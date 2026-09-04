@@ -40,6 +40,7 @@ A local Streamlit dashboard that gathers finance and major world news from free 
 | `allocator.py` | Drift and whole-unit allocation maths (pure) |
 | `schedule_rules.py` | Contribution cadence gates and the contributions log |
 | `quotes.py` | Last traded prices for bare NSE symbols |
+| `import_tradebook.py` | Builds holdings.csv from Zerodha tradebook exports |
 | `plan_investment.py` | Monthly contribution planner CLI |
 | `test_rebalance.py` | Rebalancer test suite |
 | `smoke_test.py` | End-to-end smoke test |
@@ -211,6 +212,51 @@ beyond the ceiling you set for it.
 ```powershell
 .venv\Scripts\python plan_investment.py
 ```
+
+### Building holdings.csv from your tradebooks
+
+Rather than maintaining `holdings.csv` by hand, derive it from Zerodha tradebook
+exports (Console -> Reports -> Tradebook, one CSV per financial year). The tradebook is
+the authoritative record of what you bought and sold, so net quantity and average cost
+come from replaying it:
+
+```powershell
+.venv\Scripts\python import_tradebook.py "tradebook-FY24-25.csv" "tradebook-FY25-26.csv" "tradebook-FY26-27.csv"
+```
+
+Pass every year you have. Trades are de-duplicated on their full identity rather than
+on `trade_id` alone, because that id is only unique per exchange per day - the NSE and
+BSE ranges genuinely overlap. Overlapping exports are therefore safe, including rows
+carrying no `trade_id`, and two different trades sharing one identity are reported as an
+error rather than silently merged. Ordering is by parsed timestamp, with buys settled
+before sells on a tie, so the order of the files on the command line does not change the
+result. The importer replays trades using the running weighted-average convention: a
+sell removes quantity at the prevailing average and leaves that average unchanged.
+
+It prints a reconciliation (quantity, average cost, invested, LTP, value, P/L per
+symbol), reports realised profit on every sell whether the position survived or not,
+writes the open positions to `holdings.csv`, and fetches live prices to fill the LTP
+column. Add `--dry-run` to see the summary without writing, or `--no-prices` to skip the
+network.
+
+A position you sold out of is simply absent from `holdings.csv`, because you hold none of
+it. That is not a retirement: add the symbol to `targets.yaml` with a weight and
+contributions will buy it again from zero.
+
+Three caveats:
+
+- **Charges are not in the tradebook.** Average cost is built from trade prices only, so
+  it excludes brokerage, STT, stamp duty and GST. It will read very slightly below the
+  figure Kite shows.
+- **Missing history is flagged, not guessed.** If a sell exceeds everything the supplied
+  files account for, the opening position predates them. The importer names the symbols
+  and *refuses to write*, so an incomplete set cannot quietly replace a good
+  `holdings.csv`; pass `--force` if you want it written anyway. Handing it only a
+  sells-only tradebook is refused for the same reason.
+- **Corporate actions are invisible.** Splits, bonuses and consolidations never appear
+  in a tradebook, so a replay cannot see them. If one has affected a holding, that
+  symbol's quantity and average cost will be wrong and nothing here can detect it.
+  Cross-check against Kite after any such event.
 
 ### Inputs
 

@@ -12,8 +12,9 @@ from typing import Callable
 from allocator import (OVERSHOOT_FRACTION, actionable_drift, compute_rows,
                        fundable_units, max_abs_drift, plan_orders,
                        untracked_value)
-from holdings import (HoldingsError, TargetsError, _to_float, load_holdings,
+from holdings import (HoldingsError, TargetsError, parse_number, load_holdings,
                       load_targets)
+from import_tradebook import build_positions, read_trades, write_holdings
 from portfolio_models import Holding, Order, Plan
 from schedule_rules import (add_months, evaluate_cadence,
                             load_last_contribution, record_contribution)
@@ -277,13 +278,13 @@ def test_weight_after_uses_the_deployed_total_not_the_contribution() -> None:
 
 # --- loaders ------------------------------------------------------------
 
-def test_to_float_handles_grouping_and_blanks() -> None:
-    assert _to_float("1,234.50") == 1234.5
-    assert _to_float("") == 0.0
-    assert _to_float(None) == 0.0
-    assert _to_float("-") == 0.0
-    assert _to_float("(500.00)") == -500.0
-    assert _to_float("Rs 1,00,000") == 100000.0
+def test_parse_number_handles_grouping_and_blanks() -> None:
+    assert parse_number("1,234.50") == 1234.5
+    assert parse_number("") == 0.0
+    assert parse_number(None) == 0.0
+    assert parse_number("-") == 0.0
+    assert parse_number("(500.00)") == -500.0
+    assert parse_number("Rs 1,00,000") == 100000.0
 
 
 def test_load_holdings_reads_zerodha_headers_and_ignores_extra_quantities() -> None:
@@ -615,6 +616,320 @@ def test_load_holdings_prefers_a_symbol_column_over_a_bare_name() -> None:
                       "Nippon Nifty ETF,NIFTYBEES,10,250.00,275.00\n")
         held = load_holdings(path)
     assert held[0].symbol == "NIFTYBEES"
+
+
+# --- tradebook import ---------------------------------------------------
+
+TRADEBOOK_HEADER = ("symbol,isin,trade_date,exchange,segment,series,trade_type,"
+                    "auction,quantity,price,trade_id,order_id,"
+                    "order_execution_time")
+
+
+def _trade_row(symbol: str, date_str: str, side: str, qty: float, price: float,
+               trade_id: str = "", executed: str = "", exchange: str = "NSE",
+               segment: str = "EQ", order_id: str = "ORD") -> str:
+    """Build one tradebook CSV line."""
+    return (f"{symbol},INF000,{date_str},{exchange},{segment},EQ,{side},false,"
+            f"{qty:.6f},{price:.6f},{trade_id},{order_id},{executed}")
+
+
+def _tradebook(directory: Path, name: str, rows: list[str]) -> Path:
+    """Write a tradebook CSV and return its path."""
+    return _write(directory, name, TRADEBOOK_HEADER + "\n" + "\n".join(rows) + "\n")
+
+
+def test_weighted_average_cost_survives_a_sell() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        book = _tradebook(Path(tmp), "tb.csv", [
+            _trade_row("A", "2025-01-01", "buy", 3, 100.0, "t1", "2025-01-01T10:00:00"),
+            _trade_row("A", "2025-02-01", "buy", 7, 110.0, "t2", "2025-02-01T10:00:00"),
+            _trade_row("A", "2025-03-01", "sell", 4, 150.0, "t3", "2025-03-01T10:00:00"),
+        ])
+        positions = build_positions(read_trades([str(book)]))
+    position = positions["A"]
+    # Pool is 300 + 770 = 1070 over 10 units, so the average is 107.
+    assert position.quantity == 6.0
+    assert abs(position.avg_cost - 107.0) < 1e-9, "a sell must not move the average"
+    assert abs(position.realised - 4 * (150.0 - 107.0)) < 1e-9
+    assert abs(position.cost_pool - 6 * 107.0) < 1e-9
+
+
+def test_later_buys_blend_against_the_post_sale_pool() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        book = _tradebook(Path(tmp), "tb.csv", [
+            _trade_row("A", "2025-01-01", "buy", 10, 100.0, "t1", "2025-01-01T10:00:00"),
+            _trade_row("A", "2025-02-01", "sell", 5, 200.0, "t2", "2025-02-01T10:00:00"),
+            _trade_row("A", "2025-03-01", "buy", 5, 120.0, "t3", "2025-03-01T10:00:00"),
+        ])
+        positions = build_positions(read_trades([str(book)]))
+    # 5 units at 100 plus 5 at 120 leaves 10 units averaging 110.
+    assert positions["A"].quantity == 10.0
+    assert abs(positions["A"].avg_cost - 110.0) < 1e-9
+
+
+def test_full_exit_leaves_no_position_and_records_realised_pnl() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        book = _tradebook(root, "tb.csv", [
+            _trade_row("GONE", "2025-01-01", "buy", 25, 169.98, "t1", "2025-01-01T10:00:00"),
+            _trade_row("GONE", "2025-02-01", "buy", 25, 169.25, "t2", "2025-02-01T10:00:00"),
+            _trade_row("GONE", "2025-03-01", "sell", 50, 330.65, "t3", "2025-03-01T10:00:00"),
+            _trade_row("KEEP", "2025-01-01", "buy", 10, 50.0, "t4", "2025-01-01T10:00:00"),
+        ])
+        positions = build_positions(read_trades([str(book)]))
+        assert positions["GONE"].quantity == 0.0
+        assert positions["GONE"].realised > 0
+        out = root / "holdings.csv"
+        written = write_holdings(out, positions, {"KEEP": 55.0})
+        assert [p.symbol for p in written] == ["KEEP"]
+        held = load_holdings(out)
+    assert [h.symbol for h in held] == ["KEEP"]
+
+
+def test_written_holdings_round_trip_through_the_loader() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        book = _tradebook(root, "tb.csv", [
+            _trade_row("A", "2025-01-01", "buy", 3, 100.0, "t1", "2025-01-01T10:00:00"),
+            _trade_row("A", "2025-02-01", "buy", 7, 110.0, "t2", "2025-02-01T10:00:00"),
+        ])
+        positions = build_positions(read_trades([str(book)]))
+        out = root / "holdings.csv"
+        write_holdings(out, positions, {"A": 130.0})
+        held = load_holdings(out)
+    assert held[0].quantity == 10.0
+    assert held[0].avg_cost == 107.0
+    assert held[0].last_price == 130.0
+
+
+def test_missing_price_writes_a_blank_ltp_that_still_loads() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        book = _tradebook(root, "tb.csv", [
+            _trade_row("A", "2025-01-01", "buy", 5, 100.0, "t1", "2025-01-01T10:00:00"),
+        ])
+        positions = build_positions(read_trades([str(book)]))
+        out = root / "holdings.csv"
+        write_holdings(out, positions, {})
+        held = load_holdings(out)
+    assert held[0].last_price == 0.0
+    assert held[0].quantity == 5.0
+
+
+def test_duplicate_trade_ids_across_files_are_counted_once() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        rows = [_trade_row("A", "2025-01-01", "buy", 10, 100.0, "t1",
+                           "2025-01-01T10:00:00")]
+        first = _tradebook(root, "one.csv", rows)
+        second = _tradebook(root, "two.csv", rows)
+        positions = build_positions(read_trades([str(first), str(second)]))
+    assert positions["A"].quantity == 10.0, "overlapping exports must not double count"
+
+
+def test_file_order_on_the_command_line_does_not_change_the_result() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        early = _tradebook(root, "early.csv", [
+            _trade_row("A", "2025-01-01", "buy", 10, 100.0, "t1", "2025-01-01T10:00:00"),
+        ])
+        late = _tradebook(root, "late.csv", [
+            _trade_row("A", "2025-06-01", "sell", 4, 150.0, "t2", "2025-06-01T10:00:00"),
+        ])
+        forwards = build_positions(read_trades([str(early), str(late)]))
+        backwards = build_positions(read_trades([str(late), str(early)]))
+    assert forwards["A"].quantity == backwards["A"].quantity == 6.0
+    assert abs(forwards["A"].avg_cost - backwards["A"].avg_cost) < 1e-9
+    assert abs(forwards["A"].realised - backwards["A"].realised) < 1e-9
+
+
+def test_selling_more_than_the_tradebooks_show_is_flagged() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        book = _tradebook(Path(tmp), "tb.csv", [
+            _trade_row("A", "2025-01-01", "buy", 5, 100.0, "t1", "2025-01-01T10:00:00"),
+            _trade_row("A", "2025-02-01", "sell", 12, 150.0, "t2", "2025-02-01T10:00:00"),
+        ])
+        positions = build_positions(read_trades([str(book)]))
+    assert positions["A"].oversold == 7.0, "missing opening history must be flagged"
+    assert positions["A"].quantity == 0.0
+
+
+def test_read_trades_rejects_files_that_are_not_tradebooks() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        _raises(HoldingsError, read_trades, [str(root / "nope.csv")])
+        junk = _write(root, "junk.csv", "Symbol,Quantity\nA,5\n")
+        _raises(HoldingsError, read_trades, [str(junk)])
+        empty = _tradebook(root, "empty.csv", [])
+        _raises(HoldingsError, read_trades, [str(empty)])
+
+
+def test_unknown_trade_types_and_zero_quantities_are_skipped() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        book = _tradebook(Path(tmp), "tb.csv", [
+            _trade_row("A", "2025-01-01", "buy", 10, 100.0, "t1", "2025-01-01T10:00:00"),
+            _trade_row("A", "2025-01-02", "bonus", 5, 0.0, "t2", "2025-01-02T10:00:00"),
+            _trade_row("A", "2025-01-03", "buy", 0, 100.0, "t3", "2025-01-03T10:00:00"),
+        ])
+        positions = build_positions(read_trades([str(book)]))
+    assert positions["A"].quantity == 10.0
+
+
+def test_colliding_trade_ids_across_exchanges_are_not_merged() -> None:
+    # trade_id is a per-exchange sequence, so the NSE and BSE ranges overlap.
+    # Merging on it alone would silently drop one of these trades.
+    with tempfile.TemporaryDirectory() as tmp:
+        book = _tradebook(Path(tmp), "tb.csv", [
+            _trade_row("A", "2025-01-01", "buy", 100, 10.0, "5000001",
+                       "2025-01-01T10:00:00", exchange="NSE"),
+            _trade_row("A", "2025-01-01", "buy", 100, 20.0, "5000001",
+                       "2025-01-01T11:00:00", exchange="BSE"),
+        ])
+        positions = build_positions(read_trades([str(book)]))
+    assert positions["A"].quantity == 200.0
+    assert abs(positions["A"].avg_cost - 15.0) < 1e-9
+
+
+def test_genuinely_conflicting_trades_raise_instead_of_overwriting() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        book = _tradebook(Path(tmp), "tb.csv", [
+            _trade_row("A", "2025-01-01", "buy", 100, 10.0, "t1",
+                       "2025-01-01T10:00:00"),
+            _trade_row("A", "2025-01-01", "buy", 999, 77.0, "t1",
+                       "2025-01-01T10:00:00"),
+        ])
+        _raises(HoldingsError, read_trades, [str(book)])
+
+
+def test_rows_without_a_trade_id_still_dedupe_across_files() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        rows = [_trade_row("A", "2025-01-01", "buy", 10, 100.0, "",
+                           "2025-01-01T10:00:00")]
+        first = _tradebook(root, "one.csv", rows)
+        second = _tradebook(root, "two.csv", rows)
+        positions = build_positions(read_trades([str(first), str(second)]))
+    assert positions["A"].quantity == 10.0, "blank ids must not bypass dedup"
+
+
+def test_blank_execution_time_replays_after_the_same_day_buys() -> None:
+    # A timeless row placed first would look like a sell with nothing to sell.
+    with tempfile.TemporaryDirectory() as tmp:
+        book = _tradebook(Path(tmp), "tb.csv", [
+            _trade_row("A", "2025-01-01", "buy", 100, 10.0, "t1",
+                       "2025-01-01T09:30:00"),
+            _trade_row("A", "2025-01-01", "sell", 50, 12.0, "t2", ""),
+        ])
+        positions = build_positions(read_trades([str(book)]))
+    assert positions["A"].quantity == 50.0
+    assert positions["A"].oversold == 0.0
+    assert abs(positions["A"].realised - 100.0) < 1e-9
+
+
+def test_buys_replay_before_sells_at_an_identical_timestamp() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        book = _tradebook(Path(tmp), "tb.csv", [
+            _trade_row("A", "2025-01-01", "sell", 50, 12.0, "t2",
+                       "2025-01-01T10:00:00"),
+            _trade_row("A", "2025-01-01", "buy", 100, 10.0, "t1",
+                       "2025-01-01T10:00:00"),
+        ])
+        positions = build_positions(read_trades([str(book)]))
+    assert positions["A"].quantity == 50.0
+    assert positions["A"].oversold == 0.0
+
+
+def test_non_iso_trade_dates_are_rejected_not_string_sorted() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        book = _tradebook(Path(tmp), "tb.csv", [
+            _trade_row("A", "09-01-2025", "buy", 100, 10.0, "t1", ""),
+        ])
+        _raises(HoldingsError, read_trades, [str(book)])
+
+
+def test_zero_or_blank_prices_are_rejected() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        book = _tradebook(Path(tmp), "tb.csv", [
+            _trade_row("A", "2025-01-01", "buy", 100, 10.0, "t1",
+                       "2025-01-01T10:00:00"),
+            _trade_row("A", "2025-01-02", "buy", 100, 0.0, "t2",
+                       "2025-01-02T10:00:00"),
+        ])
+        positions = build_positions(read_trades([str(book)]))
+    # A zero-priced buy would otherwise halve the average to 5.00.
+    assert positions["A"].quantity == 100.0
+    assert abs(positions["A"].avg_cost - 10.0) < 1e-9
+
+
+def test_non_equity_segments_are_skipped() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        book = _tradebook(Path(tmp), "tb.csv", [
+            _trade_row("A", "2025-01-01", "buy", 10, 100.0, "t1",
+                       "2025-01-01T10:00:00"),
+            _trade_row("NIFTY25JANFUT", "2025-01-02", "buy", 50, 23000.0, "t2",
+                       "2025-01-02T10:00:00", segment="FO"),
+        ])
+        positions = build_positions(read_trades([str(book)]))
+    assert set(positions) == {"A"}
+
+
+def test_realised_is_reported_for_a_still_open_position() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        book = _tradebook(Path(tmp), "tb.csv", [
+            _trade_row("A", "2025-01-01", "buy", 100, 10.0, "t1",
+                       "2025-01-01T10:00:00"),
+            _trade_row("A", "2025-06-01", "sell", 40, 15.0, "t2",
+                       "2025-06-01T10:00:00"),
+        ])
+        positions = build_positions(read_trades([str(book)]))
+    assert positions["A"].is_open is True
+    assert abs(positions["A"].realised - 200.0) < 1e-9
+
+
+def test_fractional_quantity_is_refused_rather_than_rounded() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        book = _tradebook(root, "tb.csv", [
+            _trade_row("A", "2025-01-01", "buy", 0.5, 100.0, "t1",
+                       "2025-01-01T10:00:00"),
+        ])
+        positions = build_positions(read_trades([str(book)]))
+        _raises(HoldingsError, write_holdings, root / "h.csv", positions, {})
+
+
+def test_incomplete_history_refuses_to_write_unless_forced() -> None:
+    from import_tradebook import _refusal
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        book = _tradebook(root, "tb.csv", [
+            _trade_row("A", "2025-01-01", "buy", 100, 10.0, "t1",
+                       "2025-01-01T10:00:00"),
+            _trade_row("A", "2025-02-01", "sell", 150, 15.0, "t2",
+                       "2025-02-01T10:00:00"),
+        ])
+        positions = build_positions(read_trades([str(book)]))
+        out = root / "holdings.csv"
+        assert _refusal(positions, out, force=False) is not None
+        assert _refusal(positions, out, force=True) is None
+
+
+def test_an_empty_result_refuses_to_clobber_a_populated_holdings_file() -> None:
+    from import_tradebook import _refusal
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        existing = _write(root, "holdings.csv",
+                          "Symbol,Quantity Available,Average Price,LTP\n"
+                          "NIFTYBEES,641,275.48,273.23\n")
+        book = _tradebook(root, "tb.csv", [
+            _trade_row("A", "2025-01-01", "buy", 10, 10.0, "t1",
+                       "2025-01-01T10:00:00"),
+            _trade_row("A", "2025-02-01", "sell", 10, 12.0, "t2",
+                       "2025-02-01T10:00:00"),
+        ])
+        positions = build_positions(read_trades([str(book)]))
+        assert not [p for p in positions.values() if p.is_open]
+        assert _refusal(positions, existing, force=False) is not None
+        assert _refusal(positions, existing, force=True) is None
 
 
 def _main() -> int:

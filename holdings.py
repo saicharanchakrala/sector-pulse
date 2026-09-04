@@ -60,7 +60,7 @@ def _pick_column(headers: list[str], candidates: tuple[str, ...],
     return None
 
 
-def _to_float(raw: "str | None") -> float:
+def parse_number(raw: "str | None") -> float:
     """Parse a possibly comma-grouped, currency-prefixed number; blank is 0.0."""
     if raw is None:
         return 0.0
@@ -116,15 +116,15 @@ def _rows_to_holdings(reader: "csv.DictReader", symbol_col: str,
         symbol = (row.get(symbol_col) or "").strip().upper()
         if not symbol:
             continue
-        quantity = _to_float(row.get(quantity_col))
+        quantity = parse_number(row.get(quantity_col))
         if quantity <= 0.0:
             logger.info("Skipping %s: quantity is %s", symbol, quantity)
             continue
         if symbol in seen:
             raise HoldingsError(f"Duplicate symbol in holdings file: {symbol}")
         seen.add(symbol)
-        avg_cost = _to_float(row.get(avg_col)) if avg_col else 0.0
-        last_price = _to_float(row.get(price_col)) if price_col else 0.0
+        avg_cost = parse_number(row.get(avg_col)) if avg_col else 0.0
+        last_price = parse_number(row.get(price_col)) if price_col else 0.0
         holdings.append(Holding(symbol=symbol, quantity=quantity,
                                 avg_cost=avg_cost, last_price=last_price))
     return holdings
