@@ -26,6 +26,7 @@ AI narrative-analysis section.
 | `intraday.py` | yfinance intraday ETF snapshots | market agent |
 | `decision.py` | Daily BUY / DON'T BUY decision engine | analysis agent |
 | `daily_signal.py` | End-of-day signal CLI (report + signals.csv + last_signal.json) | core |
+| `news_archive.py` | Dated JSONL headline archive + replay loader | core |
 | `app.py` | Streamlit dashboard | ui agent |
 | `README.md` | Docs + quickstart | scaffold agent |
 | `smoke_test.py` | End-to-end smoke test | verify agent |
@@ -200,7 +201,9 @@ def top_pick(signals) -> TradeSignal | None
   2. `news_today >= SIGNAL_MIN_NEWS` and `news_count_today >= SIGNAL_MIN_ARTICLES`
   3. `day_change_pct >= SIGNAL_MIN_INTRADAY_PCT` and `last_hour_change_pct >= 0`
   4. `momentum >= SIGNAL_MIN_MOMENTUM` (not a falling knife)
-  5. not illiquid (`avg_volume_20d >= SIGNAL_MIN_AVG_VOLUME`)
+  5. not illiquid (`avg_volume_20d * last_price >= SIGNAL_MIN_AVG_TURNOVER`;
+     rupee turnover, not a unit count, so the bar is comparable across
+     price levels)
 - **Decline diagnostic** (symmetric mirror of the buy gates, evaluated only to
   enrich the explanation - it never changes the verdict): negative news over the
   article floor, day change at or below `-SIGNAL_MIN_INTRADAY_PCT` with a
@@ -238,7 +241,7 @@ survives a cp1252 Windows console.
 Signal config knobs (config.py, paths resolved relative to the project root):
 `SIGNAL_NEWS_HOURS=12`, `SIGNAL_MIN_NEWS=0.15`, `SIGNAL_MIN_ARTICLES=3`,
 `SIGNAL_MIN_INTRADAY_PCT=0.2`, `SIGNAL_MIN_MOMENTUM=-0.2`,
-`SIGNAL_MIN_AVG_VOLUME=50_000`, `SIGNALS_CSV`, `LAST_SIGNAL_JSON`.
+`SIGNAL_MIN_AVG_TURNOVER=2_500_000`, `SIGNALS_CSV`, `LAST_SIGNAL_JSON`.
 
 ### claude_insights.py
 ```python

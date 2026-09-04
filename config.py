@@ -35,7 +35,11 @@ SIGNAL_MIN_NEWS = 0.15           # gate: today-only news score floor
 SIGNAL_MIN_ARTICLES = 3          # gate: today-only article count floor
 SIGNAL_MIN_INTRADAY_PCT = 0.2    # gate: intraday day-change floor (%)
 SIGNAL_MIN_MOMENTUM = -0.2       # gate: multi-day momentum floor (not a falling knife)
-SIGNAL_MIN_AVG_VOLUME = 50_000   # gate: 20-session mean daily volume floor
+# Gate on rupee TURNOVER, not a unit count. A 50,000-unit floor was 84x
+# stricter for INFRABEES (958/unit) than OILIETF (11.40/unit); turnover is
+# comparable across price levels. This default is set near the median ETF's
+# old effective bar and still needs calibrating against a real backtest.
+SIGNAL_MIN_AVG_TURNOVER = 2_500_000   # gate: 20-session mean daily turnover
 SIGNALS_CSV = PROJECT_ROOT / "signals.csv"
 LAST_SIGNAL_JSON = PROJECT_ROOT / "last_signal.json"
 
@@ -55,3 +59,6 @@ HOLDINGS_CSV = PROJECT_ROOT / "holdings.csv"
 TARGETS_YAML = PROJECT_ROOT / "targets.yaml"
 CONTRIBUTIONS_CSV = PROJECT_ROOT / "contributions.csv"
 LAST_PLAN_JSON = PROJECT_ROOT / "last_plan.json"
+
+# --- News archive (makes a sentiment backtest possible) ---
+NEWS_ARCHIVE_DIR = PROJECT_ROOT / "news_archive"

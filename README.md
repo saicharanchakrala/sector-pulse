@@ -33,6 +33,7 @@ A local Streamlit dashboard that gathers finance and major world news from free 
 | `intraday.py` | yfinance intraday ETF snapshots (5-minute bars) |
 | `decision.py` | Daily BUY / DON'T BUY decision engine |
 | `daily_signal.py` | End-of-day signal CLI (report + `signals.csv` + `last_signal.json`) |
+| `news_archive.py` | Dated JSONL archive of fetched headlines, so sentiment can be backtested |
 | `claude_insights.py` | Optional Claude narrative analysis |
 | `app.py` | Streamlit dashboard |
 | `portfolio_models.py` | Rebalancer dataclasses (Holding, DriftRow, Order, Plan) |
@@ -43,6 +44,7 @@ A local Streamlit dashboard that gathers finance and major world news from free 
 | `import_tradebook.py` | Builds holdings.csv from Zerodha tradebook exports |
 | `plan_investment.py` | Monthly contribution planner CLI |
 | `test_rebalance.py` | Rebalancer test suite |
+| `test_signal.py` | Offline signal-side tests (archive, liquidity gate) |
 | `smoke_test.py` | End-to-end smoke test |
 
 ## Quickstart
@@ -143,8 +145,11 @@ A sector is a BUY only when **all** BUY gates pass:
 3. Intraday confirmation: day change >= `SIGNAL_MIN_INTRADAY_PCT` (0.2%) and
    the last hour is not falling (price confirming into the close).
 4. Multi-day momentum >= `SIGNAL_MIN_MOMENTUM` (-0.2) - not a falling knife.
-5. Liquidity: 20-session average daily volume >= `SIGNAL_MIN_AVG_VOLUME`
-   (50,000 units).
+5. Liquidity: 20-session average daily **turnover** >=
+   `SIGNAL_MIN_AVG_TURNOVER` (Rs 25,00,000). Turnover, not a unit count: a
+   50,000-unit floor was 84x stricter for INFRABEES at Rs 958/unit than for
+   OILIETF at Rs 11.40, and wrongly excluded INFRABEES despite Rs 89 lakh of
+   real daily turnover. This threshold is still an uncalibrated guess.
 
 If a sector fails any buy gate the verdict is **DON'T BUY**. There is no SELL
 verdict: the engine never tells you to sell something you already hold. A mirror
@@ -164,6 +169,42 @@ All sectors are ranked by `0.4 * news_today +
 sector with the highest rank score. If nothing clears every gate, the day's
 recommendation is NO BUY. When the market has
 not traded today (weekend/holiday), the run reports "Market closed".
+
+### The news archive, and why it runs first
+
+RSS feeds serve roughly a 48-hour window. A headline not captured on the day it
+appears is gone permanently, and with it any chance of ever backtesting the news
+gate. So every `daily_signal.py` run writes what it fetched to
+`news_archive/YYYY-MM-DD.jsonl` before doing anything else, deduplicated by link,
+and logs how many new headlines it stored.
+
+`news_archive.load_archived_news(day)` reads a day straight back into `NewsItem`
+objects, which feed `analyzer.analyze` unchanged. That is the backtest path: from
+the first archived day onward, a past day's sentiment can be replayed and scored.
+Before the first archived day it cannot, at any price.
+
+The archive is gitignored (it is a data store, and it grows by roughly 270 KB a
+day at current feed volumes).
+
+### Known gaps in the signal engine
+
+Read this before trading on it. The rebalancer half carries none of these.
+
+- **No backtest.** Every threshold is a guess: `SIGNAL_MIN_NEWS`,
+  `SIGNAL_MIN_ARTICLES`, `SIGNAL_MIN_INTRADAY_PCT`, `SIGNAL_MIN_MOMENTUM`,
+  `SIGNAL_MIN_AVG_TURNOVER`, and the 0.4/0.4/0.2 rank weights. Ten-odd free
+  parameters fitted to nothing.
+- **No horizon and no exit rule.** The engine only ever says BUY or DON'T BUY.
+  Without a holding period there is no answer to "was that BUY right?", so
+  `signals.csv` can never become evidence no matter how many rows it collects.
+  This is the blocker: nothing else is measurable until it is fixed.
+- **No cost model.** Brokerage, STT, stamp duty, GST and the ETF NAV
+  premium/discount are all absent. On a small order these dominate.
+- **`buzz` is computed and never used.** `analyzer.py` produces it and `app.py`
+  displays it; no gate reads it.
+- **Its universe is not your portfolio.** The ten tradeable tickers are sector
+  ETFs; `targets.yaml` holds different instruments. Acting on a signal means
+  buying something the planner will treat as an untracked holding.
 
 ### Scheduling on Windows (weekdays 15:15 IST)
 

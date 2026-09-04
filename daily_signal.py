@@ -19,6 +19,7 @@ from datetime import datetime
 import config
 import decision
 import market_data
+import news_archive
 import news_fetcher
 from decision import TradeSignal, decide, top_pick
 from intraday import get_intraday_snapshots
@@ -171,6 +172,10 @@ def run(market: str) -> int:
     now = datetime.now().astimezone()
     logger.info("Fetching news, momentum and intraday data for %s", profile.key)
     items = news_fetcher.fetch_all_news(config.SIGNAL_NEWS_HOURS * 2, profile)
+    # Archive before anything else: an unarchived headline is gone in 48h,
+    # and with it any chance of ever backtesting the news gate.
+    written = news_archive.archive_news(items)
+    logger.info("Archived %d new headline(s) of %d fetched", written, len(items))
     momentum = market_data.get_sector_momentum(profile)
     snapshots = get_intraday_snapshots(list(profile.trade_etfs.values()))
     if not snapshots:

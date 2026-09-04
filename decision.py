@@ -41,7 +41,7 @@ class TradeSignal:
     news_count_today: int
     momentum: float                 # multi-day momentum score (0.0 if unavailable)
     intraday: IntradaySnapshot | None
-    illiquid: bool                  # avg_volume_20d < config.SIGNAL_MIN_AVG_VOLUME
+    illiquid: bool                  # 20d mean turnover < SIGNAL_MIN_AVG_TURNOVER
     reasons: list[str]              # human-readable pass/fail per gate
 
 
@@ -72,8 +72,9 @@ def _liquidity_reason(snapshot: IntradaySnapshot | None,
     """Gate 5 (shared by BUY and SELL): 20-session average volume floor."""
     if snapshot is None:
         return None
-    return (f"avg 20d volume {snapshot.avg_volume_20d:,.0f} >= "
-            f"{config.SIGNAL_MIN_AVG_VOLUME:,} "
+    turnover = snapshot.avg_volume_20d * snapshot.last_price
+    return (f"avg 20d turnover {turnover:,.0f} >= "
+            f"{config.SIGNAL_MIN_AVG_TURNOVER:,} "
             f"[{'FAIL' if illiquid else 'PASS'}]")
 
 
@@ -201,7 +202,8 @@ def decide(
         sector_momentum = momentum.get(sector)
         momentum_score = sector_momentum.score if sector_momentum is not None else 0.0
         illiquid = (snapshot is not None
-                    and snapshot.avg_volume_20d < config.SIGNAL_MIN_AVG_VOLUME)
+                    and snapshot.avg_volume_20d * snapshot.last_price
+                    < config.SIGNAL_MIN_AVG_TURNOVER)
         day_change = snapshot.day_change_pct if snapshot is not None else 0.0
         rank_score = (0.4 * news_today
                       + 0.4 * math.tanh(day_change / 1.0)
@@ -280,9 +282,9 @@ def _buy_story(signal: TradeSignal, name: str) -> list[str]:
     )
     if snap is not None:
         parts.append(
-            f"And it is liquid enough to act on, trading about "
-            f"{snap.avg_volume_20d:,.0f} units a day against a floor of "
-            f"{config.SIGNAL_MIN_AVG_VOLUME:,}."
+            f"And it is liquid enough to act on, turning over about "
+            f"{snap.avg_volume_20d * snap.last_price:,.0f} rupees a day "
+            f"against a floor of {config.SIGNAL_MIN_AVG_TURNOVER:,}."
         )
     return parts
 
@@ -315,8 +317,9 @@ def _no_buy_story(signal: TradeSignal, name: str) -> list[str]:
             f"({signal.momentum:+.2f})")
     if signal.illiquid:
         failures.append(
-            f"it is too thinly traded ({snap.avg_volume_20d:,.0f} units a "
-            f"day) to get in and out cleanly")
+            f"it is too thinly traded ("
+            f"{snap.avg_volume_20d * snap.last_price:,.0f} rupees a day) "
+            f"to get in and out cleanly")
     joined = "; ".join(failures) if failures else "one of the checks failed"
     parts = [f"{name} is not a buy today because {joined}."]
     if is_declining(signal):

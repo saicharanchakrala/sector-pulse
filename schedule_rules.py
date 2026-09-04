@@ -51,6 +51,26 @@ def load_last_contribution(path: "str | Path") -> "date | None":
     return latest
 
 
+def recorded_units(path: "str | Path") -> dict[str, float]:
+    """Cumulative units recorded as bought per symbol, across all months."""
+    csv_path = Path(path)
+    if not csv_path.exists():
+        return {}
+    units: dict[str, float] = {}
+    with csv_path.open("r", encoding="utf-8", newline="") as handle:
+        for row in csv.DictReader(handle):
+            if (row.get("action") or "").strip().upper() != "INVEST":
+                continue
+            symbol = (row.get("symbol") or "").strip().upper()
+            if not symbol:
+                continue
+            try:
+                units[symbol] = units.get(symbol, 0.0) + float(row.get("units") or 0.0)
+            except ValueError:
+                logger.warning("Ignoring unparseable unit count for %s", symbol)
+    return units
+
+
 def record_contribution(path: "str | Path", plan: Plan) -> None:
     """Append one row per order to the contributions log, creating it if needed."""
     if plan.action != "INVEST" or not plan.orders:
