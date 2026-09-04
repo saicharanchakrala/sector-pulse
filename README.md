@@ -1,8 +1,8 @@
 # Sector Pulse
 
-A local Streamlit dashboard that gathers finance and major world news from free RSS feeds, measures sector index/ETF price momentum via yfinance, and scores a market profile's sectors on a composite of news sentiment and price momentum. It then ranks the sectors to highlight where market attention and strength are concentrated. Two market profiles ship out of the box — **US** (11 GICS sectors via SPDR ETFs) and **IN** (12 Nifty sectoral indices). No API keys are required for the core app; an optional Claude-powered narrative section activates when `ANTHROPIC_API_KEY` is set.
+A local Streamlit dashboard that gathers finance and major world news from free RSS feeds, measures sector index/ETF price momentum via yfinance, and scores a market profile's sectors on a composite of news sentiment and price momentum. It then ranks the sectors to highlight where market attention and strength are concentrated. Two market profiles ship out of the box - **US** (11 GICS sectors via SPDR ETFs) and **IN** (12 Nifty sectoral indices). No API keys are required for the core app; an optional Claude-powered narrative section activates when `ANTHROPIC_API_KEY` is set.
 
-> **Not financial advice — educational use only.** Sector Pulse is a learning tool for exploring news sentiment and market momentum. Nothing it produces is a recommendation to buy or sell any security.
+> **Not financial advice - educational use only.** Sector Pulse is a learning tool for exploring news sentiment and market momentum. Nothing it produces is a recommendation to buy or sell any security.
 
 ## Features
 
@@ -12,7 +12,7 @@ A local Streamlit dashboard that gathers finance and major world news from free 
 - Classifies headlines into the profile's sectors using rich keyword regexes
 - VADER sentiment analysis with a finance-specific lexicon overlay, plus per-profile unigram and multi-word phrase boosts
 - Recency-weighted news scoring (article weight halves every 24 hours by default)
-- Sector momentum from yfinance — SPDR ETFs for the US, Nifty sectoral indices for India — across 5d / 21d / 63d windows
+- Sector momentum from yfinance - SPDR ETFs for the US, Nifty sectoral indices for India - across 5d / 21d / 63d windows
 - Composite score blending news sentiment and momentum, with a tunable news weight
 - Top headlines per sector, ranked by recency-weighted sentiment strength
 - Optional AI insights section powered by the Claude API (`ANTHROPIC_API_KEY`)
@@ -31,7 +31,7 @@ A local Streamlit dashboard that gathers finance and major world news from free 
 | `analyzer.py` | Classification, sentiment, composite scoring |
 | `market_data.py` | yfinance sector index/ETF momentum |
 | `intraday.py` | yfinance intraday ETF snapshots (5-minute bars) |
-| `decision.py` | Daily BUY / SELL / NO ACTION decision engine |
+| `decision.py` | Daily BUY / DON'T BUY decision engine |
 | `daily_signal.py` | End-of-day signal CLI (report + `signals.csv` + `last_signal.json`) |
 | `claude_insights.py` | Optional Claude narrative analysis |
 | `app.py` | Streamlit dashboard |
@@ -68,9 +68,9 @@ Sector Pulse is profile-driven: each market bundles its own RSS feeds, sector
 definitions (with index/ETF tickers and classification keywords), and sentiment
 lexicon additions.
 
-- **In-app selector** — the `Market` dropdown at the top of the sidebar switches
-  between profiles (`US — United States`, `IN — India (NSE)`).
-- **Default market** — set the `SECTOR_PULSE_MARKET` environment variable (`US` or
+- **In-app selector** - the `Market` dropdown at the top of the sidebar switches
+  between profiles (`US - United States`, `IN - India (NSE)`).
+- **Default market** - set the `SECTOR_PULSE_MARKET` environment variable (`US` or
   `IN`) to choose which profile loads by default:
 
   ```powershell
@@ -86,8 +86,8 @@ lexicon additions.
   cut", monsoon phrases).
 - **Adding a new market** is one file: create `profiles/<market>.py` defining a
   `MarketProfile` (key, label, currency, feeds, sectors, lexicon, phrases) and
-  register it in `PROFILES` in `profiles/__init__.py`. Everything else — fetching,
-  scoring, momentum, the UI, and the smoke test — picks it up automatically.
+  register it in `PROFILES` in `profiles/__init__.py`. Everything else - fetching,
+  scoring, momentum, the UI, and the smoke test - picks it up automatically.
 
 ## Configuration
 
@@ -119,7 +119,7 @@ Without the key, the app runs normally and simply omits the AI section.
 ## Daily 3:15 PM signal
 
 `daily_signal.py` produces one end-of-day recommendation per run: which single
-tradeable sector ETF to consider BUYing or SELLing today, or NO ACTION. It correlates
+tradeable sector ETF to consider buying today, if any. It correlates
 **today's news trend** (a today-only sentiment run over the last
 `SIGNAL_NEWS_HOURS` hours) with each ETF's **intraday traded trend** (5-minute
 bars vs the previous close), sanity-checked by multi-day momentum.
@@ -142,31 +142,27 @@ A sector is a BUY only when **all** BUY gates pass:
    `SIGNAL_MIN_ARTICLES` (3) articles.
 3. Intraday confirmation: day change >= `SIGNAL_MIN_INTRADAY_PCT` (0.2%) and
    the last hour is not falling (price confirming into the close).
-4. Multi-day momentum >= `SIGNAL_MIN_MOMENTUM` (-0.2) — not a falling knife.
+4. Multi-day momentum >= `SIGNAL_MIN_MOMENTUM` (-0.2) - not a falling knife.
 5. Liquidity: 20-session average daily volume >= `SIGNAL_MIN_AVG_VOLUME`
    (50,000 units).
 
-If a sector fails the BUY gates, a symmetric **SELL** gate set is checked —
-a sector is a SELL only when **all** of these pass:
+If a sector fails any buy gate the verdict is **DON'T BUY**. There is no SELL
+verdict: the engine never tells you to sell something you already hold. A mirror
+set of gates still runs, purely as a diagnostic, so the report can distinguish a
+sector under real pressure (negative news, falling price, downward trend all
+lining up) from one merely having a quiet day.
 
-1. Tradeable ETF with intraday data today (same as BUY).
-2. Today-only news score <= `-SIGNAL_MIN_NEWS` (-0.15) over at least
-   `SIGNAL_MIN_ARTICLES` (3) articles — clearly negative news flow.
-3. Intraday confirmation: day change <= `-SIGNAL_MIN_INTRADAY_PCT` (-0.2%) and
-   the last hour is not rising (falling and still falling into the close).
-4. Multi-day momentum <= `-SIGNAL_MIN_MOMENTUM` (+0.2) — don't fight a strong
-   multi-day uptrend.
-5. Liquidity (same as BUY).
+Each run also prints a **WHY** paragraph explaining the top pick in plain
+English: how positive the news flow was and over how many stories, whether the
+price confirmed it into the close, what the multi-week trend looks like, and
+whether it trades enough volume to act on. That text is generated from the gate
+values themselves, so it needs no API key and cannot cite a reason the rule did
+not actually check.
 
-> **What SELL means here:** SELL is an "exit / avoid / underweight if you hold
-> it" flag — the tool does **not** model short-selling. If you don't hold the
-> ETF, a SELL line simply means "stay away today".
-
-A sector that passes neither gate set is NO ACTION (and its gate detail shows
-why both directions failed). All sectors are ranked by `0.4 * news_today +
+All sectors are ranked by `0.4 * news_today +
 0.4 * tanh(day_change_pct) + 0.2 * momentum`; the top signal is the actionable
-sector (BUY or SELL) with the largest **absolute** rank score. If none pass in
-either direction, the day's recommendation is NO ACTION. When the market has
+sector with the highest rank score. If nothing clears every gate, the day's
+recommendation is NO BUY. When the market has
 not traded today (weekend/holiday), the run reports "Market closed".
 
 ### Scheduling on Windows (weekdays 15:15 IST)
@@ -182,7 +178,7 @@ To remove the scheduled task:
 schtasks /Delete /TN "SectorPulseDailySignal" /F
 ```
 
-> **Strong caveats — read before relying on this.**
+> **Strong caveats - read before relying on this.**
 >
 > - Yahoo Finance intraday data **may be delayed** by several minutes; the
 >   15:15 snapshot may not reflect the true last traded price.
@@ -190,13 +186,13 @@ schtasks /Delete /TN "SectorPulseDailySignal" /F
 >   credibility only as `signals.csv` accumulates a real track record you can
 >   evaluate yourself.
 > - This is **decision support, not financial advice**. It is an educational
->   tool; treat every BUY or SELL line as a prompt to do your own research.
-> - It **never places orders** — it only prints, logs to CSV, and writes a
+>   tool; treat every BUY line as a prompt to do your own research.
+> - It **never places orders** - it only prints, logs to CSV, and writes a
 >   JSON file for the dashboard.
 
 ## How the scoring works
 
-Each headline is classified into one or more sectors via keyword matching, scored for sentiment with VADER (plus a finance lexicon overlay), and weighted by recency — an article's influence halves every `RECENCY_HALF_LIFE_HOURS`. Per sector, the recency-weighted average sentiment is damped when there are few articles, producing a news score in roughly [-1, 1]. In parallel, each sector's ETF gets a momentum score from tanh-squashed 5-day, 21-day, and 63-day returns, blended by window weights. The composite is `news_weight * news_score + (1 - news_weight) * momentum_score` (news-only when momentum data is unavailable), and sectors are ranked by composite, highest first.
+Each headline is classified into one or more sectors via keyword matching, scored for sentiment with VADER (plus a finance lexicon overlay), and weighted by recency - an article's influence halves every `RECENCY_HALF_LIFE_HOURS`. Per sector, the recency-weighted average sentiment is damped when there are few articles, producing a news score in roughly [-1, 1]. In parallel, each sector's ETF gets a momentum score from tanh-squashed 5-day, 21-day, and 63-day returns, blended by window weights. The composite is `news_weight * news_score + (1 - news_weight) * momentum_score` (news-only when momentum data is unavailable), and sectors are ranked by composite, highest first.
 
 ## Monthly contribution planner (target weights)
 
@@ -375,4 +371,4 @@ allocation, both modes, the CSV and targets loaders, and every cadence boundary.
 
 ## Disclaimer
 
-**Not financial advice — educational use only.** This project demonstrates news aggregation, sentiment analysis, and market-data processing techniques. Its scores and rankings are illustrative, may be inaccurate or stale, and must not be used as the basis for investment decisions.
+**Not financial advice - educational use only.** This project demonstrates news aggregation, sentiment analysis, and market-data processing techniques. Its scores and rankings are illustrative, may be inaccurate or stale, and must not be used as the basis for investment decisions.

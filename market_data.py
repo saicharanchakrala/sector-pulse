@@ -21,7 +21,7 @@ def close_series(data: pd.DataFrame, ticker: str,
     series = None
     if isinstance(columns, pd.MultiIndex):
         # yf.download column layout depends on group_by: ("Close", ticker) by
-        # default, (ticker, "Close") with group_by="ticker" — accept either.
+        # default, (ticker, "Close") with group_by="ticker" - accept either.
         for key in (("Close", ticker), (ticker, "Close")):
             if key in columns:
                 series = data[key]

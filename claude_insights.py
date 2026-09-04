@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+from pathlib import Path
 
 import config
 from models import SectorScore
@@ -27,9 +28,23 @@ _SYSTEM_PROMPT = (
 )
 
 
+def _has_credentials() -> bool:
+    """True when the SDK has some credential to work with.
+
+    An unset ANTHROPIC_API_KEY does not mean there are no credentials: the SDK
+    resolves an API key, then an auth token, then a stored `ant auth login`
+    profile. Checking only the env var would hide the feature from anyone who
+    signed in through the CLI instead.
+    """
+    if os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN"):
+        return True
+    profile_dir = Path.home() / ".config" / "anthropic"
+    return profile_dir.is_dir() and any(profile_dir.iterdir())
+
+
 def is_available() -> bool:
     """Return True if the optional Claude insights feature can be used."""
-    if not os.environ.get("ANTHROPIC_API_KEY"):
+    if not _has_credentials():
         return False
     try:
         import anthropic  # noqa: F401
@@ -82,7 +97,7 @@ def _build_digest(scores: list[SectorScore], max_chars: int) -> str:
 def generate_insights(scores: list[SectorScore], max_chars: int = 6000) -> str | None:
     """Ask Claude for a narrative analysis of the rankings; None on any failure."""
     if not is_available():
-        logger.warning("Claude insights unavailable (no API key or anthropic package)")
+        logger.warning("Claude insights unavailable (no credentials or anthropic package)")
         return None
 
     try:

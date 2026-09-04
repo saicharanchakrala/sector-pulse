@@ -1,11 +1,11 @@
-# Sector Pulse — Build Specification
+# Sector Pulse - Build Specification
 
 A local Streamlit dashboard that gathers finance + major world news from free RSS
 feeds, measures sector index/ETF price momentum via yfinance, scores a market
 profile's sectors on a composite of news sentiment and momentum, and ranks where to
-consider investing. Markets are config-driven **profiles** (US and IN today) — each
+consider investing. Markets are config-driven **profiles** (US and IN today) - each
 profile bundles its feeds, sector definitions, and sentiment-lexicon additions.
-**Educational tool — not financial advice.** The UI must say so prominently.
+**Educational tool - not financial advice.** The UI must say so prominently.
 
 No API keys are required to run the core app. `ANTHROPIC_API_KEY` optionally enables an
 AI narrative-analysis section.
@@ -14,7 +14,7 @@ AI narrative-analysis section.
 
 | File | Responsibility | Owner |
 |---|---|---|
-| `models.py` | Shared dataclasses (pre-written — do not modify) | core |
+| `models.py` | Shared dataclasses (pre-written - do not modify) | core |
 | `config.py` | Tunables + `DEFAULT_MARKET` | core |
 | `profiles/__init__.py` | `MarketProfile` dataclass, `PROFILES` registry, `get_profile()` | core |
 | `profiles/us.py` | US profile: SPDR ETF sectors + US/world feeds | news agent |
@@ -24,7 +24,7 @@ AI narrative-analysis section.
 | `market_data.py` | yfinance sector ETF momentum | market agent |
 | `claude_insights.py` | Optional Claude narrative analysis | insights agent |
 | `intraday.py` | yfinance intraday ETF snapshots | market agent |
-| `decision.py` | Daily BUY / SELL / NO ACTION decision engine | analysis agent |
+| `decision.py` | Daily BUY / DON'T BUY decision engine | analysis agent |
 | `daily_signal.py` | End-of-day signal CLI (report + signals.csv + last_signal.json) | core |
 | `app.py` | Streamlit dashboard | ui agent |
 | `README.md` | Docs + quickstart | scaffold agent |
@@ -48,7 +48,7 @@ class MarketProfile:
     key: str                       # "US" | "IN"
     label: str
     currency: str
-    feeds: list[dict]              # {"name", "url", "category"} — see news feeds below
+    feeds: list[dict]              # {"name", "url", "category"} - see news feeds below
     sectors: dict[str, SectorDef]
     lexicon: dict[str, float]      # profile-specific VADER unigram additions
     phrases: dict[str, float]      # multi-word phrase sentiment boosts (-4..4)
@@ -76,7 +76,7 @@ back to US.
   feeds (category `"world"`) because Indian markets move on global cues.
 
 Each `profile.feeds` entry is `{"name": str, "url": str, "category": "business" |
-"world" | "markets"}` — free, live-verified RSS/Atom feeds. Each
+"world" | "markets"}` - free, live-verified RSS/Atom feeds. Each
 `SectorDef.keywords` is a rich lowercase list (25–60 entries: companies, industry
 terms, regulators, commodities, themes).
 
@@ -93,14 +93,14 @@ def fetch_all_news(
 - Fetch every feed in `profile.feeds` concurrently (`ThreadPoolExecutor`, max_workers=8).
 - Use `requests.get` with `timeout=config.REQUEST_TIMEOUT_SECONDS` and
   `headers={"User-Agent": config.USER_AGENT}`, then `feedparser.parse(response.content)`.
-  (Do not let feedparser fetch URLs itself — it has no timeout.)
+  (Do not let feedparser fetch URLs itself - it has no timeout.)
 - `published` parsing: prefer `entry.published_parsed` then `entry.updated_parsed`
   (convert via `calendar.timegm` → `datetime.fromtimestamp(ts, tz=timezone.utc)`);
   fall back to `datetime.now(timezone.utc)` if absent. All datetimes tz-aware UTC.
 - Strip HTML tags from summaries (regex `<[^>]+>` is acceptable); collapse whitespace.
 - Drop items older than `max_age_hours`; cap each feed at `config.MAX_ITEMS_PER_FEED`.
 - Dedupe across feeds by exact `link` AND by normalized title (lowercase, alphanumeric
-  + spaces only) — keep the first (newest) occurrence.
+  + spaces only) - keep the first (newest) occurrence.
 - A failing feed logs `logger.warning("...: %s", exc)` and contributes nothing. The
   function never raises and returns whatever succeeded, sorted newest first.
 
@@ -150,7 +150,7 @@ def analyze(
   when momentum is present for that sector, else `composite = news_score`.
 - Returns **all `len(profile.sectors)` sectors**, sorted by composite desc. `top_items` = up to
   `config.TOP_HEADLINES_PER_SECTOR` ScoredNewsItems for the sector, sorted by
-  `weight * abs(sentiment)` desc. Pure computation — no network, never raises.
+  `weight * abs(sentiment)` desc. Pure computation - no network, never raises.
 
 ### intraday.py
 ```python
@@ -170,7 +170,7 @@ def get_intraday_snapshots(tickers: list[str]) -> dict[str, IntradaySnapshot]
   close = second-to-last row's close when the last row is today, else the last row;
   plus 20-session mean volume) and one intraday `period="1d", interval="5m"`.
 - If the intraday frame has no bars for the current calendar date in the exchange
-  timezone, the market has not traded today — return `{}` (callers treat as closed).
+  timezone, the market has not traded today - return `{}` (callers treat as closed).
 - Defensive on MultiIndex vs flat columns (same pattern as market_data), NaN-safe,
   logs warnings, never raises; tickers with unusable data are omitted.
 
@@ -180,7 +180,7 @@ def get_intraday_snapshots(tickers: list[str]) -> dict[str, IntradaySnapshot]
 class TradeSignal:
     sector: str
     etf: str | None                 # None = no tradeable ETF (e.g. Realty/Media)
-    action: str                     # "BUY" | "SELL" | "NO ACTION"
+    action: str                     # "BUY" | "DON'T BUY"
     rank_score: float
     news_today: float               # news score computed on today-only items
     news_count_today: int
@@ -195,28 +195,26 @@ def top_pick(signals) -> TradeSignal | None
 - "Today's news trend" = items from the last `config.SIGNAL_NEWS_HOURS` hours run
   through `analyzer.analyze` for that profile; per-sector `news_score`/`news_count`
   come from that today-only run.
-- **BUY gate rule** — all must pass (each recorded as a reason):
+- **BUY gate rule** - all must pass (each recorded as a reason):
   1. sector has a trade ETF and its snapshot exists
   2. `news_today >= SIGNAL_MIN_NEWS` and `news_count_today >= SIGNAL_MIN_ARTICLES`
   3. `day_change_pct >= SIGNAL_MIN_INTRADAY_PCT` and `last_hour_change_pct >= 0`
   4. `momentum >= SIGNAL_MIN_MOMENTUM` (not a falling knife)
   5. not illiquid (`avg_volume_20d >= SIGNAL_MIN_AVG_VOLUME`)
-- **SELL gate rule** (symmetric mirror; SELL means exit/avoid/underweight —
-  short-selling is not modelled) — all must pass:
-  1. sector has a trade ETF and its snapshot exists
-  2. `news_today <= -SIGNAL_MIN_NEWS` and `news_count_today >= SIGNAL_MIN_ARTICLES`
-  3. `day_change_pct <= -SIGNAL_MIN_INTRADAY_PCT` and `last_hour_change_pct <= 0`
-  4. `momentum <= -SIGNAL_MIN_MOMENTUM` (don't fight a strong multi-day uptrend)
-  5. not illiquid
-- BUY gates are evaluated first; if BUY fails, SELL gates are evaluated. A signal
-  can never be both. When both directions fail, `action == "NO ACTION"` and
-  `reasons` = BUY-gate results, then a `"--- SELL gates ---"` separator entry,
-  then the SELL-gate results (so the report can show why BOTH directions failed).
-  A BUY or SELL signal carries only its own direction's reasons.
+- **Decline diagnostic** (symmetric mirror of the buy gates, evaluated only to
+  enrich the explanation - it never changes the verdict): negative news over the
+  article floor, day change at or below `-SIGNAL_MIN_INTRADAY_PCT` with a
+  non-rising last hour, momentum at or below `-SIGNAL_MIN_MOMENTUM`, and liquid.
+  Exposed as `decision.is_declining(signal)`.
+- A sector that fails any buy gate is `DON'T BUY`, with `reasons` = the
+  buy-gate results, then a `"--- decline check (diagnostic) ---"` separator,
+  then the mirror results. A BUY carries only its own gate results.
+- `decision.explain(signal)` returns a one-paragraph layman's account of the
+  verdict, composed from the gate values (no LLM, no network). Both serializers
+  attach it to the payload as `explanation`.
+- TOP PICK = the highest-`rank_score` signal whose action is BUY; none -> no buy.
 - `rank_score = 0.4*news_today + 0.4*tanh(day_change_pct / 1.0) + 0.2*momentum`,
   computed for every sector regardless of action; result sorted by rank desc.
-- TOP PICK = among signals with `action != "NO ACTION"`, the one with the
-  largest ABSOLUTE `rank_score`; none actionable -> the day is NO ACTION.
   Pure computation, never raises.
 
 ### daily_signal.py
@@ -224,14 +222,18 @@ CLI: `python daily_signal.py [--market IN]` (default IN). Logs INFO to stdout,
 fetches news (`SIGNAL_NEWS_HOURS * 2` lookback), momentum, and intraday snapshots
 for `profile.trade_etfs`; empty snapshots -> prints "Market closed today - no
 signal.", logs one MARKET_CLOSED row to signals.csv, exits 0. Otherwise prints the
-report: a TOP SIGNAL line ("TOP SIGNAL: BUY|SELL ETF (sector) — rank ±r"), plus
-"Strongest BUY:" / "Strongest SELL:" lines when both directions have candidates,
-or "NO ACTION today — no sector passed every gate in either direction." when
-nothing passes; then the per-sector table, gate detail for the top pick plus the
-top 2 and bottom 2 ranked sectors, and the disclaimer. Appends one row per sector
-to `config.SIGNALS_CSV` (header auto-created, utf-8; the `action` column now
-includes the SELL value, schema otherwise unchanged) and writes
-`config.LAST_SIGNAL_JSON` for the app. Always exits 0.
+report: a TOP SIGNAL line ("TOP SIGNAL: BUY ETF (sector) - rank +r"), then a
+"WHY:" block wrapping `decision.explain(pick)` at 74 columns, then an "Also
+cleared every check:" line when more than one sector qualifies. When nothing
+qualifies it prints "NO BUY today - no sector passed every check." plus an
+"Under real pressure today:" line naming any sector for which
+`decision.is_declining` holds. Then the per-sector table, gate detail for the
+top pick plus the top 2 and bottom 2 ranked sectors, and the disclaimer.
+Appends one row per sector to `config.SIGNALS_CSV` (header auto-created, utf-8;
+the `action` column carries "BUY" or "DON'T BUY", schema otherwise unchanged)
+and writes `config.LAST_SIGNAL_JSON`, whose per-signal payloads each carry an
+`explanation` string, for the app. Always exits 0. Output stays ASCII so it
+survives a cp1252 Windows console.
 
 Signal config knobs (config.py, paths resolved relative to the project root):
 `SIGNAL_NEWS_HOURS=12`, `SIGNAL_MIN_NEWS=0.15`, `SIGNAL_MIN_ARTICLES=3`,
@@ -258,7 +260,7 @@ Streamlit dashboard. Uses only the contracts above. A `Market` selectbox is the
 first sidebar control (options = `PROFILES` keys, default = `config.DEFAULT_MARKET`);
 the cached loaders take a hashable `profile_key: str` and resolve `get_profile()`
 inside. See the UI requirements given to the ui agent. Streamlit executes scripts
-top-to-bottom — structure as small helper functions plus top-level flow (no
+top-to-bottom - structure as small helper functions plus top-level flow (no
 `main()` guard needed).
 
 ## Error-handling policy (all modules)

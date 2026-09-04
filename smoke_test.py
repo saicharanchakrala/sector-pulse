@@ -141,38 +141,50 @@ def run_decision_check(items: list[NewsItem],
     )
     ranks = [s.rank_score for s in signals]
     assert ranks == sorted(ranks, reverse=True), "Signals not sorted by rank desc"
-    assert all(s.action in ("BUY", "SELL", "NO ACTION") for s in signals), (
-        "Invalid action"
-    )
+    valid = (decision.ACTION_BUY, decision.ACTION_NO_BUY)
+    assert all(s.action in valid for s in signals), "Invalid action"
     by_sector = {s.sector: s for s in signals}
     it_signal = by_sector["IT"]
-    assert it_signal.action == "BUY", (
+    assert it_signal.action == decision.ACTION_BUY, (
         f"Engineered IT signal should be BUY, got {it_signal.action}: {it_signal.reasons}"
     )
+    # Metal is engineered bearish. The verdict is still DON'T BUY, but the
+    # decline diagnostic must recognise it as actively weak, not merely quiet.
     metal_signal = by_sector["Metal"]
-    assert metal_signal.action == "SELL", (
-        f"Engineered Metal signal should be SELL, got {metal_signal.action}: "
+    assert metal_signal.action == decision.ACTION_NO_BUY, (
+        f"Engineered Metal signal should be DON'T BUY, got {metal_signal.action}: "
         f"{metal_signal.reasons}"
     )
+    assert decision.is_declining(metal_signal), (
+        "Engineered bearish Metal should register as declining"
+    )
+    assert "under real pressure" in decision.explain(metal_signal).lower(), (
+        "A declining sector's explanation should say so in plain terms"
+    )
     assert by_sector["Pharma"].illiquid, "Pharma snapshot should be flagged illiquid"
-    assert by_sector["Pharma"].action == "NO ACTION", (
+    assert by_sector["Pharma"].action == decision.ACTION_NO_BUY, (
         "Illiquid Pharma must not be actionable"
     )
-    assert any("--- SELL gates ---" in r for r in by_sector["Pharma"].reasons), (
-        "NO ACTION reasons must include the SELL-gate separator"
+    assert not decision.is_declining(by_sector["Pharma"]), (
+        "Illiquid Pharma is unremarkable, not actively declining"
+    )
+    assert any("--- decline check (diagnostic) ---" in r
+               for r in by_sector["Pharma"].reasons), (
+        "DON'T BUY reasons must include the decline-check separator"
     )
     assert by_sector["Realty"].etf is None, "Realty should have no tradeable ETF"
-    actionable = [s for s in signals if s.action != "NO ACTION"]
-    assert {"BUY", "SELL"} <= {s.action for s in actionable}, (
-        "Mixed case should produce both a BUY and a SELL"
-    )
-    expected_pick = max(actionable, key=lambda s: abs(s.rank_score))
+    buys = [s for s in signals if s.action == decision.ACTION_BUY]
+    assert buys, "Mixed case should produce at least one BUY"
+    expected_pick = max(buys, key=lambda s: s.rank_score)
     pick = decision.top_pick(signals)
     assert pick is not None and pick is expected_pick, (
-        f"Top pick must be the largest |rank_score| actionable signal "
+        f"Top pick must be the highest-ranked BUY "
         f"(expected {expected_pick.sector}, got {pick.sector if pick else None})"
     )
-    print(f"Decision OK: {len(signals)} signals, sorted, IT -> BUY, Metal -> SELL "
+    for signal in signals:
+        assert decision.explain(signal), f"No explanation for {signal.sector}"
+    print(f"Decision OK: {len(signals)} signals, sorted, IT -> BUY, "
+          f"Metal -> DON'T BUY (declining) "
           f"(top pick {pick.action} {pick.etf} / {pick.sector}, "
           f"rank {pick.rank_score:+.3f})")
 

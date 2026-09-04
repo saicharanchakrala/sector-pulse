@@ -3,7 +3,7 @@
 Runs news -> momentum -> intraday -> decision for one market, prints a
 report, appends per-sector rows to signals.csv, and writes last_signal.json
 for the dashboard. Always exits 0 so schedulers never flag a data outage.
-Educational tool — not financial advice; it never places orders.
+Educational tool - not financial advice; it never places orders.
 """
 from __future__ import annotations
 
@@ -12,10 +12,12 @@ import csv
 import json
 import logging
 import sys
+import textwrap
 from dataclasses import asdict
 from datetime import datetime
 
 import config
+import decision
 import market_data
 import news_fetcher
 from decision import TradeSignal, decide, top_pick
@@ -77,6 +79,7 @@ def signal_to_dict(signal: TradeSignal) -> dict[str, object]:
     payload = asdict(signal)
     if payload["intraday"] is not None:
         payload["intraday"]["asof"] = signal.intraday.asof.isoformat()
+    payload["explanation"] = decision.explain(signal)
     return payload
 
 
@@ -98,33 +101,41 @@ def write_last_signal(signals: list[TradeSignal], market: str,
 
 
 def _signal_line(signal: TradeSignal) -> str:
-    """Format one '<ACTION> ETF (sector) — rank' fragment for the headline."""
-    return (f"{signal.action} {signal.etf} ({signal.sector}) — "
+    """Format one '<ACTION> ETF (sector) - rank' fragment for the headline."""
+    return (f"{signal.action} {signal.etf} ({signal.sector}) - "
             f"rank {signal.rank_score:+.3f}")
 
 
 def print_top_signals(signals: list[TradeSignal]) -> None:
-    """Print the headline: overall top signal plus strongest BUY/SELL lines."""
+    """Print the headline buy, the reasoning behind it, and any runners-up."""
     pick = top_pick(signals)
     if pick is None:
-        print("\nNO ACTION today — no sector passed every gate in either "
-              "direction.")
+        print()
+        print("NO BUY today - no sector passed every check.")
+        weakest = [s for s in signals if decision.is_declining(s)]
+        if weakest:
+            print("Under real pressure today: "
+                  + ", ".join(f"{s.sector} ({s.etf})" for s in weakest))
         return
-    print(f"\nTOP SIGNAL: {_signal_line(pick)}")
-    buys = [s for s in signals if s.action == "BUY"]
-    sells = [s for s in signals if s.action == "SELL"]
-    if buys and sells:
-        best_buy = max(buys, key=lambda s: abs(s.rank_score))
-        best_sell = max(sells, key=lambda s: abs(s.rank_score))
-        print(f"Strongest BUY: {_signal_line(best_buy)}")
-        print(f"Strongest SELL: {_signal_line(best_sell)}")
+    print()
+    print(f"TOP SIGNAL: {_signal_line(pick)}")
+    print()
+    print("WHY:")
+    for line in textwrap.wrap(decision.explain(pick), width=74):
+        print(f"  {line}")
+    others = [s for s in signals
+              if s.action == decision.ACTION_BUY and s is not pick]
+    if others:
+        print()
+        print("Also cleared every check: "
+              + ", ".join(f"{s.etf} ({s.sector})" for s in others))
 
 
 def print_report(signals: list[TradeSignal], profile: MarketProfile,
                  now: datetime) -> None:
     """Print the human-readable end-of-day signal report."""
     print(f"\n{'=' * 78}")
-    print(f"SECTOR PULSE DAILY SIGNAL — {profile.label} ({profile.key})")
+    print(f"SECTOR PULSE DAILY SIGNAL - {profile.label} ({profile.key})")
     print(f"Generated {now.strftime('%Y-%m-%d %H:%M:%S %Z').strip()}")
     print("=" * 78)
     print_top_signals(signals)
@@ -146,7 +157,7 @@ def print_report(signals: list[TradeSignal], profile: MarketProfile,
     for candidate in ([pick] if pick is not None else []) + signals[:2] + signals[-2:]:
         if candidate not in detail:
             detail.append(candidate)
-    print("\nGate detail — top pick plus top 2 and bottom 2 ranked sectors:")
+    print("\nGate detail - top pick plus top 2 and bottom 2 ranked sectors:")
     for signal in detail:
         print(f"\n  {signal.sector} ({signal.etf or 'no ETF'}) -> {signal.action}")
         for reason in signal.reasons:

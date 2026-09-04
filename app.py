@@ -1,7 +1,7 @@
-"""Sector Pulse — Streamlit dashboard ranking market sectors per profile.
+"""Sector Pulse - Streamlit dashboard ranking market sectors per profile.
 
 Blends RSS news sentiment with sector index/ETF momentum into a composite
-investment-attractiveness score. Educational tool — not financial advice.
+investment-attractiveness score. Educational tool - not financial advice.
 """
 from __future__ import annotations
 
@@ -89,7 +89,7 @@ def momentum_text(momentum: SectorMomentum | None) -> str:
     if momentum is None or not momentum.returns:
         return "**Momentum:** n/a"
     windows = " | ".join(f"{w} {r:+.1f}%" for w, r in momentum.returns.items())
-    return f"**Momentum ({momentum.etf}):** {windows} — score {momentum.score:+.2f}"
+    return f"**Momentum ({momentum.etf}):** {windows} - score {momentum.score:+.2f}"
 
 
 def headline_line(scored: ScoredNewsItem) -> str:
@@ -97,7 +97,7 @@ def headline_line(scored: ScoredNewsItem) -> str:
     item = scored.item
     return (
         f"{sentiment_emoji(scored.sentiment)} "
-        f"[{esc_markdown(item.title)}]({esc_link(item.link)}) — "
+        f"[{esc_markdown(item.title)}]({esc_link(item.link)}) - "
         f"{item.source}, {age_hours(item.published):.0f}h ago"
     )
 
@@ -179,7 +179,7 @@ def render_sidebar() -> tuple[str, float, int]:
             "Market",
             profile_keys,
             index=profile_keys.index(default_key),
-            format_func=lambda key: f"{key} — {PROFILES[key].label}",
+            format_func=lambda key: f"{key} - {PROFILES[key].label}",
         )
         if st.button("Refresh data"):
             st.cache_data.clear()
@@ -223,7 +223,7 @@ def render_invest_section(scores: list[SectorScore]) -> None:
     st.subheader("Where to consider investing")
     boxes = [st.success, st.info, st.info]
     for rank, (box, score) in enumerate(zip(boxes, scores[:3]), start=1):
-        box(f"**{rank}. {score.sector} ({score.etf})** — {build_rationale(score)}")
+        box(f"**{rank}. {score.sector} ({score.etf})** - {build_rationale(score)}")
     worst = list(reversed(scores[-2:]))
     avoid = ", ".join(f"{s.sector} ({s.etf}, {s.composite:+.2f})" for s in worst)
     st.warning(f"Consider avoiding / underweight: {avoid}")
@@ -233,7 +233,7 @@ def render_sector_expanders(scores: list[SectorScore]) -> None:
     """Per-sector detail expanders in ranked order."""
     st.subheader("Sector details")
     for rank, score in enumerate(scores, start=1):
-        label = f"{rank}. {score.sector} ({score.etf}) — composite {score.composite:+.2f}"
+        label = f"{rank}. {score.sector} ({score.etf}) - composite {score.composite:+.2f}"
         with st.expander(label):
             if score.top_items:
                 for scored in score.top_items:
@@ -248,6 +248,7 @@ def signal_to_dict(signal: decision.TradeSignal) -> dict:
     payload = asdict(signal)
     if payload["intraday"] is not None:
         payload["intraday"]["asof"] = signal.intraday.asof.isoformat()
+    payload["explanation"] = decision.explain(signal)
     return payload
 
 
@@ -284,12 +285,13 @@ def fmt_time(iso_timestamp: str | None) -> str:
 def render_signal_result(top: dict | None, signal_dicts: list[dict]) -> None:
     """Render one stored or live signal result: top-pick banner plus table."""
     if top is None:
-        st.info("**NO ACTION today** — no sector passed every gate in "
-                "either direction.")
+        st.info("**NO BUY today** - no sector passed every check.")
     else:
-        banner = st.error if top["action"] == "SELL" else st.success
-        banner(f"**TOP SIGNAL: {top['action']} {top['etf']} ({top['sector']})** "
-               f"— rank {top['rank_score']:+.3f}")
+        st.success(f"**TOP SIGNAL: {top['action']} {top['etf']} "
+                   f"({top['sector']})** - rank {top['rank_score']:+.3f}")
+        rationale = top.get("explanation")
+        if rationale:
+            st.markdown(f"**Why:** {rationale}")
     st.dataframe(signal_frame(signal_dicts), width="stretch", hide_index=True)
 
 
@@ -313,7 +315,7 @@ def render_signal_section(
     momentum: dict[str, SectorMomentum],
     profile: MarketProfile,
 ) -> None:
-    """'Today's 3:15 signal' — live preview vs saved scheduled-run signal."""
+    """'Today's 3:15 signal' - live preview vs saved scheduled-run signal."""
     st.subheader("Today's 3:15 signal")
     stored = load_stored_signal(profile.key)
     if st.button("Compute signal now"):
@@ -340,16 +342,16 @@ def render_signal_section(
         live = None
     if live is not None:
         if live.get("closed"):
-            st.info("Market closed today — no live signal.")
+            st.info("Market closed today - no live signal.")
         else:
             st.markdown(
-                f"#### ⚡ Live preview — computed {fmt_time(live.get('generated_at'))} "
+                f"#### ⚡ Live preview - computed {fmt_time(live.get('generated_at'))} "
                 f"(markets may still be open; this can change until close)"
             )
             render_signal_result(live.get("top_pick"), live.get("signals", []))
         if stored is not None:
             with st.expander(
-                f"📌 Saved signal — scheduled run at "
+                f"📌 Saved signal - scheduled run at "
                 f"{fmt_time(stored.get('generated_at'))}"
             ):
                 render_signal_result(
@@ -357,18 +359,18 @@ def render_signal_section(
                 )
     elif stored is not None:
         st.markdown(
-            f"#### 📌 Saved signal — from scheduled run at "
+            f"#### 📌 Saved signal - from scheduled run at "
             f"{stored.get('generated_at', '?')}"
         )
         st.caption("The authoritative run is the 15:15 IST scheduled task; "
                    "use 'Compute signal now' for a live preview.")
         render_signal_result(stored.get("top_pick"), stored.get("signals", []))
     else:
-        st.caption("No saved signal for this market yet — run "
+        st.caption("No saved signal for this market yet - run "
                    "`python daily_signal.py` or compute one now.")
-    st.caption("Decision support only — unvalidated rule, possibly delayed "
+    st.caption("Decision support only - unvalidated rule, possibly delayed "
                "intraday data, never financial advice, never places orders. "
-               "SELL means exit/avoid/underweight — short-selling is not "
+               "SELL means exit/avoid/underweight - short-selling is not "
                "modelled.")
 
 
@@ -382,7 +384,7 @@ def render_ai_section(scores: list[SectorScore]) -> None:
         with st.spinner("Asking Claude for a narrative read on the data..."):
             st.session_state["ai_insights"] = claude_insights.generate_insights(scores)
         if st.session_state["ai_insights"] is None:
-            st.error("AI analysis failed — check the app logs and your API key.")
+            st.error("AI analysis failed - check the app logs and your API key.")
     result = st.session_state.get("ai_insights")
     if result is not None:
         st.markdown(result)
@@ -395,7 +397,7 @@ profile = get_profile(profile_key)
 
 st.title("📈 Sector Pulse")
 st.caption(
-    f"{profile.label} — news sentiment + index/ETF momentum ({profile.currency}), "
+    f"{profile.label} - news sentiment + index/ETF momentum ({profile.currency}), "
     f"blended into a live ranking of {len(profile.sectors)} market sectors."
 )
 
@@ -415,10 +417,10 @@ if not items:
         "No recent news items could be fetched. Check your connection, widen the "
         "news lookback, or hit 'Refresh data' in the sidebar."
     )
-    st.info("News data unavailable — rankings reflect momentum only.")
+    st.info("News data unavailable - rankings reflect momentum only.")
 
 if not momentum:
-    st.info("Momentum data unavailable — rankings reflect news sentiment only.")
+    st.info("Momentum data unavailable - rankings reflect news sentiment only.")
 
 scores = analyzer.analyze(items, momentum, news_weight=news_weight, profile=profile)
 

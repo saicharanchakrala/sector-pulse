@@ -1,10 +1,12 @@
-"""End-of-day BUY / SELL / NO ACTION decision engine.
+"""End-of-day BUY / DON'T BUY decision engine.
 
 Correlates today's news trend (today-only analyzer run) with each tradeable
-ETF's intraday traded trend, sanity-checked by multi-day momentum. BUY and
-SELL are symmetric gate sets; a sector that passes neither is NO ACTION.
-SELL means exit/avoid/underweight — short-selling is not modelled. Pure
-computation — no network, never raises.
+ETF's intraday traded trend, sanity-checked by multi-day momentum. A sector
+is a BUY only when every gate passes; everything else is DON'T BUY. The
+engine never advises selling a holding. A mirror set of gates runs purely as
+a diagnostic, so the explanation can distinguish a sector under real
+pressure from one merely having a quiet day. Pure computation - no network,
+never raises.
 """
 from __future__ import annotations
 
@@ -21,6 +23,11 @@ from profiles import MarketProfile, get_profile
 
 logger = logging.getLogger(__name__)
 
+# Two outcomes only. The engine never tells you to sell something you hold:
+# it either clears every buy check or it does not.
+ACTION_BUY = "BUY"
+ACTION_NO_BUY = "DON'T BUY"
+
 
 @dataclass(frozen=True)
 class TradeSignal:
@@ -28,7 +35,7 @@ class TradeSignal:
 
     sector: str
     etf: str | None                 # None = no tradeable ETF for this sector
-    action: str                     # "BUY" | "SELL" | "NO ACTION"
+    action: str                     # "BUY" | "DON'T BUY"
     rank_score: float
     news_today: float               # news score computed on today-only items
     news_count_today: int
@@ -112,7 +119,7 @@ def _buy_gates(
     return passed, reasons
 
 
-def _sell_gates(
+def _decline_gates(
     etf: str | None,
     snapshot: IntradaySnapshot | None,
     news_today: float,
@@ -120,7 +127,12 @@ def _sell_gates(
     momentum_score: float,
     illiquid: bool,
 ) -> tuple[bool, list[str]]:
-    """Evaluate all SELL gates (mirror of BUY); return (all_passed, reasons)."""
+    """Evaluate the mirror of the buy gates; return (all_passed, reasons).
+
+    This is a diagnostic, not an action. It distinguishes a sector that is
+    actively weak from one that merely failed to qualify, which is worth
+    saying in the explanation even though the verdict is the same.
+    """
     reasons: list[str] = []
     tradeable, reason = _tradeable_reason(etf, snapshot)
     reasons.append(reason)
@@ -162,15 +174,14 @@ def _classify(
     momentum_score: float,
     illiquid: bool,
 ) -> tuple[str, list[str]]:
-    """Resolve a sector's action: BUY first, then SELL, else NO ACTION."""
+    """Resolve a sector's action: BUY when every gate passes, else DON'T BUY."""
     args = (etf, snapshot, news_today, news_count, momentum_score, illiquid)
     buy_ok, buy_reasons = _buy_gates(*args)
     if buy_ok:
-        return "BUY", buy_reasons
-    sell_ok, sell_reasons = _sell_gates(*args)
-    if sell_ok:
-        return "SELL", sell_reasons
-    return "NO ACTION", buy_reasons + ["--- SELL gates ---"] + sell_reasons
+        return ACTION_BUY, buy_reasons
+    _, decline_reasons = _decline_gates(*args)
+    return (ACTION_NO_BUY,
+            buy_reasons + ["--- decline check (diagnostic) ---"] + decline_reasons)
 
 
 def decide(
@@ -179,7 +190,7 @@ def decide(
     snapshots: dict[str, IntradaySnapshot],
     profile: MarketProfile | None = None,
 ) -> list[TradeSignal]:
-    """Score every sector and gate BUY/SELL decisions; sorted by rank desc."""
+    """Score every sector and gate the buy decision; sorted by rank desc."""
     resolved = get_profile() if profile is None else profile
     today_news = _today_news_scores(items, momentum, resolved)
     signals: list[TradeSignal] = []
@@ -216,9 +227,122 @@ def decide(
     return signals
 
 
+def is_declining(signal: TradeSignal) -> bool:
+    """True when the sector is actively weak, not merely unremarkable."""
+    snap = signal.intraday
+    return bool(
+        snap is not None
+        and signal.news_today <= -config.SIGNAL_MIN_NEWS
+        and signal.news_count_today >= config.SIGNAL_MIN_ARTICLES
+        and snap.day_change_pct <= -config.SIGNAL_MIN_INTRADAY_PCT
+        and signal.momentum <= -config.SIGNAL_MIN_MOMENTUM
+    )
+
+
+def _trend_words(momentum_score: float) -> str:
+    """Describe a momentum score without using the number alone."""
+    if momentum_score >= 0.3:
+        return "clearly rising"
+    if momentum_score >= 0.05:
+        return "drifting up"
+    if momentum_score > -0.05:
+        return "roughly flat"
+    return "still slightly down, though inside the tolerance"
+
+
+def _buy_story(signal: TradeSignal, name: str) -> list[str]:
+    """Plain-English reasons a sector cleared every buy gate."""
+    snap = signal.intraday
+    parts = [
+        f"{name} is today's strongest candidate because all five checks "
+        f"passed."
+    ]
+    parts.append(
+        f"Coverage over the last {config.SIGNAL_NEWS_HOURS} hours leaned "
+        f"positive: {signal.news_count_today} stories averaging "
+        f"{signal.news_today:+.2f} on a scale from -1 to +1, where the rule "
+        f"wants at least {config.SIGNAL_MIN_NEWS:+.2f} from "
+        f"{config.SIGNAL_MIN_ARTICLES} stories."
+    )
+    if snap is not None:
+        parts.append(
+            f"The price agreed rather than contradicting the news: the ETF is "
+            f"up {snap.day_change_pct:+.2f}% on the day and was still firm in "
+            f"the final stretch ({snap.last_hour_change_pct:+.2f}% over the "
+            f"last hour), so buyers stayed rather than fading it into the "
+            f"close."
+        )
+    parts.append(
+        f"Zooming out, the multi-week trend is "
+        f"{_trend_words(signal.momentum)} ({signal.momentum:+.2f}) - this is "
+        f"the check that stops the rule buying something in free fall just "
+        f"because it looks cheap today."
+    )
+    if snap is not None:
+        parts.append(
+            f"And it is liquid enough to act on, trading about "
+            f"{snap.avg_volume_20d:,.0f} units a day against a floor of "
+            f"{config.SIGNAL_MIN_AVG_VOLUME:,}."
+        )
+    return parts
+
+
+def _no_buy_story(signal: TradeSignal, name: str) -> list[str]:
+    """Plain-English reasons a sector failed at least one buy gate."""
+    snap = signal.intraday
+    if signal.etf is None:
+        return [f"{name} has no listed ETF in this profile, so there is "
+                f"nothing to buy even when the sector looks good."]
+    if snap is None:
+        return [f"No intraday prices came back for {name} today, so the rule "
+                f"cannot confirm what the news is claiming."]
+    failures: list[str] = []
+    if not (signal.news_today >= config.SIGNAL_MIN_NEWS
+            and signal.news_count_today >= config.SIGNAL_MIN_ARTICLES):
+        failures.append(
+            f"news flow was only {signal.news_today:+.2f} across "
+            f"{signal.news_count_today} stories, short of "
+            f"{config.SIGNAL_MIN_NEWS:+.2f} from "
+            f"{config.SIGNAL_MIN_ARTICLES}")
+    if not (snap.day_change_pct >= config.SIGNAL_MIN_INTRADAY_PCT
+            and snap.last_hour_change_pct >= 0.0):
+        failures.append(
+            f"the price did not back it up ({snap.day_change_pct:+.2f}% on "
+            f"the day, {snap.last_hour_change_pct:+.2f}% in the last hour)")
+    if signal.momentum < config.SIGNAL_MIN_MOMENTUM:
+        failures.append(
+            f"the multi-week trend is falling too hard "
+            f"({signal.momentum:+.2f})")
+    if signal.illiquid:
+        failures.append(
+            f"it is too thinly traded ({snap.avg_volume_20d:,.0f} units a "
+            f"day) to get in and out cleanly")
+    joined = "; ".join(failures) if failures else "one of the checks failed"
+    parts = [f"{name} is not a buy today because {joined}."]
+    if is_declining(signal):
+        parts.append(
+            "It is not merely unremarkable either - negative news, a falling "
+            "price and a downward trend all line up, so this is a sector "
+            "under real pressure rather than one having a quiet day.")
+    return parts
+
+
+def explain(signal: TradeSignal) -> str:
+    """Explain a signal in layman's terms, as one prose paragraph."""
+    name = f"{signal.sector} ({signal.etf})" if signal.etf else signal.sector
+    if signal.action == ACTION_BUY:
+        parts = _buy_story(signal, name)
+    else:
+        parts = _no_buy_story(signal, name)
+    parts.append(
+        "Treat this as a description of what the rule measured, not a "
+        "recommendation: the thresholds have no backtest behind them.")
+    return " ".join(parts)
+
+
 def top_pick(signals: list[TradeSignal]) -> "TradeSignal | None":
-    """Actionable signal with the largest |rank_score|, or None if none pass."""
-    actionable = [s for s in signals if s.action != "NO ACTION"]
-    if not actionable:
+    """Highest-ranked buy, or None when nothing cleared every gate."""
+    buys = [s for s in signals if s.action == ACTION_BUY]
+    if not buys:
         return None
-    return max(actionable, key=lambda signal: abs(signal.rank_score))
+    return max(buys, key=lambda signal: signal.rank_score)
