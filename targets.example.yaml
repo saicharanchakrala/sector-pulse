@@ -1,0 +1,22 @@
+# Target portfolio weights, in percent. Must sum to 100.
+#
+# Copy this file to targets.yaml and set your own weights. The values below are
+# a neutral illustration, not a recommendation. The strategy only works if the
+# weights are a deliberate decision you made in advance; the tool then does the
+# arithmetic of moving your holdings toward them.
+#
+# Format is one "SYMBOL: weight" per line. Anything after # is a comment.
+
+# --- Broad market ---
+NIFTYBEES: 50.0
+
+# --- Commodities ---
+GOLDBEES: 15.0
+SILVERBEES: 15.0
+
+# --- Sector bets ---
+ITETF: 4.0
+SBIETFCON: 4.0
+MOREALTY: 4.0
+HEALTHIETF: 4.0
+CPSEETF: 4.0

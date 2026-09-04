@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+.idea/
+.streamlit/secrets.toml
+signals.csv
+last_signal.json
+signal_log.txt
+
+# Portfolio rebalancer: personal position and transaction data
+holdings.csv
+contributions.csv
+last_plan.json
+targets.yaml

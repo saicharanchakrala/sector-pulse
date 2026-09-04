@@ -1,0 +1,8 @@
+streamlit>=1.40
+feedparser>=6.0.11
+yfinance>=0.2.50
+vaderSentiment>=3.3.2
+pandas>=2.2
+plotly>=5.24
+requests>=2.32
+anthropic>=0.69
