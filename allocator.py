@@ -145,9 +145,11 @@ def _greedy_units(rows: list[DriftRow], cash: float,
 
     Equivalent to buying one unit at a time into whichever gap is currently
     widest, but each pass buys the whole run of units that would go to the same
-    symbol: enough to bring its gap down to the runner-up's. That keeps the
-    loop count proportional to the number of symbols rather than to
-    cash / price, which matters for cheap units.
+    symbol: enough to bring its gap down to the runner-up's. Where gaps are
+    well separated that collapses thousands of passes into a handful. Where
+    they are near-equal, as in an already-balanced portfolio, the run length
+    is one and the loop still steps unit by unit, so this is a best-case
+    speed-up rather than a guaranteed bound.
     """
     counts = dict(units) if units else {row.symbol: 0 for row in rows}
     remaining = {row.symbol: row.deficit - counts.get(row.symbol, 0) * row.last_price
@@ -203,7 +205,9 @@ def _spread_units(rows: list[DriftRow], cash: float,
         extra = int(math.floor(share / row.last_price))
         counts[row.symbol] = already + extra
         spent += extra * row.last_price
-    return _greedy_units(rows, cash - spent, counts)
+    # Float rounding can push `spent` a hair above `cash`, so clamp rather
+    # than hand a negative remainder to the top-up pass.
+    return _greedy_units(rows, max(0.0, cash - spent), counts)
 
 
 def _allocate(rows: list[DriftRow], cash: float, allocate: Allocator,
@@ -250,6 +254,7 @@ def plan_orders(rows: list[DriftRow], cash: float, mode: str = "fill",
         return [], cash
     allocate: Allocator = _greedy_units if mode == "fill" else _spread_units
     counts, leftover = _allocate(candidates, cash, allocate, min_order_value)
+    leftover = max(0.0, leftover)
     # Weights after the buy must be measured against the money actually
     # deployed, not the whole contribution, or every figure is understated.
     # Base is tracked value only, matching compute_rows.

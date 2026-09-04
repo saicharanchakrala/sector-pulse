@@ -14,7 +14,8 @@ import math
 from datetime import date
 
 import config
-from allocator import compute_rows, max_abs_drift, plan_orders, untracked_value
+from allocator import (actionable_drift, compute_rows, max_abs_drift,
+                       plan_orders, untracked_value)
 from holdings import HoldingsError, TargetsError, load_holdings, load_targets
 from portfolio_models import Holding, Order, Plan
 from schedule_rules import (evaluate_cadence, load_last_contribution,
@@ -233,8 +234,13 @@ def print_report(plan: Plan, recorded: bool = False) -> None:
         book += f" (tracked {plan.portfolio_value - stranded:,.0f})"
     print(f"{book}  |  contribution {plan.cash:,.0f}  |  mode "
           f"{plan.mode}  |  prices {plan.price_source}")
-    print(f"Largest tracked drift {max_abs_drift(plan.rows):.2f}pp  |  band "
-          f"{config.REBALANCE_BAND_PP:.2f}pp")
+    closeable = actionable_drift(plan.rows)
+    tracked = max_abs_drift(plan.rows)
+    line = (f"Largest closeable drift {closeable:.2f}pp  |  band "
+            f"{config.REBALANCE_BAND_PP:.2f}pp")
+    if tracked - closeable > 0.005:
+        line += f"  (largest tracked drift {tracked:.2f}pp, not closeable by buying)"
+    print(line)
     print(f"\nDECISION: {plan.action}")
     for reason in plan.reasons:
         print(f"  {reason}")

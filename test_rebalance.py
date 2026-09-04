@@ -512,13 +512,20 @@ def test_fundable_units_needs_min_order_affordable_and_no_overshoot() -> None:
 
 
 def test_expensive_survivor_cannot_strand_the_contribution() -> None:
-    # S2 at 420 has the largest gap by 2 rupees but cannot reach the 500
-    # minimum out of 700. The cheap S0 must be funded rather than the whole
-    # contribution being silently dropped.
+    # S2 at 420 holds the WIDEST gap, so the waterfall prefers it, yet 700
+    # cannot buy the 2 units (840) needed to clear a 500 minimum there. Only
+    # the fundability gate can see that; retiring the smallest gap would keep
+    # S2 and strand the lot. The cheap S0 must be funded instead.
     holdings = [Holding("S0", 1, 66.0, 66.0), Holding("S1", 50, 150.0, 150.0),
                 Holding("S2", 5, 420.0, 420.0), Holding("S3", 200, 66.0, 66.0)]
-    targets = {"S0": 24.5, "S1": 28.99, "S2": 33.13, "S3": 13.38}
+    targets = {"S0": 23.63, "S1": 28.99, "S2": 34.0, "S3": 13.38}
     rows = compute_rows(holdings, targets, cash=700.0)
+    by_symbol = {row.symbol: row for row in rows}
+    # Precondition: without this ordering the test does not exercise the gate.
+    assert by_symbol["S2"].deficit > by_symbol["S0"].deficit, (
+        "the expensive row must hold the wider gap for this test to bite")
+    assert fundable_units(by_symbol["S2"], 700.0, 500.0) == 0
+    assert fundable_units(by_symbol["S0"], 700.0, 500.0) == 8
     orders, leftover = plan_orders(rows, 700.0, mode="fill",
                                    min_order_value=500.0)
     assert orders, "a valid order existed, the contribution must not vanish"
