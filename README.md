@@ -144,7 +144,13 @@ A sector is a BUY only when **all** BUY gates pass:
    `SIGNAL_MIN_ARTICLES` (3) articles.
 3. Intraday confirmation: day change >= `SIGNAL_MIN_INTRADAY_PCT` (0.2%) and
    the last hour is not falling (price confirming into the close).
-4. Multi-day momentum >= `SIGNAL_MIN_MOMENTUM` (-0.2) - not a falling knife.
+4. Multi-day momentum >= `SIGNAL_MIN_MOMENTUM` (-0.2), **and** computed on at
+   least `SIGNAL_MIN_MOMENTUM_WEIGHT` (80%) of the configured window weight.
+   Momentum is measured on the tradeable ETF, not the sector index: yfinance
+   served only 1 daily bar since 2026-07-20 for 9 of the 12 Nifty indices while
+   the ETFs had 34-35, which had silently reduced those sectors to the 63d
+   window alone. A missing score used to arrive as 0.0, and 0.0 >= -0.2, so a
+   data outage made this gate PASS. It now fails closed.
 5. Liquidity: 20-session average daily **turnover** >=
    `SIGNAL_MIN_AVG_TURNOVER` (Rs 25,00,000). Turnover, not a unit count: a
    50,000-unit floor was 84x stricter for INFRABEES at Rs 958/unit than for

@@ -111,7 +111,9 @@ def get_sector_momentum(
     profile: MarketProfile | None = None,
 ) -> dict[str, SectorMomentum]   # key = sector name
 ```
-- `profile=None` resolves via `get_profile()`; tickers come from `profile.sectors`.
+- `profile=None` resolves via `get_profile()`. The ticker per sector is
+  `profile.trade_etfs.get(sector)` when present, else `sectors[s].etf` - the
+  tradeable ETF is both what you buy and far better served by yfinance.
 - One batched `yf.download([all profile tickers], period="6mo", interval="1d",
   auto_adjust=True, progress=False)` call; read Close prices per ticker.
 - For each window in `config.MOMENTUM_WINDOWS` (`"5d": (weight, scale_pct)`, ...):
@@ -200,7 +202,10 @@ def top_pick(signals) -> TradeSignal | None
   1. sector has a trade ETF and its snapshot exists
   2. `news_today >= SIGNAL_MIN_NEWS` and `news_count_today >= SIGNAL_MIN_ARTICLES`
   3. `day_change_pct >= SIGNAL_MIN_INTRADAY_PCT` and `last_hour_change_pct >= 0`
-  4. `momentum >= SIGNAL_MIN_MOMENTUM` (not a falling knife)
+  4. `momentum >= SIGNAL_MIN_MOMENTUM` AND
+     `momentum_weight >= SIGNAL_MIN_MOMENTUM_WEIGHT` - the gate fails
+     closed when the trend is unmeasurable or measured on too few
+     windows, rather than treating a substituted 0.0 as neutral
   5. not illiquid (`avg_volume_20d * last_price >= SIGNAL_MIN_AVG_TURNOVER`;
      rupee turnover, not a unit count, so the bar is comparable across
      price levels)

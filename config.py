@@ -35,6 +35,12 @@ SIGNAL_MIN_NEWS = 0.15           # gate: today-only news score floor
 SIGNAL_MIN_ARTICLES = 3          # gate: today-only article count floor
 SIGNAL_MIN_INTRADAY_PCT = 0.2    # gate: intraday day-change floor (%)
 SIGNAL_MIN_MOMENTUM = -0.2       # gate: multi-day momentum floor (not a falling knife)
+# Fraction of MOMENTUM_WINDOWS weight that must actually be computable
+# before the momentum gate is trusted. yfinance served only 1 daily bar
+# since 2026-07-20 for 9 of 12 Nifty sector indices, silently reducing
+# their score to the 63d window alone (weight 0.2). A gate measured on a
+# fifth of its inputs must not be treated as having passed.
+SIGNAL_MIN_MOMENTUM_WEIGHT = 0.8
 # Gate on rupee TURNOVER, not a unit count. A 50,000-unit floor was 84x
 # stricter for INFRABEES (958/unit) than OILIETF (11.40/unit); turnover is
 # comparable across price levels. This default is set near the median ETF's

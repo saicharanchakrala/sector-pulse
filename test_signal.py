@@ -199,6 +199,77 @@ def test_a_sector_with_no_snapshot_is_never_a_buy() -> None:
     assert by_sector["Realty"].etf is None
 
 
+# --- momentum gate must fail closed ------------------------------------
+
+def _gates(momentum_score: float, momentum_weight: float) -> tuple[bool, str]:
+    """Run the buy gates with everything but momentum comfortably passing."""
+    from decision import _buy_gates
+    snap = _snapshot("X.NS", price=100.0, volume=5_000_000.0)
+    ok, reasons = _buy_gates("X.NS", snap, 0.5, 5, momentum_score,
+                             momentum_weight, False)
+    return ok, next(r for r in reasons if "momentum" in r)
+
+
+def test_absent_momentum_fails_the_gate_rather_than_passing() -> None:
+    # The bug: a missing score arrived as 0.0, and 0.0 >= -0.2, so a yfinance
+    # outage made the falling-knife check PASS. A blocking gate must fail closed.
+    ok, reason = _gates(0.0, 0.0)
+    assert ok is False, "no momentum data must not clear the gate"
+    assert "unavailable" in reason, reason
+
+
+def test_momentum_on_too_little_window_weight_fails() -> None:
+    # 9 of 12 Nifty indices were silently scoring on the 63d window alone,
+    # which is 20% of the configured weight.
+    ok, reason = _gates(0.5, 0.2)
+    assert ok is False, "a fifth of the windows is not a measured trend"
+    assert "20%" in reason and "below" in reason, reason
+
+
+def test_full_window_weight_gates_on_the_score_itself() -> None:
+    assert _gates(0.5, 1.0)[0] is True
+    assert _gates(-0.5, 1.0)[0] is False, "a real falling knife must still fail"
+    ok, reason = _gates(0.0, 1.0)
+    assert ok is True
+    assert "100% of window weight" in reason, reason
+
+
+def test_threshold_boundary_is_inclusive() -> None:
+    assert _gates(0.0, config.SIGNAL_MIN_MOMENTUM_WEIGHT)[0] is True
+    assert _gates(0.0, config.SIGNAL_MIN_MOMENTUM_WEIGHT - 0.01)[0] is False
+    assert _gates(config.SIGNAL_MIN_MOMENTUM, 1.0)[0] is True
+
+
+def test_decide_reports_the_window_weight_it_used() -> None:
+    from models import SectorMomentum
+    full = SectorMomentum(sector="Metal", etf="METALIETF.NS",
+                          returns={"5d": 1.0, "21d": 2.0, "63d": 3.0}, score=0.4)
+    thin = SectorMomentum(sector="Metal", etf="METALIETF.NS",
+                          returns={"63d": 3.0}, score=0.4)
+    snaps = {"METALIETF.NS": _snapshot("METALIETF.NS", 13.40, 8_000_000.0)}
+    for mom, expected in ((full, 1.0), (thin, 0.2)):
+        signals = decision.decide([], {"Metal": mom}, snaps, get_profile("IN"))
+        metal = next(s for s in signals if s.sector == "Metal")
+        assert abs(metal.momentum_weight - expected) < 1e-9, metal.momentum_weight
+    # And a sector with no momentum entry at all reports zero weight.
+    signals = decision.decide([], {}, snaps, get_profile("IN"))
+    metal = next(s for s in signals if s.sector == "Metal")
+    assert metal.momentum_weight == 0.0
+    assert metal.action == decision.ACTION_NO_BUY
+
+
+def test_declining_diagnostic_needs_reliable_momentum_too() -> None:
+    from models import SectorMomentum
+    bearish = SectorMomentum(sector="Metal", etf="METALIETF.NS",
+                             returns={"63d": -9.0}, score=-0.6)
+    snaps = {"METALIETF.NS": _snapshot("METALIETF.NS", 13.40, 8_000_000.0,
+                                       day_change=-1.5, last_hour=-0.5)}
+    signals = decision.decide([], {"Metal": bearish}, snaps, get_profile("IN"))
+    metal = next(s for s in signals if s.sector == "Metal")
+    # Only 20% window weight, so "actively declining" is not established.
+    assert decision.is_declining(metal) is False
+
+
 def _main() -> int:
     """Run every test_* function in this module and report the tally."""
     tests = {name: obj for name, obj in sorted(globals().items())

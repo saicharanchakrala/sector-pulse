@@ -124,10 +124,12 @@ def run_decision_check(items: list[NewsItem],
     ]
     forced_momentum = dict(momentum)
     forced_momentum["IT"] = SectorMomentum(
-        sector="IT", etf="^CNXIT", returns={"5d": 2.0}, score=0.5
+        sector="IT", etf="ITBEES.NS",
+        returns={"5d": 2.0, "21d": 4.0, "63d": 8.0}, score=0.5
     )
     forced_momentum["Metal"] = SectorMomentum(
-        sector="Metal", etf="^CNXMETAL", returns={"5d": -2.5}, score=-0.5
+        sector="Metal", etf="METALIETF.NS",
+        returns={"5d": -2.5, "21d": -5.0, "63d": -9.0}, score=-0.5
     )
     snapshots = {
         "ITBEES.NS": _synthetic_snapshot("ITBEES.NS", 1.5, 0.3, 500_000.0),

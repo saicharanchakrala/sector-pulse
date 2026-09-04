@@ -81,7 +81,12 @@ def get_sector_momentum(
 ) -> dict[str, SectorMomentum]:
     """Compute weighted tanh-squashed multi-window momentum per sector ticker."""
     resolved = get_profile() if profile is None else profile
-    tickers = [sector_def.etf for sector_def in resolved.sectors.values()]
+    # Prefer the tradeable ETF over the sector index. You buy the ETF, so its
+    # own history is the relevant one, and it is far better served: yfinance
+    # returned 34-35 daily bars since 2026-07-20 for the Indian sector ETFs
+    # against a single bar for 9 of the 12 underlying indices.
+    tickers = [resolved.trade_etfs.get(name) or sector_def.etf
+               for name, sector_def in resolved.sectors.items()]
     try:
         data = yf.download(tickers, period="6mo", interval="1d",
                            auto_adjust=True, progress=False)
@@ -93,20 +98,21 @@ def get_sector_momentum(
         return {}
     momentum: dict[str, SectorMomentum] = {}
     for name, sector_def in resolved.sectors.items():
+        ticker = resolved.trade_etfs.get(name) or sector_def.etf
         try:
-            closes = close_series(data, sector_def.etf, tickers)
+            closes = close_series(data, ticker, tickers)
             if closes is None:
                 logger.warning("No usable close prices for %s (%s)",
-                               name, sector_def.etf)
+                               name, ticker)
                 continue
-            entry = _momentum_for(name, sector_def.etf, closes)
+            entry = _momentum_for(name, ticker, closes)
         except (KeyError, IndexError, TypeError, ValueError) as exc:
             logger.warning("Momentum computation failed for %s (%s): %s",
-                           name, sector_def.etf, exc)
+                           name, ticker, exc)
             continue
         if entry is None:
             logger.warning("Insufficient price history for %s (%s)",
-                           name, sector_def.etf)
+                           name, ticker)
             continue
         momentum[name] = entry
     return momentum

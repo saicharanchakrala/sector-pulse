@@ -40,6 +40,7 @@ class TradeSignal:
     news_today: float               # news score computed on today-only items
     news_count_today: int
     momentum: float                 # multi-day momentum score (0.0 if unavailable)
+    momentum_weight: float          # share of MOMENTUM_WINDOWS weight actually used
     intraday: IntradaySnapshot | None
     illiquid: bool                  # 20d mean turnover < SIGNAL_MIN_AVG_TURNOVER
     reasons: list[str]              # human-readable pass/fail per gate
@@ -78,12 +79,33 @@ def _liquidity_reason(snapshot: IntradaySnapshot | None,
             f"[{'FAIL' if illiquid else 'PASS'}]")
 
 
+def _momentum_reason(momentum_score: float,
+                     momentum_weight: float) -> tuple[bool, str]:
+    """Gate 4: multi-day trend floor, and only when the trend is measurable.
+
+    A missing momentum score used to arrive as 0.0, and 0.0 >= -0.2, so a data
+    outage made the falling-knife check PASS. A gate that blocks must fail when
+    its input is absent, not wave the trade through.
+    """
+    if momentum_weight <= 0.0:
+        return False, "momentum unavailable, no usable price windows [FAIL]"
+    if momentum_weight < config.SIGNAL_MIN_MOMENTUM_WEIGHT:
+        return False, (f"momentum {momentum_score:+.2f} computed on only "
+                       f"{momentum_weight:.0%} of window weight, below "
+                       f"{config.SIGNAL_MIN_MOMENTUM_WEIGHT:.0%} [FAIL]")
+    ok = momentum_score >= config.SIGNAL_MIN_MOMENTUM
+    return ok, (f"momentum {momentum_score:+.2f} >= {config.SIGNAL_MIN_MOMENTUM} "
+                f"on {momentum_weight:.0%} of window weight "
+                f"[{'PASS' if ok else 'FAIL'}]")
+
+
 def _buy_gates(
     etf: str | None,
     snapshot: IntradaySnapshot | None,
     news_today: float,
     news_count: int,
     momentum_score: float,
+    momentum_weight: float,
     illiquid: bool,
 ) -> tuple[bool, list[str]]:
     """Evaluate all BUY gates; return (all_passed, reason strings)."""
@@ -108,11 +130,8 @@ def _buy_gates(
         )
     else:
         intraday_ok = False
-    momentum_ok = momentum_score >= config.SIGNAL_MIN_MOMENTUM
-    reasons.append(
-        f"momentum {momentum_score:+.2f} >= {config.SIGNAL_MIN_MOMENTUM} "
-        f"[{'PASS' if momentum_ok else 'FAIL'}]"
-    )
+    momentum_ok, momentum_reason = _momentum_reason(momentum_score, momentum_weight)
+    reasons.append(momentum_reason)
     liquidity = _liquidity_reason(snapshot, illiquid)
     if liquidity is not None:
         reasons.append(liquidity)
@@ -126,6 +145,7 @@ def _decline_gates(
     news_today: float,
     news_count: int,
     momentum_score: float,
+    momentum_weight: float,
     illiquid: bool,
 ) -> tuple[bool, list[str]]:
     """Evaluate the mirror of the buy gates; return (all_passed, reasons).
@@ -155,9 +175,11 @@ def _decline_gates(
         )
     else:
         intraday_ok = False
-    momentum_ok = momentum_score <= -config.SIGNAL_MIN_MOMENTUM
+    reliable = momentum_weight >= config.SIGNAL_MIN_MOMENTUM_WEIGHT
+    momentum_ok = reliable and momentum_score <= -config.SIGNAL_MIN_MOMENTUM
     reasons.append(
         f"momentum {momentum_score:+.2f} <= {-config.SIGNAL_MIN_MOMENTUM} "
+        f"on {momentum_weight:.0%} of window weight "
         f"[{'PASS' if momentum_ok else 'FAIL'}]"
     )
     liquidity = _liquidity_reason(snapshot, illiquid)
@@ -173,10 +195,12 @@ def _classify(
     news_today: float,
     news_count: int,
     momentum_score: float,
+    momentum_weight: float,
     illiquid: bool,
 ) -> tuple[str, list[str]]:
     """Resolve a sector's action: BUY when every gate passes, else DON'T BUY."""
-    args = (etf, snapshot, news_today, news_count, momentum_score, illiquid)
+    args = (etf, snapshot, news_today, news_count, momentum_score,
+            momentum_weight, illiquid)
     buy_ok, buy_reasons = _buy_gates(*args)
     if buy_ok:
         return ACTION_BUY, buy_reasons
@@ -201,6 +225,13 @@ def decide(
         news_today, news_count = today_news.get(sector, (0.0, 0))
         sector_momentum = momentum.get(sector)
         momentum_score = sector_momentum.score if sector_momentum is not None else 0.0
+        # How much of the configured window weight actually produced a return.
+        # Absent data must not masquerade as a neutral 0.0 score.
+        momentum_weight = (
+            sum(weight for label, (weight, _) in config.MOMENTUM_WINDOWS.items()
+                if label in sector_momentum.returns)
+            if sector_momentum is not None else 0.0
+        )
         illiquid = (snapshot is not None
                     and snapshot.avg_volume_20d * snapshot.last_price
                     < config.SIGNAL_MIN_AVG_TURNOVER)
@@ -209,7 +240,8 @@ def decide(
                       + 0.4 * math.tanh(day_change / 1.0)
                       + 0.2 * momentum_score)
         action, reasons = _classify(
-            etf, snapshot, news_today, news_count, momentum_score, illiquid
+            etf, snapshot, news_today, news_count, momentum_score,
+            momentum_weight, illiquid
         )
         signals.append(
             TradeSignal(
@@ -220,6 +252,7 @@ def decide(
                 news_today=news_today,
                 news_count_today=news_count,
                 momentum=momentum_score,
+                momentum_weight=momentum_weight,
                 intraday=snapshot,
                 illiquid=illiquid,
                 reasons=reasons,
@@ -237,6 +270,7 @@ def is_declining(signal: TradeSignal) -> bool:
         and signal.news_today <= -config.SIGNAL_MIN_NEWS
         and signal.news_count_today >= config.SIGNAL_MIN_ARTICLES
         and snap.day_change_pct <= -config.SIGNAL_MIN_INTRADAY_PCT
+        and signal.momentum_weight >= config.SIGNAL_MIN_MOMENTUM_WEIGHT
         and signal.momentum <= -config.SIGNAL_MIN_MOMENTUM
     )
 
@@ -276,9 +310,10 @@ def _buy_story(signal: TradeSignal, name: str) -> list[str]:
         )
     parts.append(
         f"Zooming out, the multi-week trend is "
-        f"{_trend_words(signal.momentum)} ({signal.momentum:+.2f}) - this is "
-        f"the check that stops the rule buying something in free fall just "
-        f"because it looks cheap today."
+        f"{_trend_words(signal.momentum)} ({signal.momentum:+.2f}, measured on "
+        f"{signal.momentum_weight:.0%} of the price windows) - this is the "
+        f"check that stops the rule buying something in free fall just because "
+        f"it looks cheap today."
     )
     if snap is not None:
         parts.append(
@@ -311,7 +346,16 @@ def _no_buy_story(signal: TradeSignal, name: str) -> list[str]:
         failures.append(
             f"the price did not back it up ({snap.day_change_pct:+.2f}% on "
             f"the day, {snap.last_hour_change_pct:+.2f}% in the last hour)")
-    if signal.momentum < config.SIGNAL_MIN_MOMENTUM:
+    if signal.momentum_weight <= 0.0:
+        failures.append(
+            "the multi-week trend could not be measured at all, so the "
+            "falling-knife check cannot be cleared")
+    elif signal.momentum_weight < config.SIGNAL_MIN_MOMENTUM_WEIGHT:
+        failures.append(
+            f"the multi-week trend rests on only "
+            f"{signal.momentum_weight:.0%} of its price windows, too little "
+            f"to trust")
+    elif signal.momentum < config.SIGNAL_MIN_MOMENTUM:
         failures.append(
             f"the multi-week trend is falling too hard "
             f"({signal.momentum:+.2f})")
