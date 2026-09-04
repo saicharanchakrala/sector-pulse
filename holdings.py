@@ -14,14 +14,14 @@ TARGET_SUM_TOLERANCE = 0.5   # percentage points
 
 # Header candidates in priority order. Zerodha Console and Kite exports differ,
 # and both have changed shape over time, so match generously.
-_SYMBOL_HEADERS = ("symbol", "instrument", "tradingsymbol", "scrip", "name")
+_SYMBOL_HEADERS = ("symbol", "instrument", "tradingsymbol", "scrip")
 _QUANTITY_HEADERS = ("quantity available", "qty", "quantity", "net quantity",
                      "holdings quantity", "shares")
 _AVG_COST_HEADERS = ("average price", "avg cost", "average cost price",
                      "avg price", "buy average", "buy avg", "average")
 _PRICE_HEADERS = ("ltp", "last price", "last traded price", "cur price",
                   "market price", "previous closing price", "closing price",
-                  "close price")
+                  "close price", "price")
 
 # Zerodha ships several quantity columns; only the tradeable one is wanted.
 _QUANTITY_EXCLUDE = ("discrepant", "pledged", "long term", "collateral",
@@ -118,7 +118,7 @@ def _rows_to_holdings(reader: "csv.DictReader", symbol_col: str,
             continue
         quantity = _to_float(row.get(quantity_col))
         if quantity <= 0.0:
-            logger.warning("Skipping %s: quantity is %s", symbol, quantity)
+            logger.info("Skipping %s: quantity is %s", symbol, quantity)
             continue
         if symbol in seen:
             raise HoldingsError(f"Duplicate symbol in holdings file: {symbol}")

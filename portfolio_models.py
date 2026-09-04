@@ -76,6 +76,8 @@ class Plan:
     leftover: float = 0.0
     next_due: date | None = None
     price_source: str = "csv"
+    min_order_value: float = 0.0
+    unpriced: list[str] = field(default_factory=list)
 
     @property
     def deployed(self) -> float:

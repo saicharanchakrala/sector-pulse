@@ -9,7 +9,7 @@ import yfinance as yf
 import config
 # Reused rather than duplicated: the same MultiIndex-vs-flat column defence is
 # needed here as in the sector momentum path.
-from market_data import _close_series
+from market_data import close_series
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +40,7 @@ def fetch_last_prices(symbols: list[str],
     prices: dict[str, float] = {}
     for symbol, ticker in zip(wanted, tickers):
         try:
-            closes = _close_series(data, ticker, tickers)
+            closes = close_series(data, ticker, tickers)
             if closes is None:
                 logger.warning("No usable close price for %s (%s)", symbol, ticker)
                 continue

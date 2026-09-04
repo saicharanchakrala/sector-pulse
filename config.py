@@ -45,7 +45,7 @@ CLAUDE_MAX_TOKENS = 4096
 
 # --- Portfolio rebalancing (target-weight strategy) ---
 MONTHLY_CONTRIBUTION = 20_000.0   # rupees deployed per scheduled contribution
-CONTRIBUTION_INTERVAL_DAYS = 30   # scheduled cadence: monthly, not daily
+CONTRIBUTION_INTERVAL_MONTHS = 1  # scheduled cadence: calendar monthly, not daily
 REBALANCE_BAND_PP = 5.0           # off-cycle trigger: |drift| this many pp or more
 MIN_DAYS_BETWEEN_BUYS = 7         # floor between any two buys, band breach included
 MIN_ORDER_VALUE = 500.0           # skip dribble orders below this rupee value

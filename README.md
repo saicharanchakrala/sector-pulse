@@ -242,16 +242,35 @@ report. `--offline` skips the network entirely.
 Running this every day will not make you buy every day. The contribution is gated:
 
 - **First run** with no `contributions.csv` history: INVEST.
-- **Scheduled**: INVEST once `CONTRIBUTION_INTERVAL_DAYS` (30) have passed since the
-  last recorded buy.
-- **Off-cycle**: INVEST early only if the largest drift breaches `REBALANCE_BAND_PP`
-  (5pp) *and* at least `MIN_DAYS_BETWEEN_BUYS` (7) days have passed. This is the only
-  path to an unscheduled buy, and the spacing floor is what stops a volatile week from
-  turning into daily trading.
+- **Scheduled**: INVEST once the calendar month has rolled over from the last
+  recorded buy (`CONTRIBUTION_INTERVAL_MONTHS`, default 1). Buying on the 4th means
+  the next scheduled buy is the 4th of next month; a fixed 30-day interval would
+  instead walk backwards through the calendar (Jan 1, Jan 31, Mar 2, ...).
+- **Off-cycle**: INVEST early only if the largest *closeable* drift breaches
+  `REBALANCE_BAND_PP` (5pp) *and* at least `MIN_DAYS_BETWEEN_BUYS` (7) days have
+  passed. This is the only path to an unscheduled buy, and the spacing floor is what
+  stops a volatile week from turning into daily trading.
+
+  "Closeable" matters: the band looks only at holdings that are below target *and*
+  have a usable price, because those are the only ones a purchase can move. Drift on
+  an over-target, untracked, or unpriced holding would otherwise breach the band
+  forever while every run placed no orders, firing an off-cycle buy every 7 days.
 - **Otherwise**: HOLD, with the next due date and the drift table printed for
   information.
 
 Every gate is printed as a PASS or FAIL line, so a HOLD always explains itself.
+
+### Holdings outside your targets
+
+Target weights describe the portfolio you are actually managing, so weights are
+measured against the value of the *tracked* symbols only. A holding that is absent from
+`targets.yaml` sits outside the plan: it is listed with a `*`, its value is reported
+separately, and it is excluded from the drift band.
+
+That exclusion matters. If off-plan holdings counted toward the band, their weight would
+register as permanent drift that buying can never close, and the planner would fire an
+off-cycle buy every 7 days forever. Either add such a symbol to `targets.yaml` or sell it
+down; leaving it out simply means the tool ignores it when sizing contributions.
 
 ### Allocation modes
 
@@ -263,8 +282,10 @@ Every gate is printed as a PASS or FAIL line, so a HOLD always explains itself.
   tops up with whatever integer units the remainder can still buy.
 
 ETFs trade in whole units, so the planner floors every order and reports the undeployed
-remainder rather than pretending it was invested. `--min-order` (default 500) suppresses
-dribble orders; that symbol's share goes to the next real gap instead.
+remainder rather than pretending it was invested, along with the reason it is idle.
+`--min-order` (default 500) suppresses dribble orders: that symbol's share goes to the
+next real gap, and if every gap is too small the cash stays put and the report says so.
+Run with `--min-order 0` to deploy into small gaps as well.
 
 ### Recording a contribution
 

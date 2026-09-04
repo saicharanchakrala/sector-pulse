@@ -1,13 +1,14 @@
 """Contribution cadence: decide whether today is a buying day at all."""
 from __future__ import annotations
 
+import calendar
 import csv
 import logging
-from datetime import date, timedelta
+from datetime import date
 from pathlib import Path
 
 import config
-from allocator import max_abs_drift
+from allocator import actionable_drift
 from portfolio_models import DriftRow, Plan
 
 logger = logging.getLogger(__name__)
@@ -16,14 +17,27 @@ CONTRIBUTIONS_HEADER = ("date", "action", "symbol", "units", "last_price",
                         "amount", "portfolio_value", "mode")
 
 
+def add_months(start: date, months: int) -> date:
+    """Advance a date by whole calendar months, clamping to the month length."""
+    total = start.month - 1 + months
+    year = start.year + total // 12
+    month = total % 12 + 1
+    day = min(start.day, calendar.monthrange(year, month)[1])
+    return date(year, month, day)
+
+
 def load_last_contribution(path: "str | Path") -> "date | None":
-    """Return the date of the most recent recorded contribution, or None."""
+    """Return the date of the most recent recorded BUY, or None if there is none."""
     csv_path = Path(path)
     if not csv_path.exists():
         return None
     latest: "date | None" = None
     with csv_path.open("r", encoding="utf-8", newline="") as handle:
         for row in csv.DictReader(handle):
+            # Only executed contributions move the clock. A HOLD row would
+            # otherwise defer the next real buy by a full interval.
+            if (row.get("action") or "").strip().upper() != "INVEST":
+                continue
             raw = (row.get("date") or "").strip()
             if not raw:
                 continue
@@ -39,16 +53,15 @@ def load_last_contribution(path: "str | Path") -> "date | None":
 
 def record_contribution(path: "str | Path", plan: Plan) -> None:
     """Append one row per order to the contributions log, creating it if needed."""
+    if plan.action != "INVEST" or not plan.orders:
+        raise ValueError("refusing to record a contribution with no orders: "
+                         "only executed buys may move the cadence clock")
     csv_path = Path(path)
     is_new = not csv_path.exists()
     with csv_path.open("a", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
         if is_new:
             writer.writerow(CONTRIBUTIONS_HEADER)
-        if not plan.orders:
-            writer.writerow([plan.asof.isoformat(), plan.action, "", 0, "",
-                             0.0, round(plan.portfolio_value, 2), plan.mode])
-            return
         for order in plan.orders:
             writer.writerow([plan.asof.isoformat(), plan.action, order.symbol,
                              order.units, round(order.last_price, 2),
@@ -60,16 +73,21 @@ def evaluate_cadence(
     today: date,
     last_contribution: "date | None",
     rows: list[DriftRow],
-    interval_days: int = config.CONTRIBUTION_INTERVAL_DAYS,
+    interval_months: int = config.CONTRIBUTION_INTERVAL_MONTHS,
     band_pp: float = config.REBALANCE_BAND_PP,
     min_days_between_buys: int = config.MIN_DAYS_BETWEEN_BUYS,
 ) -> tuple[str, list[str], "date | None"]:
     """Decide INVEST or HOLD for today and explain every gate that was checked."""
-    drift = max_abs_drift(rows)
+    # Gate on drift a purchase can actually close, not on raw drift.
+    drift = actionable_drift(rows)
     if last_contribution is None:
-        return "INVEST", ["PASS: no contribution on record, this is the first run"], None
+        return "INVEST", [
+            "PASS: no contribution on record, this is the first run",
+            "WARNING: nothing is logged yet, so every run will say INVEST until "
+            "you record one with --record",
+        ], None
     days_since = (today - last_contribution).days
-    next_due = last_contribution + timedelta(days=interval_days)
+    next_due = add_months(last_contribution, interval_months)
     reasons: list[str] = [
         f"last contribution {last_contribution.isoformat()} "
         f"({days_since} day(s) ago)"
@@ -78,17 +96,17 @@ def evaluate_cadence(
         reasons.append("FAIL: last contribution is dated in the future, "
                        "check contributions.csv")
         return "HOLD", reasons, next_due
-    if days_since >= interval_days:
-        reasons.append(f"PASS: scheduled contribution due "
-                       f"({days_since} >= {interval_days} days)")
+    if today >= next_due:
+        reasons.append(f"PASS: scheduled contribution due, "
+                       f"{next_due.isoformat()} has passed")
         return "INVEST", reasons, next_due
     reasons.append(f"FAIL: scheduled contribution not due until "
-                   f"{next_due.isoformat()} ({days_since} < {interval_days} days)")
+                   f"{next_due.isoformat()}")
     if drift < band_pp:
-        reasons.append(f"FAIL: largest drift {drift:.2f}pp is inside the "
-                       f"{band_pp:.2f}pp rebalance band")
+        reasons.append(f"FAIL: largest closeable drift {drift:.2f}pp is inside "
+                       f"the {band_pp:.2f}pp rebalance band")
         return "HOLD", reasons, next_due
-    reasons.append(f"PASS: largest drift {drift:.2f}pp breaches the "
+    reasons.append(f"PASS: largest closeable drift {drift:.2f}pp breaches the "
                    f"{band_pp:.2f}pp rebalance band")
     if days_since < min_days_between_buys:
         reasons.append(f"FAIL: only {days_since} day(s) since the last buy, "

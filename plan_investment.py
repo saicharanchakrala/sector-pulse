@@ -10,10 +10,11 @@ import argparse
 import dataclasses
 import json
 import logging
+import math
 from datetime import date
 
 import config
-from allocator import compute_rows, max_abs_drift, plan_orders
+from allocator import compute_rows, max_abs_drift, plan_orders, untracked_value
 from holdings import HoldingsError, TargetsError, load_holdings, load_targets
 from portfolio_models import Holding, Order, Plan
 from schedule_rules import (evaluate_cadence, load_last_contribution,
@@ -28,7 +29,7 @@ DISCLAIMER = (
 
 
 def _parse_args() -> argparse.Namespace:
-    """Define and parse the command line."""
+    """Define, parse, and validate the command line."""
     parser = argparse.ArgumentParser(
         description="Plan where a contribution should go using target weights.")
     parser.add_argument("--amount", type=float, default=config.MONTHLY_CONTRIBUTION,
@@ -52,46 +53,71 @@ def _parse_args() -> argparse.Namespace:
                         help="log this contribution as executed today")
     parser.add_argument("--json", action="store_true",
                         help="print the plan as JSON instead of a report")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.amount <= 0.0:
+        parser.error(f"--amount must be positive, got {args.amount}")
+    if args.min_order < 0.0:
+        parser.error(f"--min-order cannot be negative, got {args.min_order}")
+    return args
 
 
 def fetch_prices(symbols: list[str]) -> dict[str, float]:
     """Fetch live prices, degrading to an empty dict if yfinance is unusable."""
     try:
         from quotes import fetch_last_prices
-    except ImportError as exc:
+    # A broken pandas or numpy install raises at import time, not just ImportError.
+    except (ImportError, OSError, ValueError, RuntimeError) as exc:
         logger.warning("Price fetching unavailable: %s", exc)
         return {}
     return fetch_last_prices(symbols)
 
 
+def _describe_source(fetched: int, wanted: int, offline: bool) -> str:
+    """Say where prices came from, including any partial fallback to the CSV."""
+    if offline:
+        return "csv (offline)"
+    if fetched == 0:
+        return "csv (yfinance unavailable)"
+    if fetched < wanted:
+        return f"yfinance {fetched}/{wanted}, {wanted - fetched} from csv"
+    return "yfinance"
+
+
 def _resolve_prices(held: list[Holding], targets: dict[str, float],
-                    offline: bool) -> tuple[list[Holding], str]:
+                    offline: bool) -> tuple[list[Holding], str, list[str]]:
     """Merge live prices over CSV prices and add zero-quantity target symbols."""
     symbols = sorted({holding.symbol for holding in held} | set(targets))
-    prices: dict[str, float] = {}
-    source = "csv"
-    if not offline:
-        prices = fetch_prices(symbols)
-        source = "yfinance" if prices else "csv (yfinance unavailable)"
+    prices: dict[str, float] = {} if offline else fetch_prices(symbols)
+    source = _describe_source(len(prices), len(symbols), offline)
     by_symbol = {holding.symbol: holding for holding in held}
     resolved: list[Holding] = []
+    unpriced: list[str] = []
     for symbol in symbols:
         holding = by_symbol.get(symbol)
         price = prices.get(symbol, holding.last_price if holding else 0.0)
+        if price <= 0.0:
+            unpriced.append(symbol)
         if holding is None:
             resolved.append(Holding(symbol=symbol, quantity=0.0, avg_cost=0.0,
                                     last_price=price))
         else:
             resolved.append(dataclasses.replace(holding, last_price=price))
-    return resolved, source
+    return resolved, source, unpriced
 
 
 def build_plan(args: argparse.Namespace, today: date) -> Plan:
     """Load inputs, decide the cadence, and allocate the contribution."""
     targets = load_targets(args.targets)
     held = load_holdings(args.holdings)
-    priced, source = _resolve_prices(held, targets, args.offline)
+    priced, source, unpriced = _resolve_prices(held, targets, args.offline)
+    if len(unpriced) == len(priced):
+        raise HoldingsError(
+            "No usable prices for any symbol. Add a last-price column (LTP or "
+            "Previous Closing Price) to the holdings CSV, or drop --offline so "
+            "prices can be fetched.")
+    if unpriced:
+        logger.warning("No price for %s; they cannot be bought this run",
+                       ", ".join(unpriced))
     rows = compute_rows(priced, targets, cash=args.amount)
     action, reasons, next_due = evaluate_cadence(
         today, load_last_contribution(config.CONTRIBUTIONS_CSV), rows)
@@ -105,7 +131,8 @@ def build_plan(args: argparse.Namespace, today: date) -> Plan:
     return Plan(asof=today, action=action, reasons=reasons, cash=args.amount,
                 portfolio_value=sum(row.value for row in rows), mode=args.mode,
                 rows=rows, orders=orders, leftover=leftover, next_due=next_due,
-                price_source=source)
+                price_source=source, min_order_value=args.min_order,
+                unpriced=unpriced)
 
 
 def _print_drift_table(plan: Plan) -> None:
@@ -122,15 +149,51 @@ def _print_drift_table(plan: Plan) -> None:
               f"{row.last_price:>10,.2f}{row.value:>12,.0f}"
               f"{row.actual_weight:>8.2f}%{row.target_weight:>8.2f}%"
               f"{row.drift_pp:>+8.2f}%{short:>12}{row.pnl_pct:>+8.1f}%")
-    if any(row.untracked for row in plan.rows):
-        print("\n  * held but absent from the targets file, target treated as 0%")
+    stranded = untracked_value(plan.rows)
+    if stranded > 0:
+        print(f"\n  * held but absent from the targets file, target treated as 0%."
+              f"\n    {stranded:,.0f} sits outside your targets. Buying cannot "
+              f"close that gap, so it is\n    excluded from the drift band. Add "
+              f"these to targets.yaml or sell them down.")
+    if plan.unpriced:
+        print(f"\n  No price for {', '.join(plan.unpriced)} - excluded from "
+              f"this run's orders.")
+
+
+def _no_orders_reason(plan: Plan) -> str:
+    """Explain precisely why the allocator produced nothing."""
+    gaps = [row for row in plan.rows
+            if row.deficit > 0.0 and row.last_price > 0.0]
+    if not gaps:
+        if plan.unpriced:
+            return "No orders: the symbols below target have no usable price."
+        return "No orders: nothing is below its target weight."
+    cheapest = min(row.last_price for row in gaps)
+    if plan.cash < cheapest:
+        return (f"No orders: {plan.cash:,.0f} cannot buy one unit of anything "
+                f"below target (cheapest is {cheapest:,.2f}).")
+    largest = max(row.deficit for row in gaps)
+    if largest < plan.min_order_value:
+        return (f"No orders: every shortfall is below the "
+                f"{plan.min_order_value:,.0f} minimum order value (largest was "
+                f"{largest:,.0f}). Lower --min-order to buy anyway.")
+    # Every gap is big enough in principle, so the blocker is unit granularity:
+    # no symbol can reach the minimum order value with whole units at this cash.
+    needed = min((math.ceil(plan.min_order_value / row.last_price)
+                  * row.last_price, row.symbol) for row in gaps)
+    if needed[0] > plan.cash:
+        return (f"No orders: reaching the {plan.min_order_value:,.0f} minimum "
+                f"order value needs at least {needed[0]:,.0f} "
+                f"({needed[1]}), more than the {plan.cash:,.0f} available. "
+                f"Lower --min-order or contribute more.")
+    return ("No orders: the cash cannot buy a whole unit without overshooting "
+            "a target.")
 
 
 def _print_orders(plan: Plan) -> None:
     """Print the buy list, or say why there is nothing to buy."""
     if not plan.orders:
-        print("\nNo orders. Either nothing is below target, or the cash cannot "
-              "buy a whole unit without overshooting a target.")
+        print(f"\n{_no_orders_reason(plan)}")
         return
     header = (f"{'BUY':<12}{'UNITS':>7}{'LTP':>10}{'AMOUNT':>12}"
               f"{'WEIGHT AFTER':>15}")
@@ -144,12 +207,33 @@ def _print_orders(plan: Plan) -> None:
     print(f"{'TOTAL':<12}{'':>7}{'':>10}{plan.deployed:>12,.0f}")
 
 
-def print_report(plan: Plan) -> None:
+def _print_idle_cash_reason(plan: Plan) -> None:
+    """Explain leftover cash when a minimum order value is what stranded it."""
+    if plan.leftover <= 0.0 or not plan.orders:
+        return
+    skipped = [row.symbol for row in plan.rows
+               if row.last_price > 0.0
+               and 0.0 < row.deficit < plan.min_order_value]
+    if skipped:
+        print(f"  Idle because these gaps are under the "
+              f"{plan.min_order_value:,.0f} minimum order value: "
+              f"{', '.join(skipped)}.\n  Use --min-order 0 to buy them too.")
+        return
+    print("  Idle because the remaining gaps cannot take another whole unit "
+          "without\n  overshooting their targets. It carries to your next "
+          "contribution.")
+
+
+def print_report(plan: Plan, recorded: bool = False) -> None:
     """Print the full human-readable plan."""
     print(f"\nCONTRIBUTION PLAN - {plan.asof.isoformat()}")
-    print(f"Portfolio {plan.portfolio_value:,.0f}  |  contribution "
-          f"{plan.cash:,.0f}  |  mode {plan.mode}  |  prices {plan.price_source}")
-    print(f"Largest drift {max_abs_drift(plan.rows):.2f}pp  |  band "
+    stranded = untracked_value(plan.rows)
+    book = f"Portfolio {plan.portfolio_value:,.0f}"
+    if stranded > 0:
+        book += f" (tracked {plan.portfolio_value - stranded:,.0f})"
+    print(f"{book}  |  contribution {plan.cash:,.0f}  |  mode "
+          f"{plan.mode}  |  prices {plan.price_source}")
+    print(f"Largest tracked drift {max_abs_drift(plan.rows):.2f}pp  |  band "
           f"{config.REBALANCE_BAND_PP:.2f}pp")
     print(f"\nDECISION: {plan.action}")
     for reason in plan.reasons:
@@ -161,6 +245,11 @@ def print_report(plan: Plan) -> None:
     if plan.action == "INVEST" or plan.orders:
         _print_orders(plan)
         print(f"\nUndeployed cash: {plan.leftover:,.0f}")
+        _print_idle_cash_reason(plan)
+    if plan.action == "INVEST" and plan.orders and not recorded:
+        print("\nAfter placing these orders, run again with --record so the "
+              "cadence clock restarts.\nWithout it the next run will say "
+              "INVEST again.")
     print(f"\n{DISCLAIMER}")
 
 
@@ -182,18 +271,23 @@ def main() -> int:
     except (HoldingsError, TargetsError) as exc:
         print(f"ERROR: {exc}")
         return 2
+    recorded = False
+    if args.record and plan.action == "INVEST" and plan.orders:
+        record_contribution(config.CONTRIBUTIONS_CSV, plan)
+        recorded = True
     if args.json:
         print(json.dumps(_plan_to_dict(plan), indent=2))
     else:
-        print_report(plan)
-    config.LAST_PLAN_JSON.write_text(
-        json.dumps(_plan_to_dict(plan), indent=2), encoding="utf-8")
-    if args.record:
-        if plan.action == "INVEST" and plan.orders:
-            record_contribution(config.CONTRIBUTIONS_CSV, plan)
-            print(f"\nRecorded to {config.CONTRIBUTIONS_CSV.name}")
-        else:
-            print("\nNothing recorded: no orders were planned.")
+        print_report(plan, recorded=recorded)
+    try:
+        config.LAST_PLAN_JSON.write_text(
+            json.dumps(_plan_to_dict(plan), indent=2), encoding="utf-8")
+    except OSError as exc:
+        logger.warning("Could not write %s: %s", config.LAST_PLAN_JSON, exc)
+    if recorded:
+        print(f"\nRecorded to {config.CONTRIBUTIONS_CSV.name}")
+    elif args.record:
+        print("\nNothing recorded: no orders were planned.")
     return 0
 
 

@@ -14,7 +14,7 @@ from profiles import MarketProfile, get_profile
 logger = logging.getLogger(__name__)
 
 
-def _close_series(data: pd.DataFrame, ticker: str,
+def close_series(data: pd.DataFrame, ticker: str,
                   requested_tickers: "list[str]") -> "pd.Series | None":
     """Return the Close series (leading NaNs trimmed) for one ticker, or None."""
     columns = data.columns
@@ -94,7 +94,7 @@ def get_sector_momentum(
     momentum: dict[str, SectorMomentum] = {}
     for name, sector_def in resolved.sectors.items():
         try:
-            closes = _close_series(data, sector_def.etf, tickers)
+            closes = close_series(data, sector_def.etf, tickers)
             if closes is None:
                 logger.warning("No usable close prices for %s (%s)",
                                name, sector_def.etf)
