@@ -270,6 +270,25 @@ def test_declining_diagnostic_needs_reliable_momentum_too() -> None:
     assert decision.is_declining(metal) is False
 
 
+def test_declining_needs_a_real_downtrend_not_merely_a_weak_uptrend() -> None:
+    # SIGNAL_MIN_MOMENTUM is negative, so `<= -SIGNAL_MIN_MOMENTUM` reads as
+    # `<= +0.2` and admitted mild uptrends as "actively declining". These gates
+    # were originally SELL gates, where that leniency was deliberate.
+    from decision import TradeSignal
+    snap = _snapshot("X.NS", 100.0, 5_000_000.0, day_change=-1.5, last_hour=-0.5)
+
+    def declining(momentum: float) -> bool:
+        signal = TradeSignal("Metal", "METALIETF.NS", decision.ACTION_NO_BUY,
+                             0.0, -0.5, 5, momentum, 1.0, snap, False, [])
+        return decision.is_declining(signal)
+
+    assert declining(0.15) is False, "a rising sector is not under pressure"
+    assert declining(0.0) is False, "a flat sector is not under pressure"
+    assert declining(-0.1) is False, "inside the floor is not under pressure"
+    assert declining(config.SIGNAL_MIN_MOMENTUM) is True, "the floor itself counts"
+    assert declining(-0.5) is True, "a real downtrend must register"
+
+
 def _main() -> int:
     """Run every test_* function in this module and report the tally."""
     tests = {name: obj for name, obj in sorted(globals().items())

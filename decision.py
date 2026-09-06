@@ -176,9 +176,13 @@ def _decline_gates(
     else:
         intraday_ok = False
     reliable = momentum_weight >= config.SIGNAL_MIN_MOMENTUM_WEIGHT
-    momentum_ok = reliable and momentum_score <= -config.SIGNAL_MIN_MOMENTUM
+    # SIGNAL_MIN_MOMENTUM is itself negative, so negating it inverts the test.
+    # These gates began life as SELL gates, where `<= +0.2` deliberately meant
+    # "do not sell into a strong uptrend". Read as an actively-declining
+    # diagnostic that admits mild uptrends, so compare against the floor itself.
+    momentum_ok = reliable and momentum_score <= config.SIGNAL_MIN_MOMENTUM
     reasons.append(
-        f"momentum {momentum_score:+.2f} <= {-config.SIGNAL_MIN_MOMENTUM} "
+        f"momentum {momentum_score:+.2f} <= {config.SIGNAL_MIN_MOMENTUM} "
         f"on {momentum_weight:.0%} of window weight "
         f"[{'PASS' if momentum_ok else 'FAIL'}]"
     )
@@ -271,7 +275,7 @@ def is_declining(signal: TradeSignal) -> bool:
         and signal.news_count_today >= config.SIGNAL_MIN_ARTICLES
         and snap.day_change_pct <= -config.SIGNAL_MIN_INTRADAY_PCT
         and signal.momentum_weight >= config.SIGNAL_MIN_MOMENTUM_WEIGHT
-        and signal.momentum <= -config.SIGNAL_MIN_MOMENTUM
+        and signal.momentum <= config.SIGNAL_MIN_MOMENTUM
     )
 
 
