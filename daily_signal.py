@@ -101,6 +101,24 @@ def write_last_signal(signals: list[TradeSignal], market: str,
         logger.warning("Could not write %s: %s", config.LAST_SIGNAL_JSON, exc)
 
 
+def persist_run(signals: list[TradeSignal], profile_key: str, now: datetime,
+                items: list, pick: "TradeSignal | None" = None) -> int:
+    """Archive the headlines and record the run; return headlines archived.
+
+    The CLI and the dashboard button both go through here. When they had
+    separate copies the button silently recorded nothing at all, and the
+    duplicate it was later given shadowed a caller's variable.
+    """
+    resolved_pick = top_pick(signals) if pick is None else pick
+    archived = news_archive.archive_news(items)
+    append_csv_rows([
+        _csv_row(signal, now, profile_key, signal is resolved_pick)
+        for signal in signals
+    ])
+    write_last_signal(signals, profile_key, now)
+    return archived
+
+
 def _signal_line(signal: TradeSignal) -> str:
     """Format one '<ACTION> ETF (sector) - rank' fragment for the headline."""
     return (f"{signal.action} {signal.etf} ({signal.sector}) - "
@@ -215,11 +233,7 @@ def run(market: str) -> int:
         return 0
     signals = decide(items, momentum, snapshots, profile)
     print_report(signals, profile, now)
-    pick = top_pick(signals)
-    append_csv_rows([
-        _csv_row(signal, now, profile.key, signal is pick) for signal in signals
-    ])
-    write_last_signal(signals, profile.key, now)
+    persist_run(signals, profile.key, now, items)
     return 0
 
 

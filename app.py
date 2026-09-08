@@ -340,18 +340,14 @@ def render_signal_section(
                     "top_pick": signal_to_dict(pick) if pick is not None else None,
                     "signals": [signal_to_dict(s) for s in signals],
                 }
-                # Persist exactly as the CLI does. A button that shows a signal
-                # and records nothing is worse than one that fails: you would
-                # believe the day was captured, and the headlines behind it
-                # would age out of the feeds within 48h, unbacktestable.
-                stored = news_archive.archive_news(items)
-                daily_signal.append_csv_rows([
-                    daily_signal._csv_row(s, now, profile.key, s is pick)
-                    for s in signals
-                ])
-                daily_signal.write_last_signal(signals, profile.key, now)
+                # Same persistence path as the CLI. A button that shows a
+                # signal and records nothing is worse than one that fails:
+                # you would believe the day was captured, and the headlines
+                # behind it age out of the feeds within 48h.
+                archived = daily_signal.persist_run(
+                    signals, profile.key, now, items, pick)
                 st.caption(f"Recorded to signals.csv and last_signal.json; "
-                           f"archived {stored} new headline(s).")
+                           f"archived {archived} new headline(s).")
     live = st.session_state.get("live_signal")
     if live is not None and live.get("market") != profile.key:
         live = None

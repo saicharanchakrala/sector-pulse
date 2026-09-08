@@ -463,6 +463,73 @@ def test_classification_holds_through_the_public_analyze_path() -> None:
             f"{sector} took {scores[sector].news_count} from a roundup")
 
 
+# --- run persistence (CLI and dashboard share this) ----------------------
+
+def test_persist_run_writes_all_three_artifacts() -> None:
+    # The dashboard button recorded nothing at all until this path was shared,
+    # and the inline copy it was first given shadowed a caller's variable.
+    import csv as _csv
+    import json as _json
+    import daily_signal
+    from decision import TradeSignal
+
+    snap = _snapshot("METALIETF.NS", 13.40, 8_000_000.0)
+    buy = TradeSignal("Metal", "METALIETF.NS", decision.ACTION_BUY, 0.5, 0.4, 6,
+                      config.SIGNAL_MIN_ARTICLES, 0.3, 1.0, snap, False, [])
+    skip = TradeSignal("IT", "ITBEES.NS", decision.ACTION_NO_BUY, -0.1, -0.2, 4,
+                       config.SIGNAL_MIN_ARTICLES, 0.1, 1.0, snap, False, [])
+    items = [_item(i) for i in range(3)]
+    now = datetime(2026, 9, 8, 15, 15, tzinfo=timezone.utc)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        original = (config.SIGNALS_CSV, config.LAST_SIGNAL_JSON,
+                    config.NEWS_ARCHIVE_DIR)
+        config.SIGNALS_CSV = root / "signals.csv"
+        config.LAST_SIGNAL_JSON = root / "last_signal.json"
+        config.NEWS_ARCHIVE_DIR = root / "news_archive"
+        try:
+            archived = daily_signal.persist_run([buy, skip], "IN", now, items)
+            assert archived == 3, archived
+            rows = list(_csv.DictReader(
+                config.SIGNALS_CSV.open(encoding="utf-8")))
+            assert len(rows) == 2, rows
+            assert {r["sector"] for r in rows} == {"Metal", "IT"}
+            top = [r for r in rows if r["top_pick"] == "True"]
+            assert len(top) == 1 and top[0]["sector"] == "Metal", rows
+            payload = _json.loads(
+                config.LAST_SIGNAL_JSON.read_text(encoding="utf-8"))
+            assert payload["market"] == "IN"
+            assert payload["top_pick"]["etf"] == "METALIETF.NS"
+            assert payload["top_pick"]["explanation"], "prose must be stored"
+            assert len(news_archive.archived_days(config.NEWS_ARCHIVE_DIR)) == 1
+        finally:
+            (config.SIGNALS_CSV, config.LAST_SIGNAL_JSON,
+             config.NEWS_ARCHIVE_DIR) = original
+
+
+def test_persist_run_returns_zero_when_nothing_new_to_archive() -> None:
+    import daily_signal
+    from decision import TradeSignal
+    snap = _snapshot("METALIETF.NS", 13.40, 8_000_000.0)
+    sig = TradeSignal("Metal", "METALIETF.NS", decision.ACTION_NO_BUY, 0.0, 0.0,
+                      1, config.SIGNAL_MIN_ARTICLES, 0.0, 1.0, snap, False, [])
+    now = datetime(2026, 9, 8, 15, 15, tzinfo=timezone.utc)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        original = (config.SIGNALS_CSV, config.LAST_SIGNAL_JSON,
+                    config.NEWS_ARCHIVE_DIR)
+        config.SIGNALS_CSV = root / "signals.csv"
+        config.LAST_SIGNAL_JSON = root / "last_signal.json"
+        config.NEWS_ARCHIVE_DIR = root / "news_archive"
+        try:
+            assert daily_signal.persist_run([sig], "IN", now, []) == 0
+            assert config.SIGNALS_CSV.exists(), "the run must still be recorded"
+        finally:
+            (config.SIGNALS_CSV, config.LAST_SIGNAL_JSON,
+             config.NEWS_ARCHIVE_DIR) = original
+
+
 def _main() -> int:
     """Run every test_* function in this module and report the tally."""
     tests = {name: obj for name, obj in sorted(globals().items())
