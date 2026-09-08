@@ -6,6 +6,7 @@ import logging
 import math
 import re
 import unicodedata
+from collections import Counter
 from datetime import datetime, timezone
 
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
@@ -56,6 +57,7 @@ _PHRASE_BOOST_DIVISOR = 8.0
 
 _VADER_CACHE: dict[str, SentimentIntensityAnalyzer] = {}
 _PATTERN_CACHE: dict[str, dict[str, "re.Pattern[str]"]] = {}
+_SHARED_CACHE: dict[str, frozenset[str]] = {}
 
 
 def _get_vader(profile: MarketProfile) -> SentimentIntensityAnalyzer:
@@ -73,13 +75,25 @@ def _sector_patterns(profile: MarketProfile) -> dict[str, "re.Pattern[str]"]:
     """Build (once per profile) one case-insensitive word-boundary regex per sector."""
     patterns = _PATTERN_CACHE.get(profile.key)
     if patterns is None:
-        patterns = {
-            name: re.compile(
-                r"\b(?:" + "|".join(re.escape(kw) for kw in sector.keywords) + r")\b",
+        shared = _shared_keywords(profile)
+        patterns = {}
+        for name, sector in profile.sectors.items():
+            # Longest first: alternation is leftmost-match, so a shorter
+            # alternative listed earlier permanently hides a longer one
+            # ("icici" swallowed "icici bank"), which understated strength for
+            # 37 compound company names. Shared keywords are removed from the
+            # pattern rather than filtered afterwards, or a shared superstring
+            # ("gross npa") would consume an exclusive substring ("npa").
+            usable = sorted({kw.lower() for kw in sector.keywords} - shared,
+                            key=len, reverse=True)
+            if not usable:
+                logger.warning("Sector %s has no discriminating keywords left",
+                               name)
+                continue
+            patterns[name] = re.compile(
+                r"\b(?:" + "|".join(re.escape(kw) for kw in usable) + r")\b",
                 re.IGNORECASE,
             )
-            for name, sector in profile.sectors.items()
-        }
         _PATTERN_CACHE[profile.key] = patterns
     return patterns
 
@@ -107,7 +121,87 @@ def _normalize_match_text(text: str) -> str:
     return unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
 
 
-def _score_items(items: list[NewsItem], profile: MarketProfile) -> list[ScoredNewsItem]:
+def _shared_keywords(profile: MarketProfile) -> frozenset[str]:
+    """Keywords claimed by more than one sector in this profile, cached.
+
+    A term on several sectors' lists carries no sector-discriminating
+    information. `rbi` sits on both the Banks and Financial Services lists, so
+    every RBI story scored 2 for each, tied, and was filed under both: that
+    single word produced most of the 130 Banks/Financial-Services collisions
+    across a three-day sample. Such terms still matter for sentiment; they just
+    cannot decide which sector a story is about.
+    """
+    cached = _SHARED_CACHE.get(profile.key)
+    if cached is None:
+        counts = Counter(keyword.lower()
+                         for sector_def in profile.sectors.values()
+                         for keyword in set(sector_def.keywords))
+        cached = frozenset(word for word, seen in counts.items() if seen > 1)
+        _SHARED_CACHE[profile.key] = cached
+    return cached
+
+
+def _sector_strengths(item: NewsItem,
+                      patterns: dict[str, "re.Pattern[str]"]) -> dict[str, int]:
+    """Distinct-keyword match strength per sector, weighting the title higher.
+
+    A headline naming a company is far stronger evidence than the same name
+    buried in a summary, and counting DISTINCT keywords stops one repeated
+    term from looking like broad coverage of a sector. Keywords shared with
+    another sector are already absent from the pattern, so every match here
+    is sector-exclusive. A keyword in both title and summary scores
+    TITLE_MATCH_WEIGHT once, not weight-plus-one.
+    """
+    title = _normalize_match_text(item.title)
+    summary = _normalize_match_text(item.summary or "")
+    strengths: dict[str, int] = {}
+    for name, pattern in patterns.items():
+        in_title = {m.group(0).lower() for m in pattern.finditer(title)}
+        in_summary = {m.group(0).lower() for m in pattern.finditer(summary)}
+        if not in_title and not in_summary:
+            continue
+        strengths[name] = (config.TITLE_MATCH_WEIGHT * len(in_title)
+                           + len(in_summary - in_title))
+    return strengths
+
+
+def _assign_sectors(strengths: dict[str, int]) -> list[str]:
+    """Pick the sectors an article belongs to, or none.
+
+    Two filters the old single-hit rule lacked. An article that qualifies for
+    more than MAX_SECTORS_PER_ARTICLE sectors is a market roundup naming one
+    company per sector: it mentions everything and therefore says nothing about
+    anything, so it is dropped rather than voting everywhere. What survives is
+    then narrowed to the best-matching sectors, which is what separates a story
+    about a bank from a story about financial services generally.
+    """
+    qualifying = {name: strength for name, strength in strengths.items()
+                  if strength >= config.MIN_MATCH_STRENGTH}
+    if not qualifying or len(qualifying) > config.MAX_SECTORS_PER_ARTICLE:
+        return []
+    best = max(qualifying.values())
+    if len(qualifying) > 1 and best < config.TITLE_MATCH_WEIGHT:
+        # Several sectors, none named in the headline: a market wrap listing
+        # index movers. One such item pushed +0.97 sentiment into the three
+        # sectors its own summary named as the day's biggest losers.
+        return []
+    return sorted(name for name, strength in qualifying.items() if strength == best)
+
+
+def classify_items(items: list[NewsItem],
+                   profile: MarketProfile) -> list[list[str]]:
+    """Sector assignments only, with no sentiment work.
+
+    Baseline computation reads sector counts and nothing else, so running
+    VADER over a year of archive would burn roughly a minute per call for a
+    result it discards.
+    """
+    patterns = _sector_patterns(profile)
+    return [_assign_sectors(_sector_strengths(item, patterns)) for item in items]
+
+
+def score_items(items: list[NewsItem],
+                profile: MarketProfile) -> list[ScoredNewsItem]:
     """Classify each item into sectors and attach sentiment and recency weight."""
     patterns = _sector_patterns(profile)
     vader = _get_vader(profile)
@@ -115,8 +209,7 @@ def _score_items(items: list[NewsItem], profile: MarketProfile) -> list[ScoredNe
     scored: list[ScoredNewsItem] = []
     for item in items:
         summary = item.summary or ""
-        match_text = _normalize_match_text(f"{item.title} {summary}")
-        matched = [name for name, pattern in patterns.items() if pattern.search(match_text)]
+        matched = _assign_sectors(_sector_strengths(item, patterns))
         sentiment = vader.polarity_scores(f"{item.title}. {summary[:300]}")["compound"]
         if profile.phrases:
             sentiment += _phrase_boost(f"{item.title} {summary}".lower(), profile.phrases)
@@ -140,7 +233,7 @@ def analyze(
 ) -> list[SectorScore]:
     """Rank the profile's sectors by a composite of news sentiment and momentum."""
     resolved = get_profile() if profile is None else profile
-    scored = _score_items(items, resolved)
+    scored = score_items(items, resolved)
     by_sector: dict[str, list[ScoredNewsItem]] = {name: [] for name in resolved.sectors}
     for scored_item in scored:
         for name in scored_item.sectors:

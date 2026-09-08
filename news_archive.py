@@ -13,13 +13,18 @@ from __future__ import annotations
 
 import json
 import logging
+import statistics
 from datetime import date, datetime, timezone
 from pathlib import Path
 
 import config
 from models import NewsItem
+from profiles import MarketProfile
 
 logger = logging.getLogger(__name__)
+
+# Keyed on (profile, exact day list) so a new archive file invalidates it.
+_BASELINE_CACHE: dict[tuple, dict[str, float]] = {}
 
 
 def archive_path(day: date, directory: "str | Path | None" = None) -> Path:
@@ -115,6 +120,61 @@ def load_archived_news(day: date,
         return []
     items.sort(key=lambda item: item.published, reverse=True)
     return items
+
+
+def sector_article_baselines(
+    profile: MarketProfile,
+    directory: "str | Path | None" = None,
+    min_days: int = config.SIGNAL_BASELINE_MIN_DAYS,
+) -> dict[str, float]:
+    """Median articles per day per sector, from the archive. Empty until mature.
+
+    A flat article floor treats every sector alike, but coverage is wildly
+    uneven: Banks draws around 26 articles a day and Pharma under 3. Three
+    articles is therefore noise for one sector and a whole day's coverage for
+    another. Returning {} until `min_days` are archived keeps the flat floor in
+    force rather than inventing a baseline from one or two days.
+    """
+    import analyzer                              # sectors-only, skips VADER
+
+    days = archived_days(directory)[-config.SIGNAL_BASELINE_MAX_DAYS:]
+    if len(days) < min_days:
+        return {}
+    root = Path(directory) if directory is not None else config.NEWS_ARCHIVE_DIR
+    # The directory belongs in the key: two archives can hold the same
+    # day names, and without it the second one reads the first's result.
+    key = (profile.key, str(root), tuple(day.isoformat() for day in days))
+    cached = _BASELINE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    per_day: dict[str, list[int]] = {name: [] for name in profile.sectors}
+    for day in days:
+        items = load_archived_news(day, directory)
+        if not items:
+            continue
+        counts = {name: 0 for name in profile.sectors}
+        for sectors in analyzer.classify_items(items, profile):
+            for name in sectors:
+                counts[name] += 1
+        for name, count in counts.items():
+            per_day[name].append(count)
+    # An archive file spans a whole fetch day, but the gate counts articles
+    # over SIGNAL_NEWS_HOURS only. Convert to the gate's window explicitly
+    # rather than relying on the fraction happening to cancel the ratio.
+    window = config.SIGNAL_NEWS_HOURS / 24.0
+    baselines = {name: statistics.median(counts) * window
+                 for name, counts in per_day.items() if counts}
+    _BASELINE_CACHE[key] = baselines
+    return baselines
+
+
+def required_articles(sector: str, baselines: dict[str, float]) -> int:
+    """Article floor for one sector: a share of its own norm, never below the flat one."""
+    baseline = baselines.get(sector)
+    if baseline is None or baseline <= 0.0:
+        return config.SIGNAL_MIN_ARTICLES
+    scaled = int(baseline * config.SIGNAL_MIN_ARTICLES_FRACTION)
+    return max(config.SIGNAL_MIN_ARTICLES, scaled)
 
 
 def archived_days(directory: "str | Path | None" = None) -> list[date]:

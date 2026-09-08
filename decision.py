@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 
 import analyzer
 import config
+import news_archive
 from intraday import IntradaySnapshot
 from models import NewsItem, SectorMomentum
 from profiles import MarketProfile, get_profile
@@ -39,6 +40,7 @@ class TradeSignal:
     rank_score: float
     news_today: float               # news score computed on today-only items
     news_count_today: int
+    min_articles: int               # the floor actually applied to this sector
     momentum: float                 # multi-day momentum score (0.0 if unavailable)
     momentum_weight: float          # share of MOMENTUM_WINDOWS weight actually used
     intraday: IntradaySnapshot | None
@@ -104,6 +106,7 @@ def _buy_gates(
     snapshot: IntradaySnapshot | None,
     news_today: float,
     news_count: int,
+    min_articles: int,
     momentum_score: float,
     momentum_weight: float,
     illiquid: bool,
@@ -113,10 +116,10 @@ def _buy_gates(
     tradeable, reason = _tradeable_reason(etf, snapshot)
     reasons.append(reason)
     news_ok = (news_today >= config.SIGNAL_MIN_NEWS
-               and news_count >= config.SIGNAL_MIN_ARTICLES)
+               and news_count >= min_articles)
     reasons.append(
         f"news {news_today:+.2f} >= {config.SIGNAL_MIN_NEWS} and "
-        f"n={news_count} >= {config.SIGNAL_MIN_ARTICLES} "
+        f"n={news_count} >= {min_articles} "
         f"[{'PASS' if news_ok else 'FAIL'}]"
     )
     if snapshot is not None:
@@ -144,6 +147,7 @@ def _decline_gates(
     snapshot: IntradaySnapshot | None,
     news_today: float,
     news_count: int,
+    min_articles: int,
     momentum_score: float,
     momentum_weight: float,
     illiquid: bool,
@@ -158,10 +162,10 @@ def _decline_gates(
     tradeable, reason = _tradeable_reason(etf, snapshot)
     reasons.append(reason)
     news_ok = (news_today <= -config.SIGNAL_MIN_NEWS
-               and news_count >= config.SIGNAL_MIN_ARTICLES)
+               and news_count >= min_articles)
     reasons.append(
         f"news {news_today:+.2f} <= {-config.SIGNAL_MIN_NEWS} and "
-        f"n={news_count} >= {config.SIGNAL_MIN_ARTICLES} "
+        f"n={news_count} >= {min_articles} "
         f"[{'PASS' if news_ok else 'FAIL'}]"
     )
     if snapshot is not None:
@@ -198,13 +202,14 @@ def _classify(
     snapshot: IntradaySnapshot | None,
     news_today: float,
     news_count: int,
+    min_articles: int,
     momentum_score: float,
     momentum_weight: float,
     illiquid: bool,
 ) -> tuple[str, list[str]]:
     """Resolve a sector's action: BUY when every gate passes, else DON'T BUY."""
-    args = (etf, snapshot, news_today, news_count, momentum_score,
-            momentum_weight, illiquid)
+    args = (etf, snapshot, news_today, news_count, min_articles,
+            momentum_score, momentum_weight, illiquid)
     buy_ok, buy_reasons = _buy_gates(*args)
     if buy_ok:
         return ACTION_BUY, buy_reasons
@@ -218,10 +223,15 @@ def decide(
     momentum: dict[str, SectorMomentum],
     snapshots: dict[str, IntradaySnapshot],
     profile: MarketProfile | None = None,
+    baselines: "dict[str, float] | None" = None,
 ) -> list[TradeSignal]:
     """Score every sector and gate the buy decision; sorted by rank desc."""
     resolved = get_profile() if profile is None else profile
     today_news = _today_news_scores(items, momentum, resolved)
+    # Article floors scale with each sector's own coverage once the archive is
+    # deep enough; until then this is {} and the flat floor applies.
+    if baselines is None:
+        baselines = news_archive.sector_article_baselines(resolved)
     signals: list[TradeSignal] = []
     for sector in resolved.sectors:
         etf = resolved.trade_etfs.get(sector)
@@ -243,9 +253,10 @@ def decide(
         rank_score = (0.4 * news_today
                       + 0.4 * math.tanh(day_change / 1.0)
                       + 0.2 * momentum_score)
+        min_articles = news_archive.required_articles(sector, baselines)
         action, reasons = _classify(
-            etf, snapshot, news_today, news_count, momentum_score,
-            momentum_weight, illiquid
+            etf, snapshot, news_today, news_count, min_articles,
+            momentum_score, momentum_weight, illiquid
         )
         signals.append(
             TradeSignal(
@@ -255,6 +266,7 @@ def decide(
                 rank_score=rank_score,
                 news_today=news_today,
                 news_count_today=news_count,
+                min_articles=min_articles,
                 momentum=momentum_score,
                 momentum_weight=momentum_weight,
                 intraday=snapshot,
@@ -272,7 +284,7 @@ def is_declining(signal: TradeSignal) -> bool:
     return bool(
         snap is not None
         and signal.news_today <= -config.SIGNAL_MIN_NEWS
-        and signal.news_count_today >= config.SIGNAL_MIN_ARTICLES
+        and signal.news_count_today >= signal.min_articles
         and snap.day_change_pct <= -config.SIGNAL_MIN_INTRADAY_PCT
         and signal.momentum_weight >= config.SIGNAL_MIN_MOMENTUM_WEIGHT
         and signal.momentum <= config.SIGNAL_MIN_MOMENTUM
@@ -344,7 +356,7 @@ def _no_buy_story(signal: TradeSignal, name: str) -> list[str]:
             f"news flow was only {signal.news_today:+.2f} across "
             f"{signal.news_count_today} stories, short of "
             f"{config.SIGNAL_MIN_NEWS:+.2f} from "
-            f"{config.SIGNAL_MIN_ARTICLES}")
+            f"{signal.min_articles}")
     if not (snap.day_change_pct >= config.SIGNAL_MIN_INTRADAY_PCT
             and snap.last_hour_change_pct >= 0.0):
         failures.append(

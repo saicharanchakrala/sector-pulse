@@ -205,8 +205,8 @@ def _gates(momentum_score: float, momentum_weight: float) -> tuple[bool, str]:
     """Run the buy gates with everything but momentum comfortably passing."""
     from decision import _buy_gates
     snap = _snapshot("X.NS", price=100.0, volume=5_000_000.0)
-    ok, reasons = _buy_gates("X.NS", snap, 0.5, 5, momentum_score,
-                             momentum_weight, False)
+    ok, reasons = _buy_gates("X.NS", snap, 0.5, 5, config.SIGNAL_MIN_ARTICLES,
+                             momentum_score, momentum_weight, False)
     return ok, next(r for r in reasons if "momentum" in r)
 
 
@@ -279,7 +279,8 @@ def test_declining_needs_a_real_downtrend_not_merely_a_weak_uptrend() -> None:
 
     def declining(momentum: float) -> bool:
         signal = TradeSignal("Metal", "METALIETF.NS", decision.ACTION_NO_BUY,
-                             0.0, -0.5, 5, momentum, 1.0, snap, False, [])
+                             0.0, -0.5, 5, config.SIGNAL_MIN_ARTICLES,
+                             momentum, 1.0, snap, False, [])
         return decision.is_declining(signal)
 
     assert declining(0.15) is False, "a rising sector is not under pressure"
@@ -287,6 +288,179 @@ def test_declining_needs_a_real_downtrend_not_merely_a_weak_uptrend() -> None:
     assert declining(-0.1) is False, "inside the floor is not under pressure"
     assert declining(config.SIGNAL_MIN_MOMENTUM) is True, "the floor itself counts"
     assert declining(-0.5) is True, "a real downtrend must register"
+
+
+# --- news classification -------------------------------------------------
+
+def _classify(title: str, summary: str = "") -> list[str]:
+    """Classify one synthetic headline through the real analyzer path."""
+    import analyzer
+    prof = get_profile("IN")
+    item = NewsItem(title=title, summary=summary, link="https://e.com/x",
+                    source="Test", published=UTC_NOW)
+    return analyzer.classify_items([item], prof)[0]
+
+
+def test_the_india_profile_has_no_duplicated_keywords() -> None:
+    import analyzer
+    # `rbi`, `repo rate` and `gross npa` were each claimed by two sectors,
+    # which tied every RBI story and filed it under both: ~130 collisions in
+    # three days. They now belong to Banks alone.
+    assert analyzer._shared_keywords(get_profile("IN")) == frozenset()
+
+
+def test_the_shared_keyword_guard_still_works_on_a_bad_profile() -> None:
+    import analyzer
+    import dataclasses
+    from models import SectorDef
+    prof = get_profile("IN")
+    clashing = dataclasses.replace(prof, key="TEST-CLASH", sectors={
+        "Alpha": SectorDef(name="Alpha", etf="A.NS", keywords=["shared", "alpha only"]),
+        "Beta": SectorDef(name="Beta", etf="B.NS", keywords=["shared", "beta only"]),
+    })
+    assert analyzer._shared_keywords(clashing) == frozenset({"shared"})
+    pats = analyzer._sector_patterns(clashing)
+    item = NewsItem(title="shared term appears", summary="", link="x",
+                    source="t", published=UTC_NOW)
+    assert analyzer._sector_strengths(item, pats) == {}, "shared alone must not assign"
+
+
+def test_rbi_policy_stories_now_classify_to_banks() -> None:
+    # India's most market-moving banking event must not land nowhere, and must
+    # not depend on whether the headline says "repo rate" or "rate cut".
+    for headline in ("RBI keeps repo rate unchanged at policy review",
+                     "RBI cuts repo rate by 25 bps",
+                     "RBI monetary policy: repo rate held"):
+        assert _classify(headline) == ["Banks"], headline
+
+
+def test_a_shared_superstring_no_longer_swallows_an_exclusive_substring() -> None:
+    # Banks declared both `npa` and `gross npa`; the shared superstring
+    # consumed the exclusive substring, so the story classified nowhere.
+    assert _classify("Gross NPA ratio declines sharply in Q2") == ["Banks"]
+
+
+def test_compound_company_names_are_reachable() -> None:
+    # Alternation is leftmost-match, so "icici" hid "icici bank" and 36 others.
+    assert _classify("ICICI Bank profit rises") == ["Banks"]
+    assert _classify("Reliance Industries refining margins improve") == ["Energy"]
+    assert _classify("State Bank of India cuts lending rate") == ["PSU Banks"]
+
+
+def test_a_multi_sector_wrap_with_no_headline_match_is_dropped() -> None:
+    # Three sectors named only in the summary, none in the headline: a market
+    # wrap. One such item pushed +0.97 into the three sectors it called losers.
+    got = _classify("Sensex Tanks 500 Points",
+                    "Nifty IT, Nifty Metal, Nifty Realty and Nifty FMCG led the losses")
+    assert got == [], got
+
+
+def test_a_bank_named_in_the_title_goes_to_banks_alone() -> None:
+    got = _classify("Axis Bank Q2 profit rises on strong credit growth")
+    assert got == ["Banks"], got
+
+
+def test_an_nbfc_story_goes_to_financial_services_alone() -> None:
+    got = _classify("Bajaj Finance posts record quarter as gold loan book grows")
+    assert got == ["Financial Services"], got
+
+
+def test_a_market_roundup_naming_everything_is_discarded() -> None:
+    # The exact failure case: this shape matched 10 of 12 sectors and voted
+    # its headline sentiment into all of them, every single day.
+    roundup = ("Stocks to watch, September 7: Tata Motors, oil-linked stocks, "
+               "SBI, IFCI, Lupin, NMDC, HUL, Infosys, DLF, Tata Steel")
+    got = _classify(roundup)
+    assert got == [], f"a roundup must carry no sector signal, got {got}"
+
+
+def test_title_outweighs_summary_when_narrowing() -> None:
+    import config
+    # Metal named in the title, IT only in the summary: the title wins.
+    got = _classify("Tata Steel raises output guidance",
+                    "Infosys was mentioned elsewhere in the note.")
+    assert got == ["Metal"], got
+    assert config.TITLE_MATCH_WEIGHT > 1
+
+
+def test_a_single_summary_mention_still_classifies() -> None:
+    # MIN_MATCH_STRENGTH is 1: the sweep showed a higher bar cost 98 of 359
+    # usable articles while cutting collisions only 9 -> 8.
+    got = _classify("Quarterly earnings wrap", "Cipla reported higher revenue.")
+    assert got == ["Pharma"], got
+
+
+# --- per-sector article floor --------------------------------------------
+
+def test_article_floor_falls_back_to_the_flat_minimum() -> None:
+    assert news_archive.required_articles("Banks", {}) == config.SIGNAL_MIN_ARTICLES
+    assert news_archive.required_articles("Nope", {"Banks": 40.0}) == \
+        config.SIGNAL_MIN_ARTICLES
+
+
+def test_article_floor_scales_with_a_sectors_own_coverage() -> None:
+    baselines = {"Banks": 26.0, "Pharma": 2.7}
+    # Banks draws ~26 a day, so 3 is noise for it and the floor must rise.
+    assert news_archive.required_articles("Banks", baselines) == 13
+    # Pharma draws under 3 a day, so it keeps the flat minimum.
+    assert news_archive.required_articles("Pharma", baselines) == \
+        config.SIGNAL_MIN_ARTICLES
+
+
+def test_baselines_stay_empty_until_the_archive_is_deep_enough() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        prof = get_profile("IN")
+        for day in (date(2026, 9, 1), date(2026, 9, 2)):
+            news_archive.archive_news(
+                [NewsItem(title="Axis Bank profit rises", summary="",
+                          link=f"https://e.com/{day}", source="T",
+                          published=UTC_NOW)], day, tmp)
+        assert news_archive.sector_article_baselines(prof, tmp, min_days=5) == {}
+        mature = news_archive.sector_article_baselines(prof, tmp, min_days=2)
+        assert mature, "with min_days met, baselines must be computed"
+        # One article a day, converted to the 12h window the gate counts over.
+        window = config.SIGNAL_NEWS_HOURS / 24.0
+        assert mature["Banks"] == window, mature["Banks"]
+
+
+def test_baseline_median_handles_an_even_number_of_days() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        prof = get_profile("IN")
+        for day, count in ((date(2026, 9, 1), 1), (date(2026, 9, 2), 3)):
+            news_archive.archive_news(
+                [NewsItem(title="Axis Bank profit rises", summary="",
+                          link=f"https://e.com/{day}-{i}", source="T",
+                          published=UTC_NOW) for i in range(count)], day, tmp)
+        got = news_archive.sector_article_baselines(prof, tmp, min_days=2)
+    window = config.SIGNAL_NEWS_HOURS / 24.0
+    assert got["Banks"] == 2.0 * window, got["Banks"]
+
+
+def test_classification_holds_through_the_public_analyze_path() -> None:
+    # The seam that matters: analyze() is what the engine consumes. Asserting
+    # only on the private helpers let the whole classifier be reverted with the
+    # suite still green.
+    import analyzer
+    prof = get_profile("IN")
+    roundup = [
+        NewsItem(title=("Stocks to watch: Tata Motors, SBI, Lupin, NMDC, HUL, "
+                        "Infosys, DLF, Tata Steel soar"),
+                 summary="Broad market wrap.", link=f"https://e.com/wrap-{i}",
+                 source="T", published=UTC_NOW)
+        for i in range(6)
+    ]
+    focused = [
+        NewsItem(title="Cipla wins US approval for new generic",
+                 summary="Pharma major gains.", link=f"https://e.com/ph-{i}",
+                 source="T", published=UTC_NOW)
+        for i in range(3)
+    ]
+    scores = {s.sector: s for s in analyzer.analyze(roundup + focused, {},
+                                                    profile=prof)}
+    assert scores["Pharma"].news_count == 3, scores["Pharma"].news_count
+    for sector in ("Auto", "Metal", "FMCG", "IT", "Realty", "Banks"):
+        assert scores[sector].news_count == 0, (
+            f"{sector} took {scores[sector].news_count} from a roundup")
 
 
 def _main() -> int:

@@ -16,6 +16,17 @@ MAX_ITEMS_PER_FEED = 40
 # --- Scoring ---
 RECENCY_HALF_LIFE_HOURS = 24     # article weight halves every N hours
 MIN_ARTICLES_FULL_CONFIDENCE = 5 # news score damped below this many articles
+
+# --- News classification ---
+# A single keyword hit anywhere used to assign a sector, so a daily
+# "stocks to watch" roundup naming one company per sector voted in 10 of 12
+# sectors at once, and 66% of Banks articles also matched Financial Services.
+TITLE_MATCH_WEIGHT = 2        # a title keyword counts double a summary one
+# Swept on a 1,052-headline sample: raising this above 1 cost 98 articles
+# (34.1% -> 24.8% usable) and cut Banks/FS collisions only 9 -> 8. The
+# shared-keyword exclusion and the roundup cap do the precision work.
+MIN_MATCH_STRENGTH = 1        # any one distinct, sector-exclusive keyword
+MAX_SECTORS_PER_ARTICLE = 3   # above this it is a roundup: carries no signal
 DEFAULT_NEWS_WEIGHT = 0.5        # composite = w*news + (1-w)*momentum
 
 # --- Momentum ---
@@ -33,6 +44,14 @@ TOP_HEADLINES_PER_SECTOR = 6
 SIGNAL_NEWS_HOURS = 12           # "today's news" = items within this window
 SIGNAL_MIN_NEWS = 0.15           # gate: today-only news score floor
 SIGNAL_MIN_ARTICLES = 3          # gate: today-only article count floor
+# A flat article floor is not comparable across sectors: Banks averages 26
+# articles a day and Pharma 2.7, so 3 is noise for one and the entire daily
+# volume for the other. Once the archive has enough days, each sector's floor
+# becomes a fraction of its own median daily volume, never below the flat
+# minimum. This tightens the loose end rather than loosening the tight one.
+SIGNAL_MIN_ARTICLES_FRACTION = 0.5
+SIGNAL_BASELINE_MIN_DAYS = 5     # archive days needed before baselines apply
+SIGNAL_BASELINE_MAX_DAYS = 60    # trailing window, so cost stays bounded
 SIGNAL_MIN_INTRADAY_PCT = 0.2    # gate: intraday day-change floor (%)
 SIGNAL_MIN_MOMENTUM = -0.2       # gate: multi-day momentum floor (not a falling knife)
 # Fraction of MOMENTUM_WINDOWS weight that must actually be computable

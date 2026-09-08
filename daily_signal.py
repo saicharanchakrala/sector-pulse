@@ -132,6 +132,18 @@ def print_top_signals(signals: list[TradeSignal]) -> None:
               + ", ".join(f"{s.etf} ({s.sector})" for s in others))
 
 
+def _table_row(signal: TradeSignal) -> str:
+    """One per-sector line of the report table."""
+    snap = signal.intraday
+    day = f"{snap.day_change_pct:+.2f}" if snap else "n/a"
+    hour = f"{snap.last_hour_change_pct:+.2f}" if snap else "n/a"
+    illiq = "YES" if signal.illiquid else ""
+    return (f"{signal.sector:<22}{signal.etf or '-':<15}{signal.action:<11}"
+            f"{signal.rank_score:>+7.3f}{signal.news_today:>+7.2f}"
+            f"{signal.news_count_today:>4}{day:>8}{hour:>9}"
+            f"{signal.momentum:>+7.2f}{illiq:>7}")
+
+
 def print_report(signals: list[TradeSignal], profile: MarketProfile,
                  now: datetime) -> None:
     """Print the human-readable end-of-day signal report."""
@@ -142,20 +154,24 @@ def print_report(signals: list[TradeSignal], profile: MarketProfile,
     print_top_signals(signals)
     header = (f"{'Sector':<22}{'ETF':<15}{'Action':<11}{'Rank':>7}{'News':>7}"
               f"{'N':>4}{'Day%':>8}{'LastHr%':>9}{'Mom':>7}{'Illiq':>7}")
-    print("\n" + header)
+    print()
+    print(header)
     print("-" * len(header))
-    for signal in signals:
-        snap = signal.intraday
-        day = f"{snap.day_change_pct:+.2f}" if snap else "n/a"
-        hour = f"{snap.last_hour_change_pct:+.2f}" if snap else "n/a"
-        illiq = "YES" if signal.illiquid else ""
-        print(f"{signal.sector:<22}{signal.etf or '-':<15}{signal.action:<11}"
-              f"{signal.rank_score:>+7.3f}{signal.news_today:>+7.2f}"
-              f"{signal.news_count_today:>4}{day:>8}{hour:>9}"
-              f"{signal.momentum:>+7.2f}{illiq:>7}")
+    # A sector with no tradeable ETF can never be actionable, so ranking it
+    # among the rest makes a structural impossibility look like a near miss.
+    actionable = [s for s in signals if s.etf is not None]
+    untradeable = [s for s in signals if s.etf is None]
+    for signal in actionable:
+        print(_table_row(signal))
+    if untradeable:
+        print()
+        print("Not tradeable - no ETF in this profile, so never actionable:")
+        for signal in untradeable:
+            print(f"  {_table_row(signal)}")
     pick = top_pick(signals)
     detail: list[TradeSignal] = []
-    for candidate in ([pick] if pick is not None else []) + signals[:2] + signals[-2:]:
+    ranked = [s for s in signals if s.etf is not None] or signals
+    for candidate in ([pick] if pick is not None else []) + ranked[:2] + ranked[-2:]:
         if candidate not in detail:
             detail.append(candidate)
     print("\nGate detail - top pick plus top 2 and bottom 2 ranked sectors:")

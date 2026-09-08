@@ -115,7 +115,7 @@ _SECTORS: dict[str, SectorDef] = {
             "insurer", "insurers", "general insurance", "life insurance",
             "mutual fund", "mutual funds", "sip inflows", "amc", "asset management",
             "broking", "brokerage", "zerodha", "demat", "wealth management",
-            "credit card spends", "fintech", "rbi", "repo rate", "irdai", "sebi",
+            "credit card spends", "fintech", "irdai", "sebi",
         ],
     ),
     "IT": SectorDef(
@@ -275,7 +275,7 @@ _SECTORS: dict[str, SectorDef] = {
             "state-run banks", "nationalised bank", "nationalised banks",
             "recapitalisation", "recapitalization", "bank merger",
             "divestment", "disinvestment", "stake dilution",
-            "government stake", "gross npa", "write-off", "loan recovery",
+            "government stake", "write-off", "loan recovery",
             "bad bank", "narcl",
         ],
     ),
