@@ -5,10 +5,14 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent
 
 # --- Market profile ---
-DEFAULT_MARKET = os.environ.get("SECTOR_PULSE_MARKET", "US")
+DEFAULT_MARKET = os.environ.get("SECTOR_PULSE_MARKET", "IN")
 
 # --- News gathering ---
-NEWS_MAX_AGE_HOURS = 48          # ignore articles older than this
+# Ignore articles older than this. Matches daily_signal's own fetch window
+# (SIGNAL_NEWS_HOURS * 2 = 24), which matters now that the dashboard button
+# also archives: at 48 it wrote two days of headlines into one archive file
+# and inflated that day's per-sector baseline against a CLI-written day.
+NEWS_MAX_AGE_HOURS = 24
 REQUEST_TIMEOUT_SECONDS = 10
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) SectorPulse/1.0"
 MAX_ITEMS_PER_FEED = 40

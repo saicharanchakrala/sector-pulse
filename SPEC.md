@@ -60,8 +60,8 @@ PROFILES: dict[str, MarketProfile]
 def get_profile(key: str | None = None) -> MarketProfile
 ```
 `get_profile(None)` resolves to `config.DEFAULT_MARKET`
-(env `SECTOR_PULSE_MARKET`, default `"US"`); unknown keys log a warning and fall
-back to US.
+(env `SECTOR_PULSE_MARKET`, default `"IN"`); an unknown key logs a warning and
+falls back to the configured default, then to the registry's first entry.
 
 ### Sector universes
 

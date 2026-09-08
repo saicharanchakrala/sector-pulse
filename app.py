@@ -175,7 +175,8 @@ def render_sidebar() -> tuple[str, float, int]:
     with st.sidebar:
         profile_keys = list(PROFILES)
         default_key = (
-            config.DEFAULT_MARKET if config.DEFAULT_MARKET in PROFILES else "US"
+            config.DEFAULT_MARKET if config.DEFAULT_MARKET in PROFILES
+            else next(iter(PROFILES))
         )
         profile_key = st.selectbox(
             "Market",

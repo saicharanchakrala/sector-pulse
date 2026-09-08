@@ -40,10 +40,19 @@ PROFILES: dict[str, MarketProfile] = {
 
 
 def get_profile(key: str | None = None) -> MarketProfile:
-    """Resolve a profile by key (None -> config.DEFAULT_MARKET); unknown keys fall back to US."""
+    """Resolve a profile by key (None -> config.DEFAULT_MARKET).
+
+    An unknown key falls back to the configured default rather than to a
+    hardcoded market, so changing DEFAULT_MARKET moves both paths together.
+    The registry's first entry is the last resort, which also stops an
+    unknown DEFAULT_MARKET from recursing.
+    """
     resolved = key if key is not None else config.DEFAULT_MARKET
     profile = PROFILES.get(resolved)
     if profile is None:
-        logger.warning("Unknown market profile %s; falling back to US", resolved)
-        return PROFILES["US"]
+        fallback = (config.DEFAULT_MARKET if config.DEFAULT_MARKET in PROFILES
+                    else next(iter(PROFILES)))
+        logger.warning("Unknown market profile %s; falling back to %s",
+                       resolved, fallback)
+        return PROFILES[fallback]
     return profile

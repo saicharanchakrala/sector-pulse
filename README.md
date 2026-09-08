@@ -72,11 +72,12 @@ lexicon additions.
 
 - **In-app selector** - the `Market` dropdown at the top of the sidebar switches
   between profiles (`US - United States`, `IN - India (NSE)`).
-- **Default market** - set the `SECTOR_PULSE_MARKET` environment variable (`US` or
-  `IN`) to choose which profile loads by default:
+- **Default market** - `IN`. Both the dashboard and every `profile=None` call
+  resolve to India unless the `SECTOR_PULSE_MARKET` environment variable overrides
+  it:
 
   ```powershell
-  $env:SECTOR_PULSE_MARKET = "IN"
+  $env:SECTOR_PULSE_MARKET = "US"
   ```
 
 - **The India profile** tracks 12 Nifty sectoral indices (Bank Nifty, Financial
@@ -97,7 +98,7 @@ All tunables live in `config.py`:
 
 | Setting | Default | What it does |
 |---|---|---|
-| `NEWS_MAX_AGE_HOURS` | `48` | Ignore articles older than this |
+| `NEWS_MAX_AGE_HOURS` | `24` | Ignore articles older than this. Matches the signal's own fetch window so dashboard-archived days are comparable with CLI-archived ones |
 | `REQUEST_TIMEOUT_SECONDS` | `10` | Per-feed HTTP timeout |
 | `MAX_ITEMS_PER_FEED` | `40` | Cap on items kept per feed |
 | `RECENCY_HALF_LIFE_HOURS` | `24` | Article weight halves every N hours |
