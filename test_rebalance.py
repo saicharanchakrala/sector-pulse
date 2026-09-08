@@ -5,9 +5,11 @@ Runs under pytest, or standalone with `python test_rebalance.py`.
 from __future__ import annotations
 
 import tempfile
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Callable
+
+import config
 
 from allocator import (OVERSHOOT_FRACTION, actionable_drift, compute_rows,
                        fundable_units, max_abs_drift, plan_orders,
@@ -415,10 +417,40 @@ def test_daily_run_the_day_after_a_buy_holds() -> None:
 
 
 def test_band_breach_invests_off_cycle_once_spacing_is_met() -> None:
+    # Spacing is passed explicitly so this tests the gate, not whatever the
+    # shipped MIN_DAYS_BETWEEN_BUYS happens to be.
     action, reasons, _ = evaluate_cadence(
-        date(2026, 9, 15), date(2026, 9, 1), FAR_OFF)
+        date(2026, 9, 15), date(2026, 9, 1), FAR_OFF, min_days_between_buys=7)
     assert action == "INVEST"
     assert any("breaches" in reason for reason in reasons)
+
+
+def test_the_band_accelerates_while_drift_is_wide_then_settles() -> None:
+    # The shipped behaviour, locked in: while drift breaches the band the
+    # off-cycle path fires at the spacing floor, and once the gap closes the
+    # cadence falls back to the monthly schedule on its own. FAR_OFF never
+    # closes (nothing is bought here), so this checks the accelerated leg.
+    last, day = date(2026, 9, 4), date(2026, 9, 5)
+    buys = []
+    while day <= date(2027, 9, 4):
+        action, _, _ = evaluate_cadence(day, last, FAR_OFF)
+        if action == "INVEST":
+            buys.append(day)
+            last = day
+        day += timedelta(days=1)
+    gaps = [(buys[i] - buys[i - 1]).days for i in range(1, len(buys))]
+    assert gaps and min(gaps) == config.MIN_DAYS_BETWEEN_BUYS, sorted(set(gaps))
+    assert len(buys) > 12, f"a breaching band must beat monthly, got {len(buys)}"
+
+    # And with drift inside the band, the same year yields a monthly cadence.
+    last, day, calm = date(2026, 9, 4), date(2026, 9, 5), []
+    while day <= date(2027, 9, 4):
+        action, _, _ = evaluate_cadence(day, last, ON_TARGET)
+        if action == "INVEST":
+            calm.append(day)
+            last = day
+        day += timedelta(days=1)
+    assert 12 <= len(calm) <= 13, f"on target should be monthly, got {len(calm)}"
 
 
 def test_band_breach_still_respects_minimum_spacing() -> None:
@@ -431,7 +463,8 @@ def test_band_breach_still_respects_minimum_spacing() -> None:
 def test_untracked_holding_alone_never_triggers_an_off_cycle_buy() -> None:
     rows = compute_rows(EQUAL_PAIR + [Holding("C", 10, 100.0, 100.0)],
                         {"A": 50.0, "B": 50.0})
-    action, _, _ = evaluate_cadence(date(2026, 9, 15), date(2026, 9, 1), rows)
+    action, _, _ = evaluate_cadence(date(2026, 9, 15), date(2026, 9, 1), rows,
+                                    min_days_between_buys=7)
     assert action == "HOLD"
 
 

@@ -337,8 +337,15 @@ Running this every day will not make you buy every day. The contribution is gate
   instead walk backwards through the calendar (Jan 1, Jan 31, Mar 2, ...).
 - **Off-cycle**: INVEST early only if the largest *closeable* drift breaches
   `REBALANCE_BAND_PP` (5pp) *and* at least `MIN_DAYS_BETWEEN_BUYS` (7) days have
-  passed. This is the only path to an unscheduled buy, and the spacing floor is what
-  stops a volatile week from turning into daily trading.
+  passed. This is the only path to an unscheduled buy.
+
+  **This accelerates deployment while you are far from target, by design.** A book
+  19.5pp under on one holding keeps re-breaching the band, so it deploys roughly
+  60,000 a month for two months and then 20,000 once drift falls inside the band -
+  about 319,000 over a year against 240,000 at a pure monthly cadence. Raise
+  `MIN_DAYS_BETWEEN_BUYS` toward 30 if you want a strictly monthly rate instead.
+  Note the planner has no view of your available cash: it prints an order every 7
+  days whether or not the money is there.
 
   "Closeable" matters: the band looks only at holdings that are below target *and*
   have a usable price, because those are the only ones a purchase can move. Drift on

@@ -117,10 +117,11 @@ def fetch_all_news(
             executor.submit(_fetch_feed, feed, cutoff): feed
             for feed in resolved.feeds
         }
+        empty: list[str] = []
         for future in as_completed(futures):
             feed = futures[future]
             try:
-                collected.extend(future.result())
+                items = future.result()
             except (
                 requests.RequestException,
                 KeyError,
@@ -130,5 +131,16 @@ def fetch_all_news(
                 OSError,
             ) as exc:
                 logger.warning("Feed %s failed: %s", feed.get("name", "?"), exc)
+                continue
+            # A feed can answer 200 with a full body and still contribute
+            # nothing: all three Moneycontrol feeds serve entries dated 2 to 10
+            # years old, so every item is age-filtered away. Without this the
+            # loss is invisible and the feed looks healthy.
+            if not items:
+                empty.append(feed.get("name", "?"))
+            collected.extend(items)
+    if empty:
+        logger.warning("These feeds returned nothing usable within %dh: %s",
+                       max_age_hours, ", ".join(sorted(empty)))
     collected.sort(key=lambda item: item.published, reverse=True)
     return _dedupe(collected)

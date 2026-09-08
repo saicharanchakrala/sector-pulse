@@ -18,7 +18,9 @@ import analyzer
 import claude_insights
 import config
 import decision
+import daily_signal
 import intraday
+import news_archive
 import market_data
 import news_fetcher
 from models import NewsItem, ScoredNewsItem, SectorMomentum, SectorScore
@@ -330,13 +332,26 @@ def render_signal_section(
             else:
                 signals = decision.decide(items, momentum, snapshots, profile)
                 pick = decision.top_pick(signals)
+                now = datetime.now().astimezone()
                 st.session_state["live_signal"] = {
                     "market": profile.key,
                     "closed": False,
-                    "generated_at": datetime.now().astimezone().isoformat(),
+                    "generated_at": now.isoformat(),
                     "top_pick": signal_to_dict(pick) if pick is not None else None,
                     "signals": [signal_to_dict(s) for s in signals],
                 }
+                # Persist exactly as the CLI does. A button that shows a signal
+                # and records nothing is worse than one that fails: you would
+                # believe the day was captured, and the headlines behind it
+                # would age out of the feeds within 48h, unbacktestable.
+                stored = news_archive.archive_news(items)
+                daily_signal.append_csv_rows([
+                    daily_signal._csv_row(s, now, profile.key, s is pick)
+                    for s in signals
+                ])
+                daily_signal.write_last_signal(signals, profile.key, now)
+                st.caption(f"Recorded to signals.csv and last_signal.json; "
+                           f"archived {stored} new headline(s).")
     live = st.session_state.get("live_signal")
     if live is not None and live.get("market") != profile.key:
         live = None

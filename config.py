@@ -76,7 +76,15 @@ CLAUDE_MAX_TOKENS = 4096
 MONTHLY_CONTRIBUTION = 20_000.0   # rupees deployed per scheduled contribution
 CONTRIBUTION_INTERVAL_MONTHS = 1  # scheduled cadence: calendar monthly, not daily
 REBALANCE_BAND_PP = 5.0           # off-cycle trigger: |drift| this many pp or more
-MIN_DAYS_BETWEEN_BUYS = 7         # floor between any two buys, band breach included
+# Floor between any two buys, off-cycle band breaches included. At 7 days a
+# book far from target keeps re-breaching the band, so it deploys faster
+# while the gap is widest and settles to monthly once drift falls inside
+# REBALANCE_BAND_PP. Measured on a book 19.5pp under on gold: about 60,000
+# a month for two months, then 20,000, totalling 319,000 over a year
+# against 240,000 at a pure monthly cadence. That acceleration is
+# deliberate. Note the planner has no view of available cash: it will
+# print an order every 7 days whether or not the money is there.
+MIN_DAYS_BETWEEN_BUYS = 7
 MIN_ORDER_VALUE = 500.0           # skip dribble orders below this rupee value
 DEFAULT_ALLOCATION_MODE = "fill"  # "fill" (waterfall) or "spread" (proportional)
 QUOTE_SUFFIX = ".NS"              # yfinance suffix for bare NSE symbols
