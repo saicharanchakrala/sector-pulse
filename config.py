@@ -99,3 +99,163 @@ LAST_PLAN_JSON = PROJECT_ROOT / "last_plan.json"
 
 # --- News archive (makes a sentiment backtest possible) ---
 NEWS_ARCHIVE_DIR = PROJECT_ROOT / "news_archive"
+
+# --- Intraday scanner (separate system from the positional signal) ---
+# The positional signal holds for weeks; this one holds for hours. Different
+# data, different costs, different failure mode - so it gets its own gates
+# and never shares a threshold with the EOD path.
+SCAN_BAR_INTERVAL = "5m"          # yfinance intraday bar size
+# 10 days of 5-minute bars: about 7 trading sessions. That is the intraday
+# working set - enough prior sessions for a relative-volume median and for a
+# gap-free ATR, without dragging a month of bars through every scan. The
+# median baseline is noisier on 6 prior sessions than on 20; that is the
+# trade for a baseline that reflects this week rather than last month.
+SCAN_BAR_LOOKBACK = "10d"
+SCAN_DAILY_LOOKBACK = "3mo"       # daily bars for ATR and previous-session levels
+SCAN_BATCH_SIZE = 40              # tickers per yfinance download call
+SCAN_BENCHMARK = "^NSEI"          # relative-strength benchmark (Nifty 50)
+
+SCAN_OPENING_RANGE_MINUTES = 15   # opening range = first N minutes of the session
+SCAN_ATR_BARS = 14                # ATR period on 5m bars, for intraday stops
+# One horizon governs everything: an intraday trade is held to the close, so
+# the plausible remaining move is sigma = bar ATR * sqrt(bars left) and both
+# the stop and the target are fractions of that same sigma. Sizing the stop
+# over one horizon while judging the target over another is incoherent - it
+# rejected every setup, because a 2:1 target on a 12-bar stop needs 6.9 ATRs
+# when the rest of the day offers 5.5.
+SCAN_STOP_FRACTION = 0.5          # stop distance as a fraction of that sigma
+# With a 0.5 fraction and a 2:1 ratio the target lands exactly on sigma, so
+# reachability holds by construction and only a structural stop can break it.
+SCAN_STRUCTURE_BAND = 0.4         # accept structure within +/- this of the stop
+# MIS intraday leverage. Sizing is capped by capital times leverage, because
+# risk-based sizing alone will happily print a 7 lakh position on 1 lakh.
+SCAN_MIS_LEVERAGE = 5.0
+# Reject a setup whose costs push the breakeven win rate above this. Under a
+# random walk a 2:1 setup wins about 33% of the time; anything needing far
+# more than that is paying the broker to gamble.
+SCAN_MAX_WIN_RATE = 0.55
+# Open interest rising alongside a price move is conventionally read as
+# fresh positioning, and falling OI as an unwind. It is reported for every
+# F&O name and contributes to the rank, but it is NOT a hard gate by
+# default: the reading is a market convention with no backtest behind it,
+# and promoting an unvalidated belief to a veto would silently halve the
+# output. Set this True to make it binding.
+SCAN_REQUIRE_OI_CONFIRMATION = False
+SCAN_MIN_OI_CHANGE_PCT = 0.0      # only consulted when the above is True
+# The target is defined as this multiple of the stop distance. It is not a
+# rejection threshold - nothing gates on reward:risk, because the target is
+# constructed from it rather than measured against it.
+SCAN_REWARD_RISK = 2.0
+SCAN_RVOL_MIN = 1.2               # today's pace vs same-time-of-day 20d median
+SCAN_MIN_TURNOVER = 50_000_000.0  # 5 crore/day: intraday needs depth, not just listing
+SCAN_MIN_PRICE = 20.0             # sub-20 names move in ticks too coarse to manage
+SCAN_MIN_MINUTES_LEFT = 45        # no entry without time for the target to work
+SCAN_COST_MULTIPLE = 3.0          # target must clear round-trip cost this many times
+SCAN_SESSION_OPEN = (9, 15)       # NSE equity session, IST
+SCAN_SESSION_CLOSE = (15, 30)
+
+# Zerodha intraday (MIS) equity charges. Rates change: verify against
+# zerodha.com/charges before trusting the breakeven figures downstream.
+COST_EQ_BROKERAGE_PCT = 0.0003    # 0.03% per executed order...
+COST_EQ_BROKERAGE_CAP = 20.0      # ...capped at 20 rupees per order
+COST_EQ_STT_SELL_PCT = 0.00025    # 0.025%, sell leg only (intraday equity)
+COST_EQ_TXN_PCT = 0.0000297       # NSE transaction charge, both legs
+COST_EQ_STAMP_BUY_PCT = 0.00003   # 0.003%, buy leg only
+COST_SEBI_PCT = 0.000001          # 10 rupees per crore, both legs
+COST_GST_PCT = 0.18               # on brokerage + transaction + SEBI
+
+# Zerodha options charges, levied on premium turnover rather than contract value.
+COST_OPT_BROKERAGE_FLAT = 20.0    # per executed order
+COST_OPT_STT_SELL_PCT = 0.001     # 0.1% of premium, sell leg only
+COST_OPT_TXN_PCT = 0.0003503      # NSE options transaction charge
+COST_OPT_STAMP_BUY_PCT = 0.00003  # 0.003%, buy leg only
+
+# Option-contract quality gates. These say whether a contract is cheap and
+# liquid enough to trade - never that its direction is right.
+OPT_MAX_SPREAD_PCT = 2.0          # bid-ask as % of mid
+OPT_MIN_OPEN_INTEREST = 500       # in contracts (lots)
+OPT_MIN_VOLUME = 100
+OPT_STRIKES_EITHER_SIDE = 5       # ATM window to report
+
+# Position sizing. Risk per trade drives quantity, so the stop distance
+# decides the size rather than the other way round: a wider stop buys fewer
+# shares for the same rupees at risk.
+SCAN_CAPITAL = 100_000.0          # intraday capital assumed by the sizer
+SCAN_RISK_PCT_PER_TRADE = 1.0     # percent of capital risked between entry and stop
+
+# Replaying a past date is bounded by yfinance, not by choice: 5-minute bars
+# stop dead at about 60 calendar days (period=70d returns nothing at all).
+# Measured 2026-09-08: bars reached back to 2026-06-17, 59 sessions. The
+# margin below keeps a request off that cliff.
+SCAN_MAX_REPLAY_DAYS = 57
+# How far back the dashboard's date picker reaches. Deliberately shorter
+# than the CLI cap: a few sessions is what anyone reviews by hand, and the
+# picker stays honest about weekends by reporting an empty session rather
+# than trying to guess the exchange calendar.
+SCAN_UI_REPLAY_DAYS = 3
+# Calendar days of history to pull *before* the replay date, so relative
+# volume has prior sessions to compare against and ATR has enough ranges.
+SCAN_REPLAY_LOOKBACK_DAYS = 12
+
+SCAN_UNIVERSE_CSV = PROJECT_ROOT / "scan_universe.csv"
+FO_MKTLOTS_URL = "https://nsearchives.nseindia.com/content/fo/fo_mktlots.csv"
+NSE_BASE_URL = "https://www.nseindia.com"
+NSE_TIMEOUT_SECONDS = 20
+SCAN_LOG_CSV = PROJECT_ROOT / "scan_log.csv"
+
+# --- Instrument discovery (no hardcoded universe) ---
+# Every tradeable name is discovered from NSE at run time. Hardcoding a list
+# is how the scanner ended up missing NIFTYFPI: the F&O master file marks its
+# own index/stock boundary with a section row, so the split is derivable and
+# a hand-maintained list is strictly worse.
+NSE_EQUITY_LIST_URL = ("https://nsearchives.nseindia.com/content/equities/"
+                       "EQUITY_L.csv")
+NSE_OI_SPURTS_PATH = "/api/live-analysis-oi-spurts-underlyings"
+NSE_LIVE_DERIVATIVES_PATH = "/api/liveEquity-derivatives"
+NSE_CONTRACT_INFO_PATH = "/api/option-chain-contract-info"
+# Index futures and a top-20 stock-futures watch are the only per-contract
+# futures feeds still answering. There is no bulk stock-futures file: the
+# derivatives bhavcopy 404s on every published URL pattern and
+# /api/quote-derivative has been withdrawn. Per-underlying futures turnover
+# and open interest from the OI snapshot is what futures data is available.
+NSE_FUTURES_INDEX_KEYS = ("nse50_fut", "stock_fut")
+INSTRUMENT_DIR = PROJECT_ROOT / "instruments"
+# One current file, not a history. The universe is a description of what is
+# listed right now, and an old copy of it has no use: a scan wants today's
+# lot sizes and today's F&O list. Chain snapshots are the opposite case and
+# do keep history, because a premium that was not recorded is unrecoverable.
+INSTRUMENT_FILE = INSTRUMENT_DIR / "universe.json"
+NSE_REQUEST_PAUSE_SECONDS = 0.15   # pacing between per-underlying requests
+CALL_ALIASES_CSV = PROJECT_ROOT / "call_aliases.csv"
+CALLS_CSV = PROJECT_ROOT / "calls.csv"
+OPTION_SNAPSHOT_DIR = PROJECT_ROOT / "option_snapshots"
+
+# --- Zerodha Kite Connect ---
+# Credentials are read from the environment and never stored in this repo.
+# The instrument master at kite_instruments.py needs none of this; only
+# quotes, historical candles and the tick stream require a session.
+KITE_API_KEY_ENV = "KITE_API_KEY"
+KITE_API_SECRET_ENV = "KITE_API_SECRET"
+KITE_ACCESS_TOKEN_ENV = "KITE_ACCESS_TOKEN"
+# The access token is written here after a login so a scan does not need one
+# per run. It is a session credential: gitignored, and short-lived by design
+# (Kite expires it around 6am the next day, with no non-interactive refresh
+# for retail apps, so a login is a daily manual step).
+KITE_TOKEN_FILE = PROJECT_ROOT / ".kite_session.json"
+KITE_API_BASE = "https://api.kite.trade"
+KITE_LOGIN_BASE = "https://kite.zerodha.com/connect/login"
+KITE_API_VERSION = "3"
+KITE_TIMEOUT_SECONDS = 30
+# Kite caps one historical request at 60 days for minute data, so a longer
+# span is paged. This is the reason to want Kite at all right now: minute
+# candles reach back years, where yfinance stops at 8 days.
+# Kite's per-request span depends on the candle size. Chunking by the wrong
+# one silently truncates a range instead of erroring, so these are explicit.
+KITE_HISTORICAL_MAX_DAYS = {
+    "minute": 60, "3minute": 100, "5minute": 100, "10minute": 100,
+    "15minute": 200, "30minute": 200, "60minute": 400, "day": 2000,
+}
+KITE_HISTORICAL_DEFAULT_SPAN = 60      # used for any interval not listed
+# Kite documents 3 requests/second for historical data. Pacing at 3/s keeps
+# a 1,500-request sweep inside the limit instead of collecting 429s.
+KITE_HISTORICAL_RATE_PER_SEC = 3.0

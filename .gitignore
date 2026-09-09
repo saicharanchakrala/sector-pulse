@@ -13,3 +13,31 @@ contributions.csv
 last_plan.json
 targets.yaml
 news_archive/
+
+# Intraday scanner: generated universe cache and run log
+scan_universe.csv
+scan_log.csv
+
+# The instrument universe is public NSE reference data, not personal
+# position data, and the scanner is driven entirely from it - so the current
+# file is committed. Only the atomic-write staging file is ignored.
+instruments/*.tmp
+
+# Option chain snapshots keep history deliberately and grow without bound
+# (about 272 KB per capture, so roughly 7 MB a day at 15-minute intervals).
+# They are local data, not repo content.
+option_snapshots/
+calls.csv
+call_aliases.csv
+
+# Cached bars for the edge harness (regenerable from yfinance)
+bar_cache/
+
+# Kite session credential - short-lived access token, never committed
+.kite_session.json
+
+# Live tick recordings (grow without bound, local data)
+tick_store/
+
+# Rotated scan logs, kept when the column set changes
+scan_log.csv.superseded*
