@@ -11,13 +11,18 @@ Run with: .venv\\Scripts\\python -m pytest test_kite.py -q
 """
 from __future__ import annotations
 
+import asyncio
+import json
 import struct
 from datetime import date, datetime, timezone
+from types import SimpleNamespace
 
 import pytest
+import websockets
 
 import kite_instruments as ki
 import kite_ticker as kt
+import tick_recorder as tr
 
 # Token low bytes select the segment: 1 NSE cash, 2 NFO, 9 indices.
 RELIANCE = 738561
@@ -299,3 +304,324 @@ def test_the_stream_url_requires_both_credentials() -> None:
 def test_split_packets_reports_the_segment_from_the_token() -> None:
     ticks = kt.parse_frame(_frame(_ltp(RELIANCE_FUT, 1)), NOW)
     assert ticks[0].segment == 2
+
+
+# --- 184-byte packets: what is parsed, and what is honestly ignored -----
+
+def test_market_depth_bytes_are_not_parsed_at_all() -> None:
+    # The module docstring says the depth block in bytes 64-184 is ignored
+    # and that Tick has no depth field. Rewriting every depth byte must
+    # therefore change nothing, and this fails the day that stops being
+    # true - which is the day the docstring would start lying.
+    packet = bytearray(_equity_full(RELIANCE_FUT, 129620, 128_549_500,
+                                    1757325600))
+    plain = kt.parse_frame(_frame(bytes(packet)), NOW)[0]
+    packet[64:184] = b"\xAB" * 120
+    scrambled = kt.parse_frame(_frame(bytes(packet)), NOW)[0]
+    assert scrambled == plain
+    assert not hasattr(plain, "depth")
+
+
+# --- stream resilience: a bounded read and a responsive stop ------------
+
+_FAKE_SESSION = SimpleNamespace(api_key="key", access_token="tok")
+
+
+class _FakeSocket:
+    """A scripted stand-in for a websockets connection.
+
+    One script entry is consumed per recv(): bytes or str come back as a
+    frame, an exception instance is raised, a callable is invoked (used to
+    trip the stop event mid-stream) and then skipped, and None blocks
+    forever, which is what a half-open TCP connection looks like from here.
+    """
+
+    def __init__(self, script: list) -> None:
+        self._script = list(script)
+        self.sent: list = []
+
+    async def send(self, message) -> None:
+        """Record a control message instead of sending it."""
+        self.sent.append(message)
+
+    async def recv(self):
+        """The next scripted frame, or a wait that never ends."""
+        while self._script:
+            item = self._script.pop(0)
+            if item is None:
+                break
+            if isinstance(item, BaseException):
+                raise item
+            if callable(item):
+                item()
+                continue
+            return item
+        await asyncio.sleep(3600)   # cancelled by the caller's bounded read
+
+
+class _FakeConnect:
+    """websockets.connect, handing out one scripted socket per call."""
+
+    def __init__(self, sockets: list) -> None:
+        self._sockets = list(sockets)
+        self.urls: list = []
+        self.kwargs: list = []
+        self._current = None
+
+    def __call__(self, url, **kwargs):
+        """Open the next scripted connection."""
+        self.urls.append(url)
+        self.kwargs.append(kwargs)
+        self._current = self._sockets[min(len(self.urls) - 1,
+                                          len(self._sockets) - 1)]
+        return self
+
+    async def __aenter__(self):
+        return self._current
+
+    async def __aexit__(self, *exc_info) -> bool:
+        return False
+
+
+def test_next_frame_is_bounded_and_a_stop_beats_a_silent_socket() -> None:
+    # await recv() on a half-open connection never returns and never
+    # raises, so the read has to be bounded or the recorder parks for the
+    # rest of the session.
+    async def go() -> None:
+        stop = asyncio.Event()
+        waiter = asyncio.ensure_future(stop.wait())
+        socket = _FakeSocket([b"\x00\x00", None])
+        assert await kt._next_frame(socket.recv, waiter, 1.0) == b"\x00\x00"
+        with pytest.raises(kt.StreamStalled):
+            await kt._next_frame(socket.recv, waiter, 0.02)
+        stop.set()
+        assert await kt._next_frame(socket.recv, waiter, 30.0) is None
+        waiter.cancel()
+
+    asyncio.run(asyncio.wait_for(go(), timeout=5))
+
+
+def test_a_silent_socket_is_dropped_and_reconnected(monkeypatch) -> None:
+    # The first socket is half-open: it accepts the subscription and then
+    # says nothing, forever, without raising. The stream has to notice and
+    # redial rather than sit there.
+    received: list = []
+    alive = _FakeSocket([])
+    connect = _FakeConnect([])
+
+    async def go():
+        nonlocal alive, connect
+        stop = asyncio.Event()
+        alive = _FakeSocket([_frame(_ltp(RELIANCE, 129490)), stop.set, None])
+        connect = _FakeConnect([_FakeSocket([None]), alive])
+        monkeypatch.setattr(websockets, "connect", connect)
+        return await asyncio.wait_for(
+            kt.stream([RELIANCE], received.extend, session=_FAKE_SESSION,
+                      stop_event=stop, reconnect_delay=0.0,
+                      read_timeout=0.02), timeout=5)
+
+    stats = asyncio.run(go())
+    assert stats.stalls == 1
+    assert len(connect.urls) == 2, "the stalled socket must be redialled"
+    assert connect.kwargs[0]["ping_interval"] is None
+    assert [t.instrument_token for t in received] == [RELIANCE]
+    assert alive.sent == [kt.subscribe_message([RELIANCE]),
+                          kt.mode_message(kt.MODE_FULL, [RELIANCE])]
+
+
+def test_a_stop_does_not_wait_for_the_next_tick(monkeypatch) -> None:
+    # stop_event used to be read only after a frame arrived, so on a quiet
+    # instrument a stop request hung until the next print. A 30s read
+    # timeout against a 2s deadline proves the stop ended it, not a timeout.
+    connect = _FakeConnect([])
+
+    async def go():
+        nonlocal connect
+        stop = asyncio.Event()
+        connect = _FakeConnect([_FakeSocket([None])])
+        monkeypatch.setattr(websockets, "connect", connect)
+        streamer = asyncio.ensure_future(
+            kt.stream([RELIANCE], lambda ticks: None, session=_FAKE_SESSION,
+                      stop_event=stop, reconnect_delay=0.0,
+                      read_timeout=30.0))
+        await asyncio.sleep(0.05)      # let it connect and block on recv
+        stop.set()
+        return await asyncio.wait_for(streamer, timeout=2)
+
+    stats = asyncio.run(go())
+    assert stats.stalls == 0 and stats.errors == 0
+    assert len(connect.urls) == 1
+
+
+def test_a_failing_callback_is_fatal_rather_than_a_reconnect_loop(
+        monkeypatch) -> None:
+    # A full disk raises OSError from inside the stream loop, where it used
+    # to be counted as a stream error and answered with a reconnect,
+    # forever, recording nothing. Reconnecting cannot fix a disk.
+    def boom(ticks) -> None:
+        raise OSError(28, "No space left on device")
+
+    connect = _FakeConnect([])
+
+    async def go() -> None:
+        nonlocal connect
+        connect = _FakeConnect([_FakeSocket([_frame(_ltp(RELIANCE, 1))])])
+        monkeypatch.setattr(websockets, "connect", connect)
+        with pytest.raises(kt.CallbackError, match="No space left"):
+            await asyncio.wait_for(
+                kt.stream([RELIANCE], boom, session=_FAKE_SESSION,
+                          reconnect_delay=0.0, read_timeout=1.0), timeout=5)
+
+    asyncio.run(go())
+    assert len(connect.urls) == 1
+
+
+def test_a_zero_read_timeout_is_refused() -> None:
+    # A non-positive timeout would stall on the first read and reconnect in
+    # a tight loop, which is worse than the hang it replaced.
+    async def go() -> None:
+        await kt.stream([RELIANCE], lambda ticks: None,
+                        session=_FAKE_SESSION, read_timeout=0.0)
+
+    with pytest.raises(ValueError, match="read_timeout"):
+        asyncio.run(go())
+
+
+# --- the recorder's writer: a persistent write failure must stop it -----
+
+class _FakeHandle:
+    """A file stand-in whose writes can be made to fail on demand."""
+
+    def __init__(self, fail: bool = False) -> None:
+        self.lines: list = []
+        self.flushes = 0
+        self.fail = fail
+
+    def write(self, text: str) -> None:
+        """Append a line, or raise what a full disk would."""
+        if self.fail:
+            raise OSError(28, "No space left on device")
+        self.lines.append(text)
+
+    def flush(self) -> None:
+        """Flush, or raise what a full disk would."""
+        if self.fail:
+            raise OSError(28, "No space left on device")
+        self.flushes += 1
+
+
+def _one_tick() -> list:
+    """A single parsed tick, for driving the writer."""
+    return kt.parse_frame(_frame(_ltp(RELIANCE, 129490)), NOW)
+
+
+def test_the_writer_labels_and_serialises_every_tick() -> None:
+    handle = _FakeHandle()
+    stop = asyncio.Event()
+    writer = tr.TickWriter(handle, {RELIANCE: "RELIANCE"}, stop)
+    writer(_one_tick())
+    row = json.loads(handle.lines[0])
+    assert row["symbol"] == "RELIANCE"
+    assert row["last_price"] == pytest.approx(1294.90)
+    assert row["received_at"] == NOW.isoformat()
+    assert row["exchange_timestamp"] is None
+    assert (writer.rows, writer.failures, handle.flushes) == (1, 0, 1)
+    assert not stop.is_set() and not writer.gave_up
+
+
+def test_a_persistent_write_failure_stops_the_recorder() -> None:
+    # Reconnecting silently around a dead disk is the failure being fixed:
+    # the recorder looked alive at WARNING level and recorded nothing.
+    handle = _FakeHandle(fail=True)
+    stop = asyncio.Event()
+    writer = tr.TickWriter(handle, {}, stop, max_failures=2)
+    writer(_one_tick())
+    assert not stop.is_set(), "one failure can be momentary"
+    assert writer.failures == 1
+    writer(_one_tick())
+    assert stop.is_set() and writer.gave_up
+    assert isinstance(writer.last_error, OSError)
+    assert writer.rows == 0
+
+
+def test_a_recovered_write_clears_the_run_of_failures() -> None:
+    handle = _FakeHandle(fail=True)
+    stop = asyncio.Event()
+    writer = tr.TickWriter(handle, {}, stop, max_failures=2)
+    writer(_one_tick())
+    handle.fail = False
+    writer(_one_tick())
+    handle.fail = True
+    writer(_one_tick())
+    assert not stop.is_set(), "the successful write broke the run"
+    assert (writer.failures, writer.consecutive_failures) == (2, 1)
+    writer(_one_tick())
+    assert stop.is_set() and writer.gave_up
+
+
+def test_the_exit_code_reports_a_write_failure_and_a_dead_stream() -> None:
+    # A run that recorded nothing must not exit 0 and look successful.
+    handle = _FakeHandle(fail=True)
+    writer = tr.TickWriter(handle, {}, asyncio.Event(), max_failures=1)
+    writer(_one_tick())
+    assert tr._report(kt.TickerStats(), writer, None) == 1
+    clean = tr.TickWriter(_FakeHandle(), {}, asyncio.Event())
+    assert tr._report(kt.TickerStats(), clean, None) == 0
+    dead = RuntimeError("stream died")
+    assert tr._report(kt.TickerStats(), clean, dead) == 1
+
+
+# --- the recorder end to end, with the socket stubbed out ---------------
+
+def _recorder_args(**overrides):
+    """Parsed recorder arguments, starting from the module's own defaults."""
+    args = tr._parse_args([])
+    for key, value in overrides.items():
+        setattr(args, key, value)
+    return args
+
+
+def _stub_recorder(monkeypatch, tmp_path, fake_stream) -> None:
+    """Point the recorder at a temp directory and a stubbed stream."""
+    monkeypatch.setattr(tr.kite_client, "load_session", lambda: _FAKE_SESSION)
+    monkeypatch.setattr(tr, "resolve_tokens",
+                        lambda args: {RELIANCE: "RELIANCE"})
+    monkeypatch.setattr(tr, "TICK_DIR", tmp_path)
+    monkeypatch.setattr(tr, "STATUS_FILE", tmp_path / "status.json")
+    monkeypatch.setattr(tr.kt, "stream", fake_stream)
+
+
+def test_the_recorder_records_a_tick_and_releases_its_file(
+        monkeypatch, tmp_path) -> None:
+    async def fake_stream(tokens, on_ticks, *, mode, session, stats,
+                          stop_event):
+        on_ticks(_one_tick())
+        stop_event.set()
+        return stats
+
+    _stub_recorder(monkeypatch, tmp_path, fake_stream)
+    code = asyncio.run(asyncio.wait_for(tr.run(_recorder_args()), timeout=5))
+    assert code == 0
+    written = list(tmp_path.glob("ticks_*.jsonl"))
+    assert len(written) == 1
+    assert json.loads(written[0].read_text(encoding="utf-8"))["symbol"] == (
+        "RELIANCE")
+    assert "stalls" in json.loads(
+        (tmp_path / "status.json").read_text(encoding="utf-8"))
+    # Windows refuses to unlink a file that is still open, so this is what
+    # proves the handle was closed rather than leaked.
+    written[0].unlink()
+
+
+def test_a_dead_stream_ends_the_run_instead_of_hanging(
+        monkeypatch, tmp_path) -> None:
+    # Without --minutes the run waited on the stop event alone, so a stream
+    # task that died on its first connection left the recorder parked for
+    # the session: no ticks, no error, nothing to see.
+    async def fake_stream(tokens, on_ticks, *, mode, session, stats,
+                          stop_event):
+        raise RuntimeError("subscription rejected")
+
+    _stub_recorder(monkeypatch, tmp_path, fake_stream)
+    code = asyncio.run(asyncio.wait_for(tr.run(_recorder_args()), timeout=5))
+    assert code == 1

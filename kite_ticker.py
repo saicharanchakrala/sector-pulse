@@ -19,7 +19,15 @@ tested without a market open or a credential.
          8             last price only
         28, 32         an index
         44             equity quote
-       184             equity quote plus open interest and market depth
+       184             equity quote, open interest, and market depth
+
+Two things the 184-byte packet carries are deliberately NOT parsed: the
+last-traded timestamp at offset 44, and the market depth in bytes 64 to
+184, which is ten 12-byte entries - five bids then five offers. Tick has
+no field for either and nothing in this project reads them, so parsing
+them would widen every recorded row for no reader. A mode of "full"
+therefore describes what was asked of Kite, not what a Tick holds: a Tick
+has no depth field at all.
 
 Prices arrive as integers in the instrument's minor unit - paise for NSE
 and NFO - and the divisor depends on the segment encoded in the low byte of
@@ -258,6 +266,7 @@ class TickerStats:
     ticks: int = 0
     heartbeats: int = 0
     errors: int = 0
+    stalls: int = 0
     connected_at: "datetime | None" = None
     last_tick_at: "datetime | None" = None
     tokens: set = field(default_factory=set)
@@ -266,22 +275,147 @@ class TickerStats:
         """Plain counters for a status line."""
         return {"frames": self.frames, "ticks": self.ticks,
                 "heartbeats": self.heartbeats, "errors": self.errors,
-                "instruments": len(self.tokens),
+                "stalls": self.stalls, "instruments": len(self.tokens),
                 "connected_at": (self.connected_at.isoformat()
                                  if self.connected_at else None),
                 "last_tick_at": (self.last_tick_at.isoformat()
                                  if self.last_tick_at else None)}
 
 
+# Kite sends a one-byte heartbeat about once a second on a live connection,
+# so silence for this long means the socket is gone even when TCP has not
+# noticed. Long enough to survive a slow moment, short enough that a dead
+# feed is caught inside one status refresh.
+#
+# The trade this makes: if Kite ever goes quiet WITHOUT dropping the
+# connection, this reconnects every timeout instead of hanging. That is the
+# intended direction. A reconnect is counted, logged and visible in the
+# status file; a hang looks exactly like a market with nothing to say.
+READ_TIMEOUT = 30.0
+
+
+class StreamStalled(Exception):
+    """Nothing arrived inside the read timeout; the socket is dead."""
+
+
+class CallbackError(Exception):
+    """`on_ticks` raised.
+
+    Wrapped so the reconnect loop cannot mistake a consumer failure for a
+    network failure. Reconnecting does not fix a full disk: it hides it
+    behind an endless retry that records nothing.
+    """
+
+
+async def _next_frame(recv, stop_waiter: "asyncio.Future",
+                      read_timeout: float) -> "bytes | str | None":
+    """The next frame from `recv()`, or None when a stop has been requested.
+
+    The read is bounded on purpose. A half-open TCP connection delivers
+    nothing and raises nothing, so an unbounded `await recv()` parks the
+    caller for the rest of the session; StreamStalled turns that silence
+    into something the caller can act on. Racing the stop waiter alongside
+    the read is what makes a stop take effect between frames instead of
+    after the next one, which on a quiet instrument could be minutes away.
+    """
+    receiver = asyncio.ensure_future(recv())
+    try:
+        done, _pending = await asyncio.wait(
+            {receiver, stop_waiter}, timeout=read_timeout,
+            return_when=asyncio.FIRST_COMPLETED)
+    except asyncio.CancelledError:
+        # A cancelled caller must not leave a read running on a socket it
+        # is about to close.
+        receiver.cancel()
+        raise
+    if receiver in done:
+        return receiver.result()
+    # Both remaining paths abandon this socket, so a frame lost to this
+    # cancellation cannot matter.
+    receiver.cancel()
+    if stop_waiter in done:
+        return None
+    raise StreamStalled(f"no frame in {read_timeout:g}s")
+
+
+async def _dispatch_frame(frame, on_ticks, counters: TickerStats) -> None:
+    """Count one frame and hand its ticks to `on_ticks`."""
+    if isinstance(frame, str):
+        # Kite sends JSON for errors and order updates.
+        logger.info("Stream message: %s", frame[:200])
+        return
+    counters.frames += 1
+    if len(frame) < 2:
+        counters.heartbeats += 1
+        return
+    ticks = parse_frame(frame)
+    if not ticks:
+        return
+    counters.ticks += len(ticks)
+    counters.last_tick_at = datetime.now().astimezone()
+    try:
+        result = on_ticks(ticks)
+        if asyncio.iscoroutine(result):
+            await result
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        raise CallbackError(
+            f"on_ticks failed: {type(exc).__name__}: {exc}") from exc
+
+
+async def _run_connection(socket, tokens: list[int], mode: str, on_ticks,
+                          counters: TickerStats, stop: asyncio.Event,
+                          stop_waiter: "asyncio.Future",
+                          read_timeout: float) -> None:
+    """Subscribe on a fresh socket, then pump frames until stop or trouble."""
+    counters.connected_at = datetime.now().astimezone()
+    counters.tokens.update(int(t) for t in tokens)
+    await socket.send(subscribe_message(tokens))
+    await socket.send(mode_message(mode, tokens))
+    logger.info("Subscribed to %d instrument(s) in %s mode", len(tokens), mode)
+    while not stop.is_set():
+        frame = await _next_frame(socket.recv, stop_waiter, read_timeout)
+        if frame is None:
+            return
+        await _dispatch_frame(frame, on_ticks, counters)
+
+
+def _scrub(text: str, *secrets: str) -> str:
+    """`text` with any of `secrets` replaced by stars.
+
+    Defence in depth. Some exception messages embed the whole URI, which
+    carries the access token, so the values are removed rather than trusted
+    to be absent.
+    """
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, "***")
+    return text
+
+
 async def stream(tokens: list[int], on_ticks, mode: str = MODE_FULL,
                  session=None, stats: "TickerStats | None" = None,
                  stop_event: "asyncio.Event | None" = None,
-                 reconnect_delay: float = 5.0) -> TickerStats:
+                 reconnect_delay: float = 5.0,
+                 read_timeout: float = READ_TIMEOUT) -> TickerStats:
     """Connect, subscribe, and hand every batch of ticks to `on_ticks`.
 
-    Reconnects on a dropped socket rather than exiting, because a recorder
-    that dies on the first network blip records nothing useful. `on_ticks`
-    receives a list of Tick and may be sync or async.
+    Reconnects on a socket that drops OR one that goes silent, rather than
+    exiting, because a recorder that dies on the first network blip records
+    nothing useful. It deliberately does NOT reconnect when `on_ticks`
+    raises: that is the consumer failing, and retrying the socket would
+    only hide it. `on_ticks` receives a list of Tick and may be sync or
+    async.
+
+    The library keepalive stays off and liveness is judged from the receive
+    side instead. Kite already sends a heartbeat about once a second, so a
+    bounded read detects a half-open connection from behaviour this module
+    observes and counts, whereas a ping only detects it if the server
+    answers pongs - which Kite does not document, and a server that ignored
+    them would have ping_timeout tearing down healthy sockets every twenty
+    seconds. The bounded read is also the only one of the two that can be
+    tested without a live market.
     """
     import websockets  # local import: only the live path needs it
 
@@ -295,50 +429,45 @@ async def stream(tokens: list[int], on_ticks, mode: str = MODE_FULL,
         raise ValueError(
             f"Kite caps one connection at {MAX_INSTRUMENTS_PER_CONNECTION} "
             f"instruments, got {len(tokens)}. Split across connections.")
+    if read_timeout <= 0:
+        raise ValueError(f"read_timeout must be positive, got {read_timeout}")
     counters = stats or TickerStats()
     url = stream_url(live.api_key, live.access_token)
 
-    while stop_event is None or not stop_event.is_set():
-        try:
-            async with websockets.connect(url, ping_interval=None) as socket:
-                counters.connected_at = datetime.now().astimezone()
-                counters.tokens.update(int(t) for t in tokens)
-                await socket.send(subscribe_message(tokens))
-                await socket.send(mode_message(mode, tokens))
-                logger.info("Subscribed to %d instrument(s) in %s mode",
-                            len(tokens), mode)
-                while stop_event is None or not stop_event.is_set():
-                    frame = await socket.recv()
-                    if isinstance(frame, str):
-                        # Kite sends JSON for errors and order updates.
-                        logger.info("Stream message: %s", frame[:200])
-                        continue
-                    counters.frames += 1
-                    if len(frame) < 2:
-                        counters.heartbeats += 1
-                        continue
-                    ticks = parse_frame(frame)
-                    if not ticks:
-                        continue
-                    counters.ticks += len(ticks)
-                    counters.last_tick_at = datetime.now().astimezone()
-                    result = on_ticks(ticks)
-                    if asyncio.iscoroutine(result):
-                        await result
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            counters.errors += 1
-            # Defence in depth. Some exception messages embed the whole URI,
-            # which carries the token, so the values are scrubbed rather
-            # than trusted to be absent.
-            reason = str(exc)[:400]
-            for secret in (live.access_token, live.api_key):
-                if secret:
-                    reason = reason.replace(secret, "***")
-            logger.warning("Stream dropped (%s: %s); reconnecting in %.0fs",
-                           type(exc).__name__, reason[:160], reconnect_delay)
-            if stop_event is not None and stop_event.is_set():
+    # An internal event when the caller supplied none, so that every wait
+    # below has one thing to race against and no branch has to ask whether
+    # a stop is even possible.
+    stop = stop_event if stop_event is not None else asyncio.Event()
+    stop_waiter = asyncio.ensure_future(stop.wait())
+    try:
+        while not stop.is_set():
+            try:
+                async with websockets.connect(url,
+                                              ping_interval=None) as socket:
+                    await _run_connection(socket, tokens, mode, on_ticks,
+                                          counters, stop, stop_waiter,
+                                          read_timeout)
+            except (asyncio.CancelledError, CallbackError):
+                # CancelledError is not an Exception, but naming it says the
+                # omission is deliberate. CallbackError is fatal by design:
+                # see the class docstring.
+                raise
+            except StreamStalled as exc:
+                counters.errors += 1
+                counters.stalls += 1
+                logger.warning("Stream silent (%s); reconnecting in %gs",
+                               exc, reconnect_delay)
+            except Exception as exc:
+                counters.errors += 1
+                reason = _scrub(str(exc)[:400], live.access_token,
+                                live.api_key)
+                logger.warning("Stream dropped (%s: %s); reconnecting in %gs",
+                               type(exc).__name__, reason[:160],
+                               reconnect_delay)
+            if stop.is_set():
                 break
-            await asyncio.sleep(reconnect_delay)
+            # A sleep that a stop request can cut short.
+            await asyncio.wait({stop_waiter}, timeout=reconnect_delay)
+    finally:
+        stop_waiter.cancel()
     return counters

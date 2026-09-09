@@ -141,48 +141,92 @@ def read_status() -> "dict | None":
         return None
 
 
-async def run(args: argparse.Namespace) -> int:
-    """Record until the time limit or an interrupt."""
-    session = kite_client.load_session()
-    if session is None:
-        print("No Kite session. Run: .venv\\Scripts\\python -m kite_login")
-        return 1
-    labels = resolve_tokens(args)
-    tokens = list(labels)
-    TICK_DIR.mkdir(parents=True, exist_ok=True)
-    path = tick_path(datetime.now().astimezone())
-    print(f"Recording {len(tokens)} instruments in {args.mode} mode")
-    print(f"  -> {path}")
-    if args.minutes:
-        print(f"  stopping after {args.minutes} minute(s)")
-    print("  Ctrl+C to stop. Ticks only flow while the market is open;")
-    print("  on subscribe Kite sends one last-known snapshot per instrument.")
+# One failed write can be momentary. A run of them cannot be explained away.
+MAX_CONSECUTIVE_WRITE_FAILURES = 3
 
-    stats = kt.TickerStats()
-    stop = asyncio.Event()
-    handle = path.open("a", encoding="utf-8")
 
-    def on_ticks(ticks: list[kt.Tick]) -> None:
-        """Append each tick as one JSON line."""
-        for tick in ticks:
-            row = asdict(tick)
-            row["symbol"] = labels.get(tick.instrument_token, "")
-            row["received_at"] = tick.received_at.isoformat()
-            row["exchange_timestamp"] = (tick.exchange_timestamp.isoformat()
-                                         if tick.exchange_timestamp else None)
-            handle.write(json.dumps(row) + "\n")
-        handle.flush()
+class TickWriter:
+    """Appends ticks as JSON lines, and stops the run if writing keeps failing.
 
-    async def status_loop() -> None:
-        """Refresh the status file so staleness is visible to a reader."""
-        while not stop.is_set():
-            write_status(stats, labels, args.mode)
-            try:
-                await asyncio.wait_for(stop.wait(), timeout=args.status_every)
-            except asyncio.TimeoutError:
-                continue
+    A write failure used to be indistinguishable from a network failure.
+    The callback runs inside the stream loop, so an OSError from a full
+    disk was caught by kite_ticker.stream, counted as a stream error and
+    followed by a reconnect, forever, at WARNING level: the recorder looked
+    alive and recorded nothing. Recording nothing is worse than stopping,
+    so a run of failures sets the stop event and the run exits non-zero.
 
-    loop = asyncio.get_running_loop()
+    `rows` counts ticks in batches that were written whole. A batch that
+    fails part way through may still have put some lines on disk, so the
+    count is a floor, not a guarantee.
+    """
+
+    def __init__(self, handle, labels: dict[int, str], stop: asyncio.Event,
+                 max_failures: int = MAX_CONSECUTIVE_WRITE_FAILURES) -> None:
+        self._handle = handle
+        self._labels = labels
+        self._stop = stop
+        self._max_failures = max_failures
+        self.rows = 0
+        self.failures = 0
+        self.consecutive_failures = 0
+        self.last_error: "OSError | None" = None
+
+    @property
+    def gave_up(self) -> bool:
+        """True once consecutive failures have stopped the recorder."""
+        return self.consecutive_failures >= self._max_failures
+
+    def __call__(self, ticks: "list[kt.Tick]") -> None:
+        """Append one batch of ticks, one JSON line each."""
+        try:
+            for tick in ticks:
+                self._handle.write(json.dumps(self._row(tick)) + "\n")
+            self._handle.flush()
+        except OSError as exc:
+            self._on_failure(exc, len(ticks))
+            return
+        self.rows += len(ticks)
+        self.consecutive_failures = 0
+
+    def _row(self, tick: "kt.Tick") -> dict:
+        """One tick as a JSON-safe row, labelled with its symbol."""
+        row = asdict(tick)
+        row["symbol"] = self._labels.get(tick.instrument_token, "")
+        row["received_at"] = tick.received_at.isoformat()
+        row["exchange_timestamp"] = (tick.exchange_timestamp.isoformat()
+                                     if tick.exchange_timestamp else None)
+        return row
+
+    def _on_failure(self, exc: OSError, lost: int) -> None:
+        """Count a failed batch, and stop the recorder once it is a pattern."""
+        self.failures += 1
+        self.consecutive_failures += 1
+        self.last_error = exc
+        if self.gave_up:
+            logger.error("Stopping: %d consecutive tick-write failures, "
+                         "the last %s: %s", self.consecutive_failures,
+                         type(exc).__name__, exc)
+            self._stop.set()
+        else:
+            logger.error("Tick write failed (%d of %d before stopping), "
+                         "up to %d tick(s) lost: %s",
+                         self.consecutive_failures, self._max_failures,
+                         lost, exc)
+
+
+async def _status_loop(stats: kt.TickerStats, labels: dict[int, str],
+                       mode: str, every: int, stop: asyncio.Event) -> None:
+    """Refresh the status file so staleness is visible to a reader."""
+    while not stop.is_set():
+        write_status(stats, labels, mode)
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=every)
+        except asyncio.TimeoutError:
+            continue
+
+
+def _install_stop_handlers(loop, stop: asyncio.Event) -> None:
+    """Ask the loop to set `stop` on SIGINT and SIGTERM, where it can."""
     for name in ("SIGINT", "SIGTERM"):
         sig = getattr(signal, name, None)
         if sig is None:
@@ -194,34 +238,114 @@ async def run(args: argparse.Namespace) -> int:
             # still unwinds the run, so this is a graceful-shutdown nicety only.
             pass
 
-    watcher = asyncio.create_task(status_loop())
-    streamer = asyncio.create_task(
-        kt.stream(tokens, on_ticks, mode=args.mode, session=session,
-                  stats=stats, stop_event=stop))
+
+def _print_preamble(tokens: list[int], path, args: argparse.Namespace) -> None:
+    """What the operator needs to know before any ticks arrive."""
+    print(f"Recording {len(tokens)} instruments in {args.mode} mode")
+    print(f"  -> {path}")
+    if args.minutes:
+        print(f"  stopping after {args.minutes} minute(s)")
+    print("  Ctrl+C to stop. Ticks only flow while the market is open;")
+    print("  on subscribe Kite sends one last-known snapshot per instrument.")
+
+
+async def _wait_until_done(streamer: asyncio.Task, stop: asyncio.Event,
+                           minutes: int) -> None:
+    """Block until the time limit, a stop request, or the streamer ending.
+
+    Waiting on the stop event alone would hang for the whole run if the
+    stream task died: a rejected subscription or an expired token would
+    look like a healthy recorder that simply never received a tick.
+    """
+    stopper = asyncio.ensure_future(stop.wait())
     try:
-        if args.minutes:
-            await asyncio.wait_for(stop.wait(), timeout=args.minutes * 60)
-        else:
-            await stop.wait()
-    except asyncio.TimeoutError:
-        pass
-    except KeyboardInterrupt:
-        pass
+        await asyncio.wait({streamer, stopper},
+                           timeout=minutes * 60 if minutes else None,
+                           return_when=asyncio.FIRST_COMPLETED)
     finally:
-        stop.set()
-        for task in (streamer, watcher):
-            task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
-        write_status(stats, labels, args.mode)
-        handle.close()
+        stopper.cancel()
+
+
+async def _shutdown(tasks) -> "BaseException | None":
+    """Cancel the background tasks and return the first real failure.
+
+    CancelledError is expected here and means nothing, which is why it has
+    to be named. Anything else is a bug or a fatal stream condition, and
+    swallowing it is how a recorder ends up looking healthy while recording
+    nothing.
+    """
+    for task in tasks:
+        task.cancel()
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    first = None
+    for task, result in zip(tasks, results):
+        if (not isinstance(result, BaseException)
+                or isinstance(result, asyncio.CancelledError)):
+            continue
+        logger.error("Task %s ended in %s: %s", task.get_name(),
+                     type(result).__name__, result)
+        if first is None:
+            first = result
+    return first
+
+
+def _report(stats: kt.TickerStats, writer: TickWriter,
+            failure: "BaseException | None") -> int:
+    """Print the closing summary and return the process exit code."""
     print()
-    print("Stopped.")
+    if writer.gave_up:
+        print(f"Stopped: {writer.consecutive_failures} tick writes failed in "
+              f"a row ({writer.last_error}). Nothing was reaching disk, so "
+              f"the recorder gave up rather than pretend to record.")
+    elif failure is not None:
+        print(f"Stopped by a failure - {type(failure).__name__}: {failure}")
+    elif writer.failures:
+        print(f"Stopped, but {writer.failures} batch(es) failed to write; "
+              f"the last error was {writer.last_error}")
+    else:
+        print("Stopped.")
     for key, value in stats.summary().items():
         print(f"  {key:<16}{value}")
-    return 0
+    print(f"  {'rows_written':<16}{writer.rows}")
+    return 1 if (writer.failures or failure is not None) else 0
+
+
+async def run(args: argparse.Namespace) -> int:
+    """Record until the time limit, an interrupt, or a fatal write failure."""
+    session = kite_client.load_session()
+    if session is None:
+        print("No Kite session. Run: .venv\\Scripts\\python -m kite_login")
+        return 1
+    labels = resolve_tokens(args)
+    tokens = list(labels)
+    TICK_DIR.mkdir(parents=True, exist_ok=True)
+    path = tick_path(datetime.now().astimezone())
+    _print_preamble(tokens, path, args)
+
+    stats = kt.TickerStats()
+    stop = asyncio.Event()
+    _install_stop_handlers(asyncio.get_running_loop(), stop)
+    # The handle is a context manager so that anything raising between the
+    # open and the close cannot leak it.
+    with path.open("a", encoding="utf-8") as handle:
+        writer = TickWriter(handle, labels, stop)
+        tasks = (
+            asyncio.create_task(
+                kt.stream(tokens, writer, mode=args.mode, session=session,
+                          stats=stats, stop_event=stop), name="stream"),
+            asyncio.create_task(
+                _status_loop(stats, labels, args.mode, args.status_every,
+                             stop), name="status"),
+        )
+        try:
+            await _wait_until_done(tasks[0], stop, args.minutes)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            stop.set()
+            failure = await _shutdown(tasks)
+        write_status(stats, labels, args.mode)
+    return _report(stats, writer, failure)
 
 
 def main(argv: "list[str] | None" = None) -> int:
