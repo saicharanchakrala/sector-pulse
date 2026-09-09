@@ -33,9 +33,14 @@ class IntradaySnapshot:
     avg_volume_20d: float           # 20-session mean daily volume
 
 
-def _field_series(data: pd.DataFrame, field: str, ticker: str,
-                  requested_tickers: list[str]) -> "pd.Series | None":
-    """Return one ticker's column for a field, handling MultiIndex vs flat frames."""
+def field_series(data: pd.DataFrame, field: str, ticker: str,
+                 requested_tickers: list[str]) -> "pd.Series | None":
+    """Return one ticker's column for a field, handling MultiIndex vs flat frames.
+
+    Public because the intraday scanner needs the same MultiIndex-versus-flat
+    defence over High, Low and Volume. Duplicating it once produced a scanner
+    that silently saw no volume on batched downloads.
+    """
     columns = data.columns
     series = None
     if isinstance(columns, pd.MultiIndex):
@@ -90,7 +95,7 @@ def _avg_volume_20d(volumes: "pd.Series | None") -> float:
 def _today_frame(intraday: pd.DataFrame, ticker: str,
                  tickers: list[str]) -> "pd.DataFrame | None":
     """Today's 5-minute Close/High/Low bars for one ticker, or None."""
-    closes = _field_series(intraday, "Close", ticker, tickers)
+    closes = field_series(intraday, "Close", ticker, tickers)
     if closes is None or closes.empty:
         return None
     tz = getattr(closes.index, "tz", None)
@@ -98,8 +103,8 @@ def _today_frame(intraday: pd.DataFrame, ticker: str,
     mask = [ts.date() == today for ts in closes.index]
     if not any(mask):
         return None
-    highs = _field_series(intraday, "High", ticker, tickers)
-    lows = _field_series(intraday, "Low", ticker, tickers)
+    highs = field_series(intraday, "High", ticker, tickers)
+    lows = field_series(intraday, "Low", ticker, tickers)
     frame = pd.DataFrame({"Close": closes})
     if highs is not None:
         frame["High"] = highs
@@ -155,10 +160,10 @@ def get_intraday_snapshots(tickers: list[str]) -> dict[str, IntradaySnapshot]:
             prev_close = None
             avg_volume = 0.0
             if daily is not None:
-                closes = _field_series(daily, "Close", ticker, tickers)
+                closes = field_series(daily, "Close", ticker, tickers)
                 today = today_bars.index[-1].date()
                 prev_close = _previous_close(closes, today) if closes is not None else None
-                avg_volume = _avg_volume_20d(_field_series(daily, "Volume", ticker, tickers))
+                avg_volume = _avg_volume_20d(field_series(daily, "Volume", ticker, tickers))
             if prev_close is None:
                 logger.warning("No previous close for %s; skipping", ticker)
                 continue
