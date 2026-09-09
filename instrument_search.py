@@ -36,6 +36,7 @@ held for 252 sessions.
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass
 from datetime import date
 
@@ -49,12 +50,26 @@ KIND_FUTURE = "future"
 KIND_OPTION = "option"
 KIND_ORDER = (KIND_STOCK, KIND_INDEX, KIND_FUTURE, KIND_OPTION)
 
-# Below this many characters, options are left out. Two characters can
-# match tens of thousands of contracts, and a list of strikes for a name
-# the user has not finished typing buries the stock they were after.
+# Below this many characters, options are left out entirely.
+#
+# What this does NOT do, since an earlier comment claimed it: it does not
+# "narrow" the option list. Four characters still matches every one of
+# BANKNIFTY's contracts. What keeps the list usable is the kind-first tier
+# ordering below, which puts the stock and its futures above every strike.
+# This threshold does something smaller and more specific - it stops a
+# one- or two-letter query, typed on the way to something else, from
+# spending the whole result budget on strikes.
+#
+# It is not a performance guard either: a full scan of the 43,800-row
+# catalogue costs about 7ms for "R" and 15ms for "RELI".
 MIN_CHARS_FOR_OPTIONS = 4
 
 _CATALOGUE: "list[Match] | None" = None
+# Streamlit serves each session on its own thread, and two arriving together
+# would both see an empty catalogue and both download the 109,000-row
+# master. The rebind is atomic under the GIL so there was no corruption,
+# only duplicated work - and, with an empty result, a duplicated failure.
+_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -88,15 +103,6 @@ class Match:
         side = "call" if self.right == "CE" else "put"
         return (f"{self.symbol}  -  {self.underlying} {side} at "
                 f"{self.strike:,.0f}, expires {when}, lot {self.lot_size:,}")
-
-
-def _kind_of(contract) -> str:
-    """Which bucket one instrument-master row belongs in."""
-    if getattr(contract, "is_option", False):
-        return KIND_OPTION
-    if getattr(contract, "is_future", False):
-        return KIND_FUTURE
-    return KIND_STOCK
 
 
 def build(rows: "list | None" = None) -> list:
@@ -152,9 +158,13 @@ def catalogue(refresh: bool = False) -> list:
     avoids rebuilding ~43,000 Match objects on every keystroke.
     """
     global _CATALOGUE
-    if _CATALOGUE is None or refresh:
-        _CATALOGUE = build()
-    return _CATALOGUE
+    # `not _CATALOGUE`, so a build that failed because the master could not
+    # be reached is retried on the next keystroke instead of being cached
+    # as "there are no instruments".
+    with _LOCK:
+        if not _CATALOGUE or refresh:
+            _CATALOGUE = build()
+        return _CATALOGUE
 
 
 def _score(match: Match, text: str) -> "tuple | None":
@@ -175,6 +185,11 @@ def _score(match: Match, text: str) -> "tuple | None":
         tier = 3
     elif text in symbol:
         tier = 4
+    elif text in underlying:
+        # A mid-word match on the underlying. Without this tier a query
+        # that lands inside the underlying's name but not inside the
+        # contract symbol matched nothing at all.
+        tier = 5
     else:
         return None
     # Nearer expiry first - that is the liquid contract - with cash

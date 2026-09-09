@@ -213,3 +213,43 @@ def test_each_kind_labels_what_distinguishes_it() -> None:
     call = isearch.find("RELIANCE26SEP1400CE").label
     assert "call" in call and "1,400" in call
     assert "put" in isearch.find("RELIANCE26SEP1400PE").label
+
+
+# --- a failed download must not become a cached "there are nothing" ------
+
+def test_an_empty_master_is_retried_rather_than_cached(monkeypatch) -> None:
+    # THE REGRESSION. kite_instruments.fetch_master returns [] on any
+    # network failure. market_source cached that - [] is not None, so it
+    # was never retried - and the catalogue cached [] on top, so one
+    # transient failure to reach Kite's CSV disabled the typeahead for the
+    # life of the process. The lookup then treated "no matches" as a dead
+    # end and refused to analyse anything at all.
+    import kite_instruments as ki
+    import market_source
+
+    monkeypatch.setattr(isearch, "_CATALOGUE", None)
+    monkeypatch.setattr(market_source, "_MASTER", None)
+    monkeypatch.setattr(ki, "fetch_master", lambda timeout=60: [])
+    assert isearch.catalogue() == []
+
+    # The network recovers. The next call must actually try again.
+    monkeypatch.setattr(ki, "fetch_master", lambda timeout=60: universe())
+    monkeypatch.setattr(ki, "nse_equities",
+                        lambda r: [c for c in r if c.instrument_type == "EQ"
+                                   and not c.tradingsymbol.startswith("NIFTY")])
+    monkeypatch.setattr(ki, "indices",
+                        lambda r: [c for c in r
+                                   if c.tradingsymbol.startswith("NIFTY")])
+    monkeypatch.setattr(ki, "nse_futures", lambda r: [c for c in r if c.is_future])
+    monkeypatch.setattr(ki, "nse_options", lambda r: [c for c in r if c.is_option])
+    assert isearch.catalogue(), "an empty catalogue was cached and never retried"
+    assert isearch.find("RELIANCE") is not None
+
+
+def test_a_mid_word_match_on_the_underlying_is_found() -> None:
+    # There was no "text inside the underlying" tier, so a query landing
+    # inside the underlying's name but not inside the contract symbol
+    # matched nothing. Ranked last, below every prefix match.
+    hits = isearch.search("ELIANCE", limit=10, include_options=True)
+    assert hits, "a mid-word underlying match found nothing"
+    assert any(h.underlying == "RELIANCE" for h in hits)

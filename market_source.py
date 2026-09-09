@@ -205,7 +205,11 @@ def master(refresh: bool = False) -> list:
     without a session. Only prices need the login.
     """
     global _MASTER, _TOKENS, _EXCHANGES
-    if _MASTER is None or refresh:
+    # `not _MASTER` rather than `is None`: fetch_master returns [] on any
+    # network failure, and caching that meant one transient outage disabled
+    # symbol resolution for the whole process - never retried, because []
+    # is not None. An empty master is a failure to answer, not an answer.
+    if not _MASTER or refresh:
         _MASTER = ki.fetch_master()
         _TOKENS = None
         _EXCHANGES = None
