@@ -66,7 +66,23 @@ def load_frames() -> dict[str, pd.DataFrame]:
 
 
 def benchmark_changes(frame: pd.DataFrame) -> dict:
-    """Benchmark percent change per session, for relative strength."""
+    """Benchmark percent change per session, indexed BY TIMESTAMP.
+
+    This returned one scalar per session - the index's FULL-DAY move - and
+    handed it to every bar of that session. Since relative_strength is
+    day_change_pct minus this, and relative_strength is both a hard gate
+    (setups._strength_reason) and 20% of the score being tested here, every
+    signal was scored against the outcome of the session it was still
+    trading in. edge_lab's own docstring names this trap and warns that a
+    caller supplying full-day changes is opting into lookahead; this file
+    was that caller.
+
+    Now: a Series per session of the index's move UP TO EACH BAR, so bar i
+    sees only what the index had done by bar i. Aligned on timestamps
+    rather than bar position, because 658 of 6,225 session-pairs in the
+    cache have different bar counts and position-matching would read a
+    later clock time off the benchmark.
+    """
     if frame is None or frame.empty:
         return {}
     closes = frame["Close"].dropna()
@@ -74,10 +90,23 @@ def benchmark_changes(frame: pd.DataFrame) -> dict:
     for day, series in closes.groupby(closes.index.date):
         if len(series) < 2:
             continue
-        first, last = float(series.iloc[0]), float(series.iloc[-1])
+        first = float(series.iloc[0])
         if first > 0:
-            by_day[day] = (last / first - 1.0) * 100.0
+            by_day[day] = (series / first - 1.0) * 100.0
     return by_day
+
+
+def benchmark_at(series, stamp) -> "float | None":
+    """The benchmark's move as at `stamp`, or None when it is unknown.
+
+    Looks the timestamp up rather than clamping to the last available bar:
+    clamping would serve the index's closing move for any bar past the
+    benchmark's own last one, which is the same lookahead by another route.
+    """
+    if series is None or len(series) == 0:
+        return None
+    upto = series.loc[series.index <= stamp]
+    return float(upto.iloc[-1]) if len(upto) else None
 
 
 def turnover_estimate(sessions: dict, prior_days: list) -> float:
@@ -102,7 +131,8 @@ def turnover_estimate(sessions: dict, prior_days: list) -> float:
     return float(np.median(values)) if values else 0.0
 
 
-def reading_from(ctx, turnover: float) -> Readings:
+def reading_from(ctx, turnover: float,
+                 benchmark: "float | None" = None) -> Readings:
     """A production Readings built from one edge_lab Context.
 
     Every field that the gates or the score actually consult is filled from
@@ -130,7 +160,13 @@ def reading_from(ctx, turnover: float) -> Readings:
         prev_close=ctx.prev_close, day_change_pct=change,
         vwap=vwap, vwap_distance_pct=distance,
         opening_range=orb, cpr=None, atr_bar=ctx.atr,
-        rvol=ctx.rvol, relative_strength=ctx.relative_strength,
+        rvol=ctx.rvol,
+        # NOT ctx.relative_strength: that reads Context.benchmark_change,
+        # which the caller used to fill with the session's full-day move.
+        # Computed here from the point-in-time benchmark instead, and left
+        # None when the benchmark is unknown so the gate fails closed.
+        relative_strength=(None if benchmark is None or change is None
+                           else change - benchmark),
         turnover_20d=turnover, oi_change_pct=None,
         futures_share=None, derivatives_turnover=None,
         day_high=float(np.nanmax(highs)), day_low=float(np.nanmin(lows)),
@@ -169,15 +205,25 @@ def outcome(ctx, session, direction: str, trade) -> tuple:
 
 
 def candidate_bars(session) -> list:
-    """The first bar that can fire long and the first that can fire short.
+    """Every bar where a direction is possible, in order.
 
-    choose_direction only returns a direction when price is on the matching
-    side of VWAP AND has broken the opening range that way, and the session
-    takes at most one signal per direction - so the first qualifying bar per
-    direction is the only one that can ever become a signal. Finding those
-    two with numpy instead of calling the full gate stack on all 75 bars is
-    what makes this run in minutes rather than days. Equivalent by
-    construction, not an approximation.
+    This used to return only the FIRST qualifying bar per direction, on the
+    argument that a session takes one signal per direction so a later bar
+    could never become one. That argument is wrong, and the error was
+    measured: choose_direction needs only VWAP side plus an opening-range
+    break, but an ACTIONABLE signal must also clear liquidity, relative
+    volume, strength, time, cost, win-rate and reachability. When the first
+    breaking bar fails one of those, the old code consumed the session and
+    never looked at the later bar that did pass.
+
+    Counted over 12 cached symbols and 2,748 sessions: 449 actionable
+    signals sat at the first qualifying bar and 746 sat at a later one, so
+    62% of what the scanner would actually show was invisible - and missing
+    non-randomly, in exactly the variables being scored.
+
+    So the full set is returned and the caller stops per direction at the
+    first bar that is actionable, keeping the first break separately for
+    the gates-ignored table.
     """
     n = session.n
     orb = edge_lab.BARS_PER_ORB
@@ -198,14 +244,8 @@ def candidate_bars(session) -> list:
     price = close[idx]
     ref = vwap[idx]
     with np.errstate(invalid="ignore"):
-        longs = idx[(price > ref) & (price > orb_high)]
-        shorts = idx[(price < ref) & (price < orb_low)]
-    picks = []
-    if longs.size:
-        picks.append(int(longs[0]))
-    if shorts.size:
-        picks.append(int(shorts[0]))
-    return sorted(set(picks))
+        qualifies = ((price > ref) & (price > orb_high)) |                     ((price <= ref) & (price < orb_low))
+    return [int(i) for i in idx[qualifies]]
 
 
 def collect() -> pd.DataFrame:
@@ -240,25 +280,59 @@ def collect() -> pd.DataFrame:
         if len(unique) <= WARMUP:
             skipped["too few sessions"] += 1
             continue
+        # edge_lab's session dict carries only the OHLCV arrays, not the
+        # timestamps, so they are rebuilt here. Needed to look the
+        # benchmark up by clock time rather than by bar position - 658 of
+        # 6,225 session-pairs in the cache have different bar counts, and
+        # position-matching would read the index at a later time than the
+        # stock's bar. Vectorised .date on the index, once per symbol.
+        index = frame.index
+        day_of = index.date
+        stamps_by_day = {day: index[day_of == day] for day in unique}
         for position, day in enumerate(unique):
             if position < WARMUP:
                 continue
             session = edge_lab._prepare_session(
-                symbol, day, sessions, unique[:position], changes.get(day))
+                symbol, day, sessions, unique[:position], None)
             if session is None:
                 skipped["unmeasurable session"] += 1
                 continue
+            bench_series = changes.get(day)
             turnover = turnover_estimate(sessions, unique[:position])
+            stamps = stamps_by_day.get(day)
+            fired_actionable, fired_break = set(), set()
             for i in candidate_bars(session):
                 ctx = session.context(i)
+                # Point-in-time benchmark for THIS bar. Context is frozen,
+                # so the value is handed to reading_from rather than set on
+                # it, and a bar with no benchmark reading gets None so the
+                # strength gate fails closed instead of guessing.
+                stamp = (stamps[i] if stamps is not None and i < len(stamps)
+                         else None)
+                bench = (benchmark_at(bench_series, stamp)
+                         if stamp is not None else None)
                 try:
-                    reading = reading_from(ctx, turnover)
+                    reading = reading_from(ctx, turnover, bench)
                     setup = setups.evaluate(reading)
                 except Exception as exc:
                     skipped[f"evaluate: {type(exc).__name__}"] += 1
                     continue
                 if setup.direction == setups.NO_SETUP or setup.levels is None:
                     continue
+                side = setup.direction
+                # One row per direction per session, as the scanner takes.
+                # The kept bar is the first ACTIONABLE one, falling back to
+                # the first break when no bar in the session ever passes -
+                # so the gates-ignored table still has a row and the
+                # gate-passing table is no longer a biased subsample.
+                if setup.actionable:
+                    if side in fired_actionable:
+                        continue
+                    fired_actionable.add(side)
+                else:
+                    if side in fired_actionable or side in fired_break:
+                        continue
+                    fired_break.add(side)
                 gross, cost = outcome(ctx, session, setup.direction, setup.levels)
                 if gross is None:
                     continue

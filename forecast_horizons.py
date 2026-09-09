@@ -294,7 +294,7 @@ def main() -> int:
         print(f"    selection spread (basket - all)  : "
               f"{result['spread']:+.3f}%")
         print(f"    share of positions beating index : {result['hit']:.3f}")
-        print(f"    mean worst drawdown on the path  : {result['mdd']:.2f}%")
+        print(f"    worst forward close vs entry     : {result['mdd']:.2f}%")
 
         rng = np.random.default_rng(SEED)
         nulls = []
@@ -322,18 +322,31 @@ def main() -> int:
     print("=" * 104)
     print("SUMMARY  (positive excess = beat holding the index, after charges)")
     print("=" * 104)
+    print("Excess is PER HOLDING PERIOD, and the periods differ, so the rows "
+          "are NOT")
+    print("directly comparable: 10 sessions is about 25 round trips a year "
+          "while 252")
+    print("is one, and each row is charged for a single round trip. The "
+          "trips/yr column")
+    print("is the conversion factor. Selection spread is the like-for-like "
+          "number.")
+    print()
     print(f"{'horizon':>8} {'excess %':>10} {'95% CI':>22} {'boot p':>8} "
-          f"{'perm p':>8} {'spread':>8} {'mdd %':>8}")
+          f"{'perm p':>8} {'spread':>8} {'mdd %':>8} {'trips/yr':>9}")
     for row in summary:
         if not row or row.get("excess") != row.get("excess"):
             print(f"{row.get('label', '?'):>8} {'n/a':>10}  "
                   f"{row.get('note', '')}")
             continue
+        trips = 252.0 / HORIZONS[row["label"]]["sessions"]
         print(f"{row['label']:>8} {row['excess']:>+10.3f} "
               f"[{row['lo']:+9.3f},{row['hi']:+9.3f}] {row['p']:>8.4f} "
               f"{row.get('perm_p', float('nan')):>8.4f} "
-              f"{row['spread']:>+8.3f} {row['mdd']:>8.2f}")
+              f"{row['spread']:>+8.3f} {row['mdd']:>8.2f} {trips:>9.1f}")
     print()
+    print("'worst forward close' is the lowest CLOSE over the horizon relative")
+    print("to entry, not a true intraday drawdown - highs and lows are not")
+    print("loaded - so it UNDERSTATES how far underwater a position went.")
     print("Read the LONG row with the most suspicion: its rows overlap so")
     print("heavily that the effective sample is roughly the non-overlapping")
     print("period count printed above, not the row count.")

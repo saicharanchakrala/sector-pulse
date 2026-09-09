@@ -70,7 +70,11 @@ EMBARGO_DAYS = 1
 CALIB_DAYS = 20
 SEED = 20260909
 MAX_FIT_ROWS = 250_000
-PERMUTATIONS = 10
+# 30, not 10. The comment above was copied from forecast_horizons together
+# with its reasoning and then the value was left at 10, so step 3 could
+# report only "not significant" whatever the data - the exact p floors at
+# 1/11 = 0.091. Thirty gives a floor of 1/31 = 0.032.
+PERMUTATIONS = 30
 
 FEATURES = [
     "vwap_dist_atr", "orb_pos", "orb_break_up", "orb_break_down",
@@ -184,7 +188,11 @@ def walk_forward(data: pd.DataFrame, stop_fraction: float, reward: float,
         calib = set(train_days[-CALIB_DAYS:])
         long_model, long_iso = fit_side(train, long_label, calib)
         short_model, short_iso = fit_side(train, short_label, calib)
-        if long_model is None or short_model is None:
+        # A fold where one side calibrated and the other did not would
+        # compare an isotonic probability against a raw one, so the side
+        # chosen becomes an artefact of which side happened to calibrate.
+        if (long_model is None or short_model is None
+                or long_iso is None or short_iso is None):
             continue
         block = test[["symbol", "day", "bar", long_label, short_label,
                       long_r, short_r, cost_column]].copy()
@@ -246,7 +254,15 @@ def main() -> int:
     print("=" * 104)
     print("STEP 1  geometry selection on TRAINING data only")
     print("=" * 104)
+    if not folds:
+        print("FATAL: no folds - too few sessions for the embargo and "
+              "fold count configured")
+        return 1
     tune = data[data["day"].isin(set(folds[0][0]))]
+    if tune.empty:
+        print("FATAL: the first fold has an empty training window, so the "
+              "geometry cannot be chosen on training data")
+        return 1
     scored = []
     for stop_fraction, reward in GEOMETRIES:
         suffix = tag(stop_fraction, reward)
@@ -332,10 +348,19 @@ def main() -> int:
     print(f"  net R > 0 with p < 0.05 before correction: "
           f"{len(good)} of {len(results)} geometries")
     if good:
+        # Benjamini-Hochberg is a STEP-UP procedure: find the largest rank
+        # whose p clears alpha*i/m and reject everything at or below it.
+        # Testing each rank independently, as this did, is a different and
+        # more conservative test wearing BH's name. forecast_stats has the
+        # tested implementation, and every geometry tried is passed in -
+        # correcting only the winners defeats the correction.
+        import forecast_stats
         m = len(results)
         ranked = sorted(good, key=lambda r: r["p"])
-        survivors = [r for i, r in enumerate(ranked, start=1)
-                     if r["p"] <= 0.05 * i / m]
+        all_p = [r["p"] for r in results]
+        keep = forecast_stats.benjamini_hochberg(all_p, 0.05)
+        surviving = {id(r) for r, ok in zip(results, keep) if ok}
+        survivors = [r for r in ranked if id(r) in surviving]
         print(f"  surviving Benjamini-Hochberg across all {m}: "
               f"{len(survivors)}")
         for r in ranked:
