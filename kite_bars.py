@@ -34,11 +34,19 @@ CACHE_DIR = config.PROJECT_ROOT / "bar_cache"
 OHLCV = ["Open", "High", "Low", "Close", "Volume"]
 
 
-def _cache_path(symbol: str, interval: str, start: date, end: date):
-    """Where one symbol's bars for one span are cached."""
+def _cache_path(symbol: str, interval: str, start: date, end: date,
+                oi: bool = False):
+    """Where one symbol's bars for one span are cached.
+
+    `oi` is part of the key. Without it a frame fetched without open
+    interest was served verbatim to a later oi=True caller, which silently
+    dropped the one column that caller asked for. The no-OI variant keeps
+    the original name so the existing cache stays valid.
+    """
     safe = symbol.replace("/", "_").replace(":", "_").replace(" ", "_")
-    return (CACHE_DIR /
-            f"kite__{safe}__{interval}__{start:%Y%m%d}_{end:%Y%m%d}.parquet")
+    suffix = "__oi" if oi else ""
+    return (CACHE_DIR / f"kite__{safe}__{interval}__"
+                        f"{start:%Y%m%d}_{end:%Y%m%d}{suffix}.parquet")
 
 
 def token_map(contracts: "list | None" = None) -> dict[str, int]:
@@ -57,22 +65,37 @@ def fetch_symbol(symbol: str, instrument_token: int, start: date, end: date,
                  interval: str = "5minute", oi: bool = False,
                  refresh: bool = False,
                  session=None) -> "pd.DataFrame | None":
-    """One symbol's bars, from cache when available."""
-    path = _cache_path(symbol, interval, start, end)
+    """One symbol's bars, from cache when available.
+
+    With oi=True the frame must carry an OpenInterest column: a frame
+    without it is refused rather than served as if it had one, because the
+    absence is invisible downstream. ValueError is caught alongside
+    KiteError so a bad span cannot kill a whole worker pool.
+    """
+    path = _cache_path(symbol, interval, start, end, oi=oi)
     if path.exists() and not refresh:
         try:
-            return pd.read_parquet(path)
+            cached = pd.read_parquet(path)
         except Exception as exc:
             logger.warning("Unreadable cache %s: %s", path.name, exc)
+        else:
+            if not oi or "OpenInterest" in cached.columns:
+                return cached
+            logger.warning("Cache %s has no OpenInterest; refetching",
+                           path.name)
     try:
         frame = kite_client.historical(instrument_token, start, end,
                                        interval=interval, oi=oi,
                                        session=session)
-    except kite_client.KiteError as exc:
+    except (kite_client.KiteError, ValueError) as exc:
         logger.warning("%s: %s", symbol, exc)
         return None
     if frame is None or frame.empty:
         logger.info("%s: no bars for %s..%s", symbol, start, end)
+        return None
+    if oi and "OpenInterest" not in frame.columns:
+        logger.warning("%s: Kite served no OpenInterest, refusing the frame",
+                       symbol)
         return None
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     try:
@@ -90,9 +113,11 @@ def load_bars(symbols: list[str], start: date, end: date,
     """Bars for many symbols, cached per symbol.
 
     `progress(done, total, symbol, cached)` is called per symbol so a long
-    sweep can report where it is. Symbols with no token or no data are
-    omitted and logged rather than raising: a sweep of two hundred names
-    should not die on one delisting.
+    sweep can report where it is. `total` counts the symbols that have a
+    token, not the symbols asked for, so a sweep with unresolvable names
+    still reaches 100%. Symbols with no token or no data are omitted and
+    logged rather than raising: a sweep of two hundred names should not die
+    on one delisting.
     """
     rows = contracts if contracts is not None else ki.fetch_master()
     tokens = token_map(rows)
@@ -102,7 +127,6 @@ def load_bars(symbols: list[str], start: date, end: date,
         raise kite_client.KiteError("No Kite session. Run kite_login first.")
     out: dict[str, pd.DataFrame] = {}
     missing: list[str] = []
-    total = len(symbols)
     # Fetches run concurrently while kite_client._pace still serialises
     # request STARTS at Kite's documented 3 per second. Sequentially each
     # symbol cost about 10 seconds for four chunked requests - almost all of
@@ -116,13 +140,15 @@ def load_bars(symbols: list[str], start: date, end: date,
             wanted.append((symbol, token))
         else:
             missing.append(symbol)
+    total = len(wanted)
     done = 0
     lock = threading.Lock()
 
     def one(pair):
         nonlocal done
         symbol, token = pair
-        was_cached = _cache_path(symbol, interval, start, end).exists()
+        was_cached = _cache_path(symbol, interval, start, end,
+                                 oi=oi).exists()
         frame = fetch_symbol(symbol, token, start, end, interval=interval,
                              oi=oi, refresh=refresh, session=session)
         with lock:
@@ -149,6 +175,12 @@ def benchmark_day_changes(index_symbol: str, start: date, end: date,
 
     Uses each session's last close against the prior session's, which is
     what the live scanner compares against.
+
+    That makes the value a WHOLE-session figure, so feeding it to
+    edge_lab.run_rule as `benchmark_change` hands a replayed rule the
+    index's outcome for a day it is still trading. Anything measured off
+    ctx.benchmark_change or ctx.relative_strength is therefore not
+    point-in-time. Every other field on the harness context is.
     """
     rows = contracts if contracts is not None else ki.fetch_master()
     token = index_tokens(rows).get(index_symbol.strip().upper())
