@@ -123,19 +123,23 @@ def run_decision_check(items: list[NewsItem],
         for i in range(10)
     ]
     forced_momentum = dict(momentum)
+    # Tickers come from the profile, not literals. Retargeting a sector's ETF
+    # once stranded these snapshots, which silently turned the engineered
+    # positive path into DON'T BUY instead of failing loudly.
+    etf = profile.trade_etfs
     forced_momentum["IT"] = SectorMomentum(
-        sector="IT", etf="ITBEES.NS",
+        sector="IT", etf=etf["IT"],
         returns={"5d": 2.0, "21d": 4.0, "63d": 8.0}, score=0.5
     )
     forced_momentum["Metal"] = SectorMomentum(
-        sector="Metal", etf="METALIETF.NS",
+        sector="Metal", etf=etf["Metal"],
         returns={"5d": -2.5, "21d": -5.0, "63d": -9.0}, score=-0.5
     )
     snapshots = {
-        "ITBEES.NS": _synthetic_snapshot("ITBEES.NS", 1.5, 0.3, 500_000.0),
-        "BANKBEES.NS": _synthetic_snapshot("BANKBEES.NS", -1.2, -0.4, 800_000.0),
-        "METALIETF.NS": _synthetic_snapshot("METALIETF.NS", -1.4, -0.5, 600_000.0),
-        "PHARMABEES.NS": _synthetic_snapshot("PHARMABEES.NS", 0.9, 0.1, 1_000.0),
+        etf["IT"]: _synthetic_snapshot(etf["IT"], 1.5, 0.3, 500_000.0),
+        etf["Banks"]: _synthetic_snapshot(etf["Banks"], -1.2, -0.4, 800_000.0),
+        etf["Metal"]: _synthetic_snapshot(etf["Metal"], -1.4, -0.5, 600_000.0),
+        etf["Pharma"]: _synthetic_snapshot(etf["Pharma"], 0.9, 0.1, 1_000.0),
     }
     signals = decision.decide(boosted, forced_momentum, snapshots, profile)
     assert len(signals) == len(profile.sectors), (
@@ -174,7 +178,13 @@ def run_decision_check(items: list[NewsItem],
                for r in by_sector["Pharma"].reasons), (
         "DON'T BUY reasons must include the decline-check separator"
     )
-    assert by_sector["Realty"].etf is None, "Realty should have no tradeable ETF"
+    # Whichever sectors have no listed ETF must exercise the etf-is-None
+    # branch. Derived from the profile so giving one an ETF cannot leave a
+    # hardcoded sector name asserting the opposite of shipped behaviour.
+    untradeable = sorted(set(profile.sectors) - set(profile.trade_etfs))
+    assert untradeable, "profile must still exercise the no-ETF branch"
+    for sector in untradeable:
+        assert by_sector[sector].etf is None, f"{sector} should have no ETF"
     buys = [s for s in signals if s.action == decision.ACTION_BUY]
     assert buys, "Mixed case should produce at least one BUY"
     expected_pick = max(buys, key=lambda s: s.rank_score)

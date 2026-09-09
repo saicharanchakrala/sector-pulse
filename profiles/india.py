@@ -1,8 +1,9 @@
 """India (NSE) market profile: Nifty sectoral indices + Indian financial press.
 
 Every feed URL below was live-verified on 2026-06-12 and every index symbol
-was verified live on yfinance the same day. Three global feeds are included
-because Indian markets move on global cues.
+was verified live on yfinance the same day; the tradeable ETFs were
+re-verified on 2026-09-08. Three global feeds are included because Indian
+markets move on global cues.
 """
 from __future__ import annotations
 
@@ -331,19 +332,24 @@ _PHRASES: dict[str, float] = {
     "open offer": 0.8,
 }
 
-# Tradeable NSE sector ETFs (verified live on yfinance with volume, 2026-06-12).
-# Realty and Media have no listed sector ETF and so get no entry.
+# Tradeable NSE sector ETFs (verified live on yfinance with volume, 2026-09-08).
+# Media has no listed sector ETF and so gets no entry.
+#
+# These tickers are also the momentum source (see market_data), so each one
+# must be the fund actually bought - a sibling ETF tracking the same index
+# still has its own premium, tracking error and liquidity.
 _TRADE_ETFS: dict[str, str] = {
     "Banks": "BANKBEES.NS",
-    "Financial Services": "FINIETF.NS",
-    "IT": "ITBEES.NS",
+    "Financial Services": "BFSI.NS",
+    "IT": "ITETF.NS",
     "Pharma": "PHARMABEES.NS",
     "Auto": "AUTOBEES.NS",
     "FMCG": "FMCGIETF.NS",
     "Metal": "METALIETF.NS",
     "Energy": "OILIETF.NS",
-    "Infrastructure": "INFRABEES.NS",
-    "PSU Banks": "PSUBNKBEES.NS",
+    "Infrastructure": "INFRAIETF.NS",
+    "PSU Banks": "PSUBANK.NS",
+    "Realty": "MOREALTY.NS",
 }
 
 IN_PROFILE = MarketProfile(

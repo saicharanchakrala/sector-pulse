@@ -154,12 +154,19 @@ def test_liquidity_gate_uses_rupee_turnover_not_unit_count() -> None:
     # INFRABEES trades near 958/unit. Under the old 50,000-UNIT floor it needed
     # 4.79 crore of turnover to qualify, while an 11-rupee ETF needed 5.7 lakh:
     # an 84x inconsistency. Turnover is comparable across price levels.
-    dear_but_liquid = _snapshot("INFRABEES.NS", price=958.0, volume=9_000.0)
+    # The ticker is read from the profile: when it was hardcoded, retargeting
+    # Infrastructure left the snapshot unmatched, so the sector got no
+    # snapshot at all and illiquid defaulted to False. The assertion below
+    # still passed while testing nothing.
+    ticker = get_profile("IN").trade_etfs["Infrastructure"]
+    dear_but_liquid = _snapshot(ticker, price=958.0, volume=9_000.0)
     turnover = 958.0 * 9_000.0
     assert turnover > config.SIGNAL_MIN_AVG_TURNOVER
     assert dear_but_liquid.avg_volume_20d < 50_000, "would fail the old unit gate"
-    by_sector = _decide_with({"INFRABEES.NS": dear_but_liquid})
-    assert by_sector["Infrastructure"].illiquid is False
+    by_sector = _decide_with({ticker: dear_but_liquid})
+    infra = by_sector["Infrastructure"]
+    assert infra.intraday is not None, "snapshot must reach the gate to test it"
+    assert infra.illiquid is False
 
 
 def test_genuinely_thin_etf_is_still_illiquid() -> None:
@@ -196,7 +203,11 @@ def test_explanation_mentions_turnover_not_units() -> None:
 def test_a_sector_with_no_snapshot_is_never_a_buy() -> None:
     by_sector = _decide_with({})
     assert all(s.action == decision.ACTION_NO_BUY for s in by_sector.values())
-    assert by_sector["Realty"].etf is None
+    profile = get_profile("IN")
+    untradeable = sorted(set(profile.sectors) - set(profile.trade_etfs))
+    assert untradeable, "profile must still exercise the no-ETF branch"
+    for sector in untradeable:
+        assert by_sector[sector].etf is None
 
 
 # --- momentum gate must fail closed ------------------------------------
