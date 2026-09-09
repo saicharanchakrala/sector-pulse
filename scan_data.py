@@ -37,6 +37,13 @@ class BarSet:
     # Where the intraday bars came from. Defaults to the download so any
     # caller that does not set it cannot accidentally claim to be live.
     source: str = "download"
+    # How many symbols actually had bars built from ticks today, and how old
+    # the newest of those bars is. Separate fields because `source` was
+    # being asked to carry both and got them wrong: a live path covering 3
+    # of 216 symbols, or running on a file hours stale, is not the same
+    # thing as a healthy stream, and the UI has to be able to tell.
+    live_symbols: int = 0
+    live_age_seconds: float = float("nan")
 
     @property
     def covered(self) -> int:
@@ -112,12 +119,13 @@ def fetch_bars(tickers: list[str], batch_size: int = config.SCAN_BATCH_SIZE,
 
     intraday = {}
     source = "download"
+    streamed, age = 0, float("nan")
     if target is None:
         # Live scan: prefer bars the feed has already built from ticks.
         # Costs no network and the newest bar is seconds old rather than
         # minutes. A replay skips this entirely - there is no live feed for
         # a past instant.
-        intraday = _live_intraday(unique)
+        intraday, streamed, age = _live_intraday(unique)
         if intraday:
             source = "live feed"
     if not intraday:
@@ -130,26 +138,44 @@ def fetch_bars(tickers: list[str], batch_size: int = config.SCAN_BATCH_SIZE,
         logger.warning("No intraday bars for %d symbol(s): %s",
                        len(failed), ", ".join(failed[:10]))
     return BarSet(intraday=intraday, daily=daily,
-                  requested=len(unique), failed=failed, source=source)
+                  requested=len(unique), failed=failed, source=source,
+                  live_symbols=streamed, live_age_seconds=age)
 
 
-def _live_intraday(symbols: list[str]) -> dict:
-    """Prior sessions from cache plus today from the tick feed, or {}.
+def _live_intraday(symbols: list[str]) -> tuple:
+    """(frames, symbols that streamed, age of newest bar) or ({}, 0, nan).
 
     Returns {} rather than a partial answer when the feed has written
     nothing for today, so the caller downloads instead of silently scanning
     yesterday's close as though it were now.
+
+    The two extra return values exist because `combined()` merges cached
+    prior sessions and the startup seed with the stream, and yields a frame
+    for every symbol having ANY of the three. Its emptiness therefore says
+    nothing about whether the feed is alive, which is precisely what the
+    caller needs to know.
     """
+    empty = ({}, 0, float("nan"))
     try:
         import live_bars
         import market_source
     except Exception as exc:                      # optional dependency path
         logger.info("Live bars unavailable (%s); downloading", exc)
-        return {}
+        return empty
     state = live_bars.status()
     if not state.get("present") or not state.get("bars"):
         logger.info("No live bars written today; downloading instead")
-        return {}
+        return empty
+    age = state.get("age_seconds", float("nan"))
+    # A stale file is worse than no file: it looks live, so nothing warns,
+    # and the levels are computed against a price that stopped moving when
+    # the feed died. `age == age` rules out NaN, where the age is unknowable
+    # and the download is the safe answer too.
+    if not (age == age) or age > config.SCAN_LIVE_MAX_AGE_SECONDS:
+        logger.warning(
+            "Live bars are %.0fs old (limit %ds) - the feed looks stopped, "
+            "so downloading instead", age, config.SCAN_LIVE_MAX_AGE_SECONDS)
+        return empty
     tokens = {}
     for symbol in symbols:
         token = market_source.token_for(symbol)
@@ -159,14 +185,21 @@ def _live_intraday(symbols: list[str]) -> dict:
         combined = live_bars.combined(symbols, tokens)
     except Exception as exc:
         logger.warning("Live bar assembly failed (%s); downloading", exc)
-        return {}
+        return empty
     live_today = live_bars.load_today(tokens)
     if not live_today:
-        return {}
-    logger.info("Live bars: %d symbols, %d with today's session, "
-                "newest %.0fs old", len(combined), len(live_today),
-                state.get("age_seconds", float("nan")))
-    return combined
+        return empty
+    # Only symbols the caller ASKED for and that actually streamed. The
+    # store holds whatever the feed was subscribed to, which is not the
+    # same universe as this scan.
+    streamed = len([s for s in symbols if s in live_today])
+    if not streamed:
+        logger.info("Live store holds no requested symbol; downloading")
+        return empty
+    logger.info("Live bars: %d symbols assembled, %d of %d requested "
+                "streaming, newest %.0fs old",
+                len(combined), streamed, len(symbols), age)
+    return combined, streamed, age
 
 
 def _carry_source(original: BarSet, intraday: dict, daily: dict,
@@ -181,7 +214,9 @@ def _carry_source(original: BarSet, intraday: dict, daily: dict,
     return BarSet(intraday=intraday, daily=daily,
                   requested=original.requested,
                   failed=list(original.failed if failed is None else failed),
-                  source=original.source)
+                  source=original.source,
+                  live_symbols=original.live_symbols,
+                  live_age_seconds=original.live_age_seconds)
 
 
 def truncate(bars: BarSet, cutoff) -> BarSet:

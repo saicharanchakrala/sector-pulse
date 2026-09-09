@@ -160,6 +160,21 @@ SCAN_MIN_TURNOVER = 50_000_000.0  # 5 crore/day: intraday needs depth, not just 
 SCAN_MIN_PRICE = 20.0             # sub-20 names move in ticks too coarse to manage
 SCAN_MIN_MINUTES_LEFT = 45        # no entry without time for the target to work
 SCAN_COST_MULTIPLE = 3.0          # target must clear round-trip cost this many times
+# How old the newest live bar may be before the feed counts as dead.
+# The arithmetic, which an earlier version of this comment got wrong by a
+# whole bar: age is measured from the bar's START stamp, and a bar closes
+# only when a tick from the NEXT bucket arrives. So the bar starting at S
+# closes at S+300, reaches the file by S+300+flush, and remains the newest
+# bar in it until its successor lands at S+600+flush. With the default
+# --flush-every of 20s the peak age of a perfectly healthy feed is
+# therefore 620s, not 340s. A 600s limit refused the live path for the
+# first 20s of every bucket - about 7% of the session - and fell back to
+# the 216-symbol download this whole path exists to avoid.
+SCAN_LIVE_MAX_AGE_SECONDS = 900
+# Below this share of requested symbols actually streaming, the live path is
+# not meaningfully live and the scan says so rather than claiming it is.
+SCAN_LIVE_MIN_COVERAGE = 0.5
+
 SCAN_SESSION_OPEN = (9, 15)       # NSE equity session, IST
 SCAN_SESSION_CLOSE = (15, 30)
 

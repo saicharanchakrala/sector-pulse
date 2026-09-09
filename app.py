@@ -904,18 +904,38 @@ def render_scan_results(ranked: list[setups.Setup], bars: scan_data.BarSet,
     stamp = (now.strftime("%Y-%m-%d %H:%M:%S") if replaying
              else now.strftime("%H:%M:%S"))
     origin = getattr(bars, "source", "download")
+    streaming = getattr(bars, "live_symbols", 0)
+    detail = ""
+    if origin == "live feed":
+        age = getattr(bars, "live_age_seconds", float("nan"))
+        detail = f" ({streaming}/{bars.requested} streaming"
+        detail += f", newest {age:.0f}s old)" if age == age else ")"
     st.caption(
         f"{'Replayed as of' if replaying else 'Scanned'} {stamp} IST{nifty} | "
         f"{indicators.minutes_left_in_session(now)} min left in the session | "
-        f"bars from **{origin}**"
+        f"bars from **{origin}**{detail}"
     )
-    if not replaying and origin != "live feed":
-        st.warning(
-            "These bars were DOWNLOADED, not streamed. The newest candle can "
-            "be several minutes old, so entry and stop are computed against "
-            "a price that has already moved. Start the live feed above to "
-            "remove both the wait and the staleness."
-        )
+    if not replaying:
+        # Three distinct states, where there used to be two. The middle one
+        # is the dangerous one: bars that came through the live path but
+        # where most symbols were served from cache or the startup seed, so
+        # they are as stale as a download while looking live.
+        thin = (origin == "live feed" and bars.requested
+                and streaming < config.SCAN_LIVE_MIN_COVERAGE * bars.requested)
+        if origin != "live feed":
+            st.warning(
+                "These bars were DOWNLOADED, not streamed. The newest candle "
+                "can be several minutes old, so entry and stop are computed "
+                "against a price that has already moved. Start the live feed "
+                "above to remove both the wait and the staleness."
+            )
+        elif thin:
+            st.warning(
+                f"Only {streaming} of {bars.requested} symbols are actually "
+                "streaming. The rest came from cached history or the startup "
+                "backfill, so their newest candle is as old as a download's. "
+                "Check the live feed is subscribed to this universe."
+            )
 
     if not actionable:
         premature = [s for s in ranked if not s.readings.range_closed]
