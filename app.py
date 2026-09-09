@@ -1,14 +1,22 @@
-"""Sector Pulse - Streamlit dashboard ranking market sectors per profile.
+"""Sector Pulse - Streamlit dashboard for both signal systems.
 
-Blends RSS news sentiment with sector index/ETF momentum into a composite
-investment-attractiveness score. Educational tool - not financial advice.
+Two tabs, two unrelated systems:
+
+  Positional signal  blends RSS news sentiment with sector index/ETF momentum
+                     into a composite score held for weeks.
+  Intraday scan      ranks NSE F&O names on VWAP, opening range, relative
+                     volume and volatility, and emits entry, stop, target and
+                     size for the same session.
+
+They share no thresholds and no data. Educational tool - not financial advice.
 """
 from __future__ import annotations
 
 import json
 import re
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -19,14 +27,22 @@ import claude_insights
 import config
 import decision
 import daily_signal
+import indicators
 import intraday
-import news_archive
 import market_data
 import news_fetcher
+import options_chain
+import scan_data
+import instruments
+import option_history
+import setups
+from levels import LONG
 from models import NewsItem, ScoredNewsItem, SectorMomentum, SectorScore
 from profiles import PROFILES, MarketProfile, get_profile
 
 st.set_page_config(page_title="Sector Pulse", page_icon="📈", layout="wide")
+
+IST_ZONE = ZoneInfo("Asia/Kolkata")
 
 GREEN = "#16a34a"
 RED = "#dc2626"
@@ -44,7 +60,12 @@ def load_news(max_age_hours: int, profile_key: str) -> list[NewsItem]:
 
 @st.cache_data(ttl=config.CACHE_TTL_SECONDS)
 def load_momentum(profile_key: str) -> dict[str, SectorMomentum]:
-    """Fetch and cache sector index/ETF momentum from yfinance."""
+    """Fetch and cache sector index/ETF momentum from yfinance.
+
+    Keyed on the profile key alone, but the result depends on the profile's
+    trade_etfs. Editing a profile while the dashboard is running keeps
+    serving the old tickers until the TTL lapses, so use "Refresh data".
+    """
     return market_data.get_sector_momentum(profile=get_profile(profile_key))
 
 
@@ -402,50 +423,540 @@ def render_ai_section(scores: list[SectorScore]) -> None:
         st.markdown(result)
 
 
+# --- Instrument sync -------------------------------------------------------
+
+def _cache_state() -> tuple["instruments.Universe | None", dict]:
+    """What the local cache currently holds: instruments and option chains."""
+    return instruments.load_latest(), option_history.cache_summary()
+
+
+def render_cache_status() -> None:
+    """Show what is cached locally, and how stale it is."""
+    universe, chains = _cache_state()
+    left, mid, right = st.columns(3)
+    if universe is None:
+        left.metric("Instruments cached", "none")
+        mid.metric("F&O underlyings", "-")
+    else:
+        left.metric("Instruments cached", f"{len(universe.equities):,}",
+                    help=f"Captured {universe.captured_at:%Y-%m-%d %H:%M}")
+        mid.metric("F&O underlyings",
+                   f"{len(universe.fo_indices) + len(universe.fo_stocks):,}")
+    right.metric("Chain snapshots", f"{chains['snapshots']:,}",
+                 help=f"{chains['megabytes']} MB on disk")
+    if universe is not None:
+        age = datetime.now().astimezone() - universe.captured_at
+        hours = age.total_seconds() / 3600
+        stale = ("captured " + f"{hours:.1f}h ago"
+                 if hours >= 1 else f"captured {age.seconds // 60} min ago")
+        st.caption(f"Instrument snapshot {stale}. Lot sizes and the F&O list "
+                   f"change on expiry, so re-sync at least weekly.")
+    if chains["snapshots"] == 0:
+        st.caption("No option chains stored yet. NSE serves only a live "
+                   "snapshot and keeps no archive, so any option level before "
+                   "your first capture can only ever be reconstructed from the "
+                   "underlying, never replayed.")
+    elif chains["last"] is not None:
+        st.caption(f"Chain captures span {chains['first']:%Y-%m-%d %H:%M} to "
+                   f"{chains['last']:%Y-%m-%d %H:%M}.")
+
+
+def sync_instruments(with_chains: bool) -> dict:
+    """Fetch and cache the instrument universe, optionally every chain too."""
+    status = st.status("Syncing from NSE...", expanded=True)
+    result: dict = {}
+    with status:
+        st.write("Fetching the listed-equity master, F&O master and open "
+                 "interest...")
+        universe = instruments.discover()
+        path = instruments.save(universe)
+        result["universe"] = universe.counts()
+        result["universe_path"] = path
+        st.write(f"Cached {len(universe.equities):,} equities, "
+                 f"{len(universe.fo_stocks):,} F&O stocks, "
+                 f"{len(universe.fo_indices)} indices, "
+                 f"{len(universe.fo_state):,} with live open interest.")
+        for gap in universe.gaps:
+            st.warning(gap)
+
+        if with_chains:
+            wanted = [i.symbol for i in universe.fo_underlyings]
+            indices = {i.symbol for i in universe.fo_indices}
+            bar = st.progress(0.0, text="Capturing option chains...")
+
+            def tick(done: int, total: int, symbol: str) -> None:
+                bar.progress(done / max(1, total),
+                             text=f"Option chains {done}/{total} - {symbol}")
+
+            snapshot = option_history.capture(wanted, indices, progress=tick)
+            chain_path = option_history.save(snapshot)
+            bar.empty()
+            result["chains"] = snapshot.counts()
+            result["chains_path"] = chain_path
+            st.write(f"Captured {snapshot.contract_count:,} contracts across "
+                     f"{len(snapshot.chains):,} underlyings.")
+            if snapshot.failed:
+                st.warning(f"No chain returned for {len(snapshot.failed)} "
+                           f"underlying(s): "
+                           f"{', '.join(snapshot.failed[:8])}"
+                           + (" ..." if len(snapshot.failed) > 8 else ""))
+        status.update(label="Sync complete", state="complete", expanded=False)
+    return result
+
+
+def render_sync_tab() -> None:
+    """Cache status plus the sync button."""
+    st.caption(
+        "Everything the scanner trades is discovered from NSE, never "
+        "hardcoded. This syncs that universe into the local cache so a scan "
+        "can say exactly which instruments were listed when it ran."
+    )
+    render_cache_status()
+    st.divider()
+    with_chains = st.checkbox(
+        "Also capture every option chain",
+        value=False,
+        help="About 216 paced requests, roughly two minutes. This is the only "
+             "way option calls become replayable later: NSE keeps no chain "
+             "history, so a premium not captured now is gone.")
+    if with_chains:
+        st.info(
+            "Option chains are the one thing that cannot be back-filled. "
+            "Equity bars stay available for ten days, so an equity signal can "
+            "be replayed at any past minute. A premium that was not recorded "
+            "can only be estimated from the underlying and a delta."
+        )
+    if st.button("Sync instruments now", type="primary"):
+        result = sync_instruments(with_chains)
+        st.session_state["last_sync"] = result
+        st.success("Cache updated. The scan tab will use this snapshot.")
+        st.rerun()
+    last = st.session_state.get("last_sync")
+    if last:
+        st.write("Last sync in this session:")
+        st.json({k: v for k, v in last.items() if not k.endswith("_path")})
+        for key in ("universe_path", "chains_path"):
+            if last.get(key):
+                st.caption(f"{key.replace('_path', '')}: `{last[key]}`")
+
+
+# --- Intraday scan tab -------------------------------------------------------
+
+# None means the curated large-cap list; an int slices the F&O list, which is
+# alphabetical, so those labels say "first N" rather than implying liquidity.
+# None means every F&O single stock, which is the default and the whole
+# tradeable intraday universe. An int caps the listed-equity sweep, which is
+# slow and mostly rejected on turnover.
+_SCAN_SCOPES: dict[str, "int | None"] = {
+    "F&O single stocks (default)": None,
+    "All listed equities, first 300": 300,
+    "All listed equities (very slow)": 0,
+}
+
+
+@st.cache_data(ttl=config.CACHE_TTL_SECONDS, show_spinner=False)
+def load_scan_bars(tickers: tuple[str, ...],
+                   target: "date | None" = None) -> scan_data.BarSet:
+    """Download and cache intraday plus daily bars for a ticker tuple.
+
+    Cached on the tickers and the replay date, never on the clock, so the
+    gates are always re-evaluated against the chosen instant from bars that
+    may be a few minutes old. That is the right split: the download is the
+    slow part, and the remaining session time is what moves the levels. The
+    date belongs in the key because a past window is a different download.
+    """
+    return scan_data.fetch_bars(list(tickers), target=target)
+
+
+def scan_frame(actionable: list[setups.Setup]) -> pd.DataFrame:
+    """Ranked actionable setups as a display table."""
+    return pd.DataFrame([{
+        "Symbol": s.symbol,
+        "Side": s.direction,
+        "Score": round(s.rank_score, 3),
+        "Entry": round(s.levels.entry, 2),
+        "Stop": round(s.levels.stop, 2),
+        "Target": round(s.levels.target, 2),
+        "Stop %": round(s.levels.stop_pct, 2),
+        "Target %": round(s.levels.target_pct, 2),
+        "Qty": s.levels.quantity,
+        "Risk": round(s.levels.lot_risk, 0),
+        "Cost": round(s.levels.cost_rupees, 0),
+        "Win % needed": round(s.levels.required_win_rate * 100, 1),
+        "RVOL": round(s.readings.rvol or 0.0, 2),
+        "RS vs Nifty": round(s.readings.relative_strength or 0.0, 2),
+        "OI chg %": (round(s.readings.oi_change_pct, 2)
+                     if s.readings.oi_change_pct is not None else None),
+    } for s in actionable])
+
+
+def _session_bounds() -> tuple[time, time]:
+    """The first computable minute of the session, and the close.
+
+    The lower bound is the opening-range close, not the opening bell. Before
+    the range has elapsed the latest bar is one of the bars defining it, so
+    the range brackets the current price by construction and no breakout can
+    be represented - offering 09:15 would be offering a control that cannot
+    produce a signal on any day.
+    """
+    open_h, open_m = config.SCAN_SESSION_OPEN
+    close_h, close_m = config.SCAN_SESSION_CLOSE
+    first = open_h * 60 + open_m + config.SCAN_OPENING_RANGE_MINUTES
+    return time(first // 60, first % 60), time(close_h, close_m)
+
+
+def render_replay_controls() -> "datetime | None":
+    """Date and time pickers; returns the replay instant, or None for live."""
+    earliest, latest = _session_bounds()
+    today = datetime.now(IST_ZONE).date()
+    mode = st.radio(
+        "When", ["Live (now)", "Replay a past instant"], horizontal=True,
+        help="A replay discards every bar after the chosen instant, so the "
+             "scan sees only what was knowable then.")
+    if mode == "Live (now)":
+        return None
+    left, right = st.columns(2)
+    with left:
+        chosen_day = st.date_input(
+            "Session date",
+            value=today,
+            min_value=today - timedelta(days=config.SCAN_UI_REPLAY_DAYS),
+            max_value=today,
+            help=f"The last {config.SCAN_UI_REPLAY_DAYS} days. Weekends and "
+                 f"holidays have no session and will come back empty.")
+    with right:
+        chosen_time = st.slider(
+            "Time (IST)", min_value=earliest, max_value=latest,
+            value=time(10, 0), step=timedelta(minutes=5),
+            help=f"5-minute steps, matching the bar size. Starts at "
+                 f"{earliest.strftime('%H:%M')} because the opening range "
+                 f"has not closed before then and no breakout is computable.")
+    moment = datetime.combine(chosen_day, chosen_time, tzinfo=IST_ZONE)
+    if chosen_day != today:
+        st.info(
+            f"Replaying {chosen_day:%A %d %B} at {chosen_time:%H:%M}. Open "
+            f"interest is dropped for a past session (NSE publishes no OI "
+            f"history, and today's figures would be lookahead), and option "
+            f"contracts cannot be shown unless a chain snapshot was stored "
+            f"at the time."
+        )
+    return moment
+
+
+def render_scan_controls() -> tuple[float, float, str, bool, "datetime | None", bool]:
+    """Scan inputs; returns (capital, risk_pct, scope, want_options, as_of, run)."""
+    left, mid, right = st.columns(3)
+    with left:
+        capital = st.number_input(
+            "Intraday capital", min_value=1_000.0, value=config.SCAN_CAPITAL,
+            step=10_000.0,
+            help="Position size is capped by this times MIS leverage.")
+    with mid:
+        risk_pct = st.number_input(
+            "Risk per trade (%)", min_value=0.1, max_value=10.0,
+            value=config.SCAN_RISK_PCT_PER_TRADE, step=0.25,
+            help="Percent of capital lost if the stop fills exactly.")
+    with right:
+        scope = st.selectbox("Universe", list(_SCAN_SCOPES))
+    as_of = render_replay_controls()
+    want_options = st.checkbox(
+        "Also pick an option contract for each setup",
+        help="Adds one NSE chain request per setup, so it is slower. Live "
+             "scans only: a past session has no chain to read.")
+    return (capital, risk_pct, scope, want_options, as_of,
+            st.button("Run intraday scan"))
+
+
+def run_scan(capital: float, risk_pct: float, scope: str,
+             as_of: "datetime | None" = None):
+    """Fetch bars and evaluate every symbol in scope, live or replayed."""
+    discovered = instruments.load_latest()
+    if discovered is None:
+        discovered = instruments.discover()
+        instruments.save(discovered)
+    limit = _SCAN_SCOPES[scope]
+    if limit is None:
+        equity = [inst.symbol for inst in discovered.fo_stocks]
+    else:
+        equity = [inst.symbol for inst in discovered.equities]
+        if limit:
+            equity = equity[:limit]
+    tickers = tuple([instruments.to_ticker(sym) for sym in equity]
+                    + [config.SCAN_BENCHMARK])
+
+    actual_now = datetime.now(IST_ZONE)
+    now = actual_now if as_of is None else as_of
+    # ANY earlier instant is a replay, not merely an earlier date. Comparing
+    # dates let a replay of 10:00 today pass straight through, and an audit
+    # found the resulting scan carrying open interest captured at 20:36 and
+    # an option chain quoting that day's closing prices, both presented as
+    # 10:00 readings.
+    replaying = as_of is not None and as_of < actual_now
+    other_day = now.date() != actual_now.date()
+    bars = load_scan_bars(tickers, target=now.date() if other_day else None)
+    if as_of is not None:
+        bars = scan_data.truncate(bars, now)
+    benchmark = scan_data.benchmark_change_pct(bars)
+    # The instrument snapshot may only inform a scan of an instant at or
+    # after its own capture time. NSE publishes no open-interest history, so
+    # a later snapshot cannot be backfilled onto an earlier moment.
+    states = (discovered.fo_state
+              if discovered.captured_at <= now else {})
+
+    evaluated = []
+    for symbol in equity:
+        ticker = instruments.to_ticker(symbol)
+        frame = bars.intraday.get(ticker)
+        if frame is None:
+            continue
+        reading = setups.measure(symbol, ticker, frame, bars.daily.get(ticker),
+                                 benchmark, now, fo_state=states.get(symbol))
+        if reading is not None:
+            evaluated.append(setups.evaluate(reading, capital=capital,
+                                             risk_pct=risk_pct))
+    return setups.rank(evaluated), bars, benchmark, now, replaying
+
+
+def render_scan_option_picks(actionable: list[setups.Setup]) -> None:
+    """Show the tradeable contract, if any, for each actionable setup."""
+    st.subheader("Option contracts")
+    st.caption(
+        "Direction comes from the equity setup above. All that is assessed "
+        "here is whether a contract is liquid and cheap enough to express it. "
+        "Buying only - selling naked options is never proposed."
+    )
+    discovered = instruments.load_latest()
+    lot_sizes = ({inst.symbol: inst.lot_size or 0
+                  for inst in discovered.fo_underlyings} if discovered else {})
+    index_symbols = ({inst.symbol for inst in discovered.fo_indices}
+                     if discovered else set())
+    session = options_chain.open_session()
+    for setup in actionable:
+        lot_size = lot_sizes.get(setup.symbol, 0)
+        with st.expander(f"{setup.symbol} {setup.direction}"):
+            if lot_size <= 0:
+                st.info("No lot size known, so option costs cannot be computed.")
+                continue
+            contracts, spot, expiry = options_chain.fetch_chain(
+                setup.symbol, setup.symbol in index_symbols, session=session)
+            if not contracts or spot is None:
+                st.info("No option chain came back for this underlying.")
+                continue
+            metrics = options_chain.summarise(setup.symbol, contracts, spot,
+                                              expiry)
+            if metrics is not None:
+                pcr = metrics.put_call_ratio
+                st.write(
+                    f"Expiry {expiry} | spot {spot:,.2f} | lot {lot_size} | "
+                    f"ATM {metrics.atm_strike:,.0f} | IV call "
+                    f"{metrics.atm_call_iv:.1f} / put {metrics.atm_put_iv:.1f}"
+                    + (f" | PCR {pcr:.2f}" if pcr is not None else "")
+                )
+            contract, reasons = options_chain.pick_contract(
+                contracts, spot, setup.direction, lot_size)
+            if contract is None:
+                st.warning(f"No tradeable contract: {reasons[0]}")
+            else:
+                side = "CALL" if setup.direction == LONG else "PUT"
+                st.success(
+                    f"BUY {contract.strike:,.0f} {side} at mid "
+                    f"{contract.mid:.2f} (bid {contract.bid:.2f} / ask "
+                    f"{contract.ask:.2f})")
+            for reason in reasons:
+                st.caption(f"- {reason}")
+
+
+def render_scan_results(ranked: list[setups.Setup], bars: scan_data.BarSet,
+                        benchmark, now: datetime, want_options: bool,
+                        replaying: bool = False) -> None:
+    """Render one scan's headline counts, table, gate detail and options."""
+    actionable = [s for s in ranked if s.actionable]
+    directional = [s for s in ranked
+                   if s.direction != setups.NO_SETUP and not s.actionable]
+    left, mid, right = st.columns(3)
+    left.metric("Symbols with bars", f"{bars.covered}/{bars.requested}")
+    mid.metric("Got a direction", f"{len(actionable) + len(directional)}")
+    right.metric("Cleared every gate", f"{len(actionable)}")
+    nifty = (f" | Nifty {benchmark:+.2f}% today" if benchmark is not None
+             else " | Nifty change unavailable, so relative strength fails closed")
+    stamp = (now.strftime("%Y-%m-%d %H:%M:%S") if replaying
+             else now.strftime("%H:%M:%S"))
+    st.caption(
+        f"{'Replayed as of' if replaying else 'Scanned'} {stamp} IST{nifty} | "
+        f"{indicators.minutes_left_in_session(now)} min left in the session"
+    )
+
+    if not actionable:
+        premature = [s for s in ranked if not s.readings.range_closed]
+        if not bars.intraday or bars.covered == 0:
+            # A total download failure must not read as a quiet market.
+            st.error(
+                f"No bars came back at all ({bars.covered}/{bars.requested}). "
+                f"This is a data failure, not an absence of setups - the "
+                f"source may be rate limiting or the market may have been "
+                f"closed on the chosen date. Re-run before drawing any "
+                f"conclusion."
+            )
+        elif premature and len(premature) == len(ranked):
+            open_h, open_m = config.SCAN_SESSION_OPEN
+            closes_at = open_h * 60 + open_m + config.SCAN_OPENING_RANGE_MINUTES
+            st.warning(
+                f"**No signal is computable yet.** The opening range covers "
+                f"the first {config.SCAN_OPENING_RANGE_MINUTES} minutes and "
+                f"does not close until "
+                f"{closes_at // 60:02d}:{closes_at % 60:02d}. Until then the "
+                f"latest bar is one of the bars defining the range, so the "
+                f"range brackets the current price by construction and no "
+                f"breakout can be represented. This is arithmetic, not a "
+                f"reading of the market: the same empty result would appear "
+                f"on the sharpest gap-up morning on record."
+            )
+        else:
+            st.info(
+                "No setup cleared every gate. On most days that is the "
+                "expected answer: the direction rule needs price-vs-VWAP and "
+                "the opening-range break to agree, and usually they do not."
+            )
+    else:
+        st.dataframe(scan_frame(actionable), width="stretch", hide_index=True)
+        # Each setup is sized to a fraction of capital on its own. Taken
+        # together they are not, and nothing said so: sixteen setups on one
+        # session came to 16x the assumed capital in notional.
+        total_risk = sum(s.levels.lot_risk for s in actionable)
+        total_notional = sum(s.levels.entry * s.levels.quantity
+                             for s in actionable)
+        st.warning(
+            f"**Aggregate exposure:** taking all {len(actionable)} risks "
+            f"{total_risk:,.0f} rupees across {total_notional:,.0f} of "
+            f"notional. Each row is sized independently against its own "
+            f"stop, so the per-trade cap does not bound the total."
+        )
+        best = actionable[0]
+        st.markdown(f"**Top setup: {best.symbol} {best.direction}**")
+        st.write(setups.explain(best))
+
+    shown = actionable or directional[:5]
+    if shown:
+        st.subheader("Gate detail")
+        for setup in shown[:8]:
+            suffix = (f" (score {setup.rank_score:.3f})" if setup.actionable
+                      else " - not actionable")
+            with st.expander(f"{setup.symbol} - {setup.direction}{suffix}"):
+                for reason in setup.reasons:
+                    st.caption(reason)
+
+    if want_options and actionable:
+        if replaying:
+            st.warning(
+                "**Option contracts cannot be shown for a replayed instant.** "
+                "NSE serves only a live chain and publishes no archive, so a "
+                "chain fetched now describes now. Pinning it onto an earlier "
+                "signal changes the strike, the premium and the spread: an "
+                "audit of a 10:00 replay found every printed spot equal to "
+                "that day's close, ten for ten. Capture chains with the "
+                "Instrument sync tab and replays after the first capture can "
+                "read a real one."
+            )
+        else:
+            render_scan_option_picks(actionable[:5])
+
+
+def render_scan_tab() -> None:
+    """Intraday scanner tab: controls, then the last scan's results."""
+    st.caption(
+        "A separate system from the positional signal. It holds for hours, not "
+        "weeks, so it has its own data, thresholds and cost model - no "
+        "threshold is shared between the two."
+    )
+    st.warning(
+        "Unbacktested. yfinance caps 5-minute history near 60 days, far too "
+        "little to establish whether this rule makes money, and its bars are "
+        "delayed rather than live - so treat every entry price as indicative, "
+        "not executable. The levels are arithmetic from today's range and "
+        "volatility, not a forecast."
+    )
+    capital, risk_pct, scope, want_options, as_of, run = render_scan_controls()
+    if run:
+        label = ("Downloading bars and evaluating setups..." if as_of is None
+                 else f"Replaying {as_of:%Y-%m-%d %H:%M} IST...")
+        with st.spinner(label):
+            ranked, bars, benchmark, now, past = run_scan(
+                capital, risk_pct, scope, as_of)
+        st.session_state["scan"] = (ranked, bars, benchmark, now,
+                                    want_options, past)
+    stored = st.session_state.get("scan")
+    if stored is None:
+        st.info("Set your capital and risk, then hit Run intraday scan.")
+        return
+    render_scan_results(*stored)
+
+
+def render_positional_tab(profile_key: str, news_weight: float,
+                          max_age_hours: int) -> None:
+    """The end-of-day sector signal and ranking.
+
+    Returns early instead of calling st.stop() on a data outage: st.stop()
+    aborts the whole script, which would blank the intraday tab too even
+    though it needs neither news nor this profile.
+    """
+    profile = get_profile(profile_key)
+    st.caption(
+        f"{profile.label} - news sentiment + index/ETF momentum ({profile.currency}), "
+        f"blended into a live ranking of {len(profile.sectors)} market sectors."
+    )
+    with st.spinner("Fetching news and market data..."):
+        items = load_news(max_age_hours, profile_key)
+        momentum = load_momentum(profile_key)
+
+    if not items and not momentum:
+        st.warning(
+            "No news items and no momentum data could be fetched. Check your "
+            "connection, widen the news lookback, or hit 'Refresh data' in "
+            "the sidebar."
+        )
+        return
+
+    if not items:
+        st.warning(
+            "No recent news items could be fetched. Check your connection, widen "
+            "the news lookback, or hit 'Refresh data' in the sidebar."
+        )
+        st.info("News data unavailable - rankings reflect momentum only.")
+
+    if not momentum:
+        st.info("Momentum data unavailable - rankings reflect news sentiment only.")
+
+    scores = analyzer.analyze(items, momentum, news_weight=news_weight,
+                              profile=profile)
+    render_header_metrics(len(items), scores, momentum, profile)
+    st.plotly_chart(build_score_chart(scores), width="stretch")
+    render_invest_section(scores)
+    render_signal_section(items, momentum, profile)
+
+    st.subheader("Full ranking")
+    st.dataframe(build_ranking_frame(scores), width="stretch", hide_index=True)
+
+    render_sector_expanders(scores)
+    render_ai_section(scores)
+
+
 # --- Top-level flow ----------------------------------------------------------
 
 profile_key, news_weight, max_age_hours = render_sidebar()
-profile = get_profile(profile_key)
 
 st.title("📈 Sector Pulse")
-st.caption(
-    f"{profile.label} - news sentiment + index/ETF momentum ({profile.currency}), "
-    f"blended into a live ranking of {len(profile.sectors)} market sectors."
-)
 
-with st.spinner("Fetching news and market data..."):
-    items = load_news(max_age_hours, profile_key)
-    momentum = load_momentum(profile_key)
+tab_positional, tab_intraday, tab_sync = st.tabs(
+    ["Positional signal (end of day)", "Intraday scan", "Instrument sync"])
 
-if not items and not momentum:
-    st.warning(
-        "No news items and no momentum data could be fetched. Check your "
-        "connection, widen the news lookback, or hit 'Refresh data' in the sidebar."
-    )
-    st.stop()
+with tab_positional:
+    render_positional_tab(profile_key, news_weight, max_age_hours)
 
-if not items:
-    st.warning(
-        "No recent news items could be fetched. Check your connection, widen the "
-        "news lookback, or hit 'Refresh data' in the sidebar."
-    )
-    st.info("News data unavailable - rankings reflect momentum only.")
+with tab_intraday:
+    render_scan_tab()
 
-if not momentum:
-    st.info("Momentum data unavailable - rankings reflect news sentiment only.")
-
-scores = analyzer.analyze(items, momentum, news_weight=news_weight, profile=profile)
-
-render_header_metrics(len(items), scores, momentum, profile)
-st.plotly_chart(build_score_chart(scores), width="stretch")
-render_invest_section(scores)
-render_signal_section(items, momentum, profile)
-
-st.subheader("Full ranking")
-st.dataframe(build_ranking_frame(scores), width="stretch", hide_index=True)
-
-render_sector_expanders(scores)
-render_ai_section(scores)
+with tab_sync:
+    render_sync_tab()
 
 st.caption(
     "Educational tool only. Data comes from free public sources and may be delayed "

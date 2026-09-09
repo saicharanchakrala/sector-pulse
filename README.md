@@ -31,6 +31,23 @@ A local Streamlit dashboard that gathers finance and major world news from free 
 | `analyzer.py` | Classification, sentiment, composite scoring |
 | `market_data.py` | yfinance sector index/ETF momentum |
 | `intraday.py` | yfinance intraday ETF snapshots (5-minute bars) |
+| `scan_intraday.py` | intraday scanner CLI: gates, levels, sizing, replay |
+| `setups.py` | per-symbol gates and the ranked verdict |
+| `indicators.py` | pure intraday maths: VWAP, opening range, CPR, ATR, RVOL |
+| `levels.py` | entry, stop, target, size and the required win rate |
+| `trade_costs.py` | Zerodha intraday equity and options charges |
+| `scan_data.py` | batched bar downloads and point-in-time truncation |
+| `options_chain.py` | live NSE chain, contract quality, PCR, max pain |
+| `instruments.py` | instrument discovery and the current universe file |
+| `discover.py` | discovery CLI |
+| `option_history.py` | option chain snapshots, so replays become possible |
+| `edge_lab.py` | harness measuring what price does after a signal |
+| `kite_instruments.py` | Zerodha public instrument master (no auth) |
+| `kite_client.py` | Kite session, quotes, paged historical candles |
+| `kite_login.py` | interactive Kite login helper |
+| `kite_bars.py` | bulk historical bars, cached to parquet |
+| `kite_ticker.py` | Kite WebSocket tick stream and binary parser |
+| `tick_recorder.py` | background tick recorder process |
 | `decision.py` | Daily BUY / DON'T BUY decision engine |
 | `daily_signal.py` | End-of-day signal CLI (report + `signals.csv` + `last_signal.json`) |
 | `news_archive.py` | Dated JSONL archive of fetched headlines, so sentiment can be backtested |
@@ -140,7 +157,7 @@ displays (with a "Compute signal now" button for a live re-check).
 A sector is a BUY only when **all** BUY gates pass:
 
 1. The sector has a tradeable ETF (`profile.trade_etfs`) with intraday data
-   today. In the India profile, Realty and Media have no listed sector ETF.
+   today. In the India profile, only Media has no listed sector ETF.
 2. Today-only news score >= `SIGNAL_MIN_NEWS` (0.15) over at least
    `SIGNAL_MIN_ARTICLES` (3) articles.
 3. Intraday confirmation: day change >= `SIGNAL_MIN_INTRADAY_PCT` (0.2%) and
@@ -209,9 +226,10 @@ Read this before trading on it. The rebalancer half carries none of these.
   premium/discount are all absent. On a small order these dominate.
 - **`buzz` is computed and never used.** `analyzer.py` produces it and `app.py`
   displays it; no gate reads it.
-- **Its universe is not your portfolio.** The ten tradeable tickers are sector
-  ETFs; `targets.yaml` holds different instruments. Acting on a signal means
-  buying something the planner will treat as an untracked holding.
+- **Its universe only partly overlaps your portfolio.** The tradeable tickers
+  are sector ETFs chosen to be the fund you would actually buy, but most are
+  not in `targets.yaml`. Acting on a signal for one of those means buying
+  something the planner will treat as an untracked holding.
 
 ### Scheduling on Windows (weekdays 15:15 IST)
 
@@ -241,6 +259,241 @@ schtasks /Delete /TN "SectorPulseDailySignal" /F
 ## How the scoring works
 
 Each headline is classified into one or more sectors via keyword matching, scored for sentiment with VADER (plus a finance lexicon overlay), and weighted by recency - an article's influence halves every `RECENCY_HALF_LIFE_HOURS`. Per sector, the recency-weighted average sentiment is damped when there are few articles, producing a news score in roughly [-1, 1]. In parallel, each sector's ETF gets a momentum score from tanh-squashed 5-day, 21-day, and 63-day returns, blended by window weights. The composite is `news_weight * news_score + (1 - news_weight) * momentum_score` (news-only when momentum data is unavailable), and sectors are ranked by composite, highest first.
+
+## Intraday scanner
+
+A second, separate system. The 3:15 signal above holds for weeks; this one
+holds for hours. They share no thresholds, no data source and no code path,
+because a rule that survives a week of drift is not the same rule that
+survives an afternoon of noise.
+
+```bash
+.venv\Scripts\python discover.py                       # cache the instrument universe
+.venv\Scripts\python scan_intraday.py --top 10         # scan the F&O single stocks
+.venv\Scripts\python scan_intraday.py --options        # also pick a tradeable contract
+.venv\Scripts\python scan_intraday.py --all-equities   # all ~2,570 listed names, slow
+```
+
+It ranks names on a transparent rule and prints, for each setup that clears
+every gate, an entry, a stop, a target and a size. Direction is never
+predicted: it is read off two agreeing structural facts, which side of the
+session VWAP price sits and which side of the opening range it has broken.
+When those disagree the symbol is chop and gets nothing, which is most
+symbols on most days.
+
+### Read this before using any of it
+
+**No rule here has a measured edge, and one has been measured to have
+none.** The harness in `edge_lab.py` ran the shipped rule over 3,537 signals
+across 49 sessions and 60 names:
+
+| | p10 | p25 | p50 | p75 | p90 | mean |
+|---|---|---|---|---|---|---|
+| Favourable excursion (MFE) | 0.063 | 0.178 | 0.419 | 0.785 | 1.290 | 0.601 |
+| Adverse excursion (MAE) | 0.086 | 0.226 | 0.482 | 0.845 | 1.312 | 0.629 |
+
+Both in units of sigma, where sigma is the bar ATR grown by the square root
+of bars remaining. Two things follow, and both matter more than any feature
+in this section.
+
+First, **adverse excursion exceeds favourable at every percentile**. After
+this breakout fires, price moves against the signal slightly more than for
+it. A rule with that property cannot be rescued by choosing a better stop or
+target, because no geometry manufactures edge that is not in the signal.
+
+Second, the rule's own target sat at 1.000 sigma, which only **16.6%** of
+signals ever reach. That is why live replays returned so few winners: the
+target was placed near the 85th percentile of favourable movement. The
+sqrt-of-time model overstated reachable range by roughly 2.4x at the median,
+because intraday prices mean-revert at short horizons rather than
+random-walking.
+
+Across the whole stop-and-target grid, **16 of 20 combinations lose money
+even at zero cost**, and the best gross expectancy is +0.047 R against the
+roughly 0.16 R that round-trip charges consume. The shipped geometry scores
+10.2 percentage points *worse* than a coin flip.
+
+Every gate is a conventional technical-analysis choice, and the rank weights
+are a judgement call. Neither is validated. Treat the output as a
+description of what was measured, not a recommendation.
+
+### The gates, and which ones actually bind
+
+Nine gates run per symbol, each printing its own PASS/FAIL line so the
+verdict can be rebuilt by hand. Honesty about their relative weight, from a
+run over 210 names: of 99 directional candidates that were rejected, **the
+relative-volume gate rejected 84 and reachability 8**. The cost-multiple and
+required-win-rate gates rejected **zero of 115**. The trail reads like nine
+independent filters; in practice one does nearly all the work.
+
+`SCAN_REQUIRE_OI_CONFIRMATION` is deliberately `False`. Open interest rising
+with price is a market convention with no backtest behind it here, so it
+informs the rank and the reasons rather than vetoing a setup. Promoting an
+unvalidated belief to a veto would look like rigour while being a guess.
+
+### What is honest about it
+
+- **The required win rate.** Every setup prints the hit rate it needs to
+  break even after real charges. That number is what makes a
+  reward-to-risk ratio mean anything: 2:1 sounds like an edge but only says
+  a 33% hit rate breaks even *before* costs.
+- **Aggregate exposure.** Each row is sized independently against its own
+  stop, so the per-trade cap does not bound the total. The report states the
+  combined risk and notional, which on one session came to 11.5x the assumed
+  capital.
+- **Nothing is computable before 09:30.** The opening range covers the first
+  15 minutes, so until it closes the latest bar is one of the bars defining
+  it, the range brackets the current price by construction, and no breakout
+  can be represented. The scanner says exactly that instead of printing an
+  empty result that looks like a quiet market.
+- **A data failure is not a quiet market.** Zero bars returned prints as a
+  data failure, not as an absence of setups.
+
+### Point-in-time replay
+
+```bash
+.venv\Scripts\python scan_intraday.py --as-of "10:00"              # today
+.venv\Scripts\python scan_intraday.py --as-of "2026-09-04 10:00"   # an earlier session
+```
+
+Bars after the instant are discarded, so the scan sees only what was
+knowable then. Two subtleties were found by audit rather than by design, and
+both are now enforced:
+
+- The cutoff is **strictly** before the instant. A bar is stamped at its
+  start, so the bar labelled 10:00 covers 10:00 to 10:05 and its close is
+  the 10:05 price. Keeping it made 16 setups where a true 10:00 cutoff gives
+  12, with 8 manufactured by that single bar and 4 genuine ones deleted.
+- Open interest is used only when the instrument snapshot was captured at or
+  before the replayed instant. NSE publishes no OI history, so a snapshot
+  taken in the evening cannot inform a morning scan. The column reads `n/a`
+  and says why.
+
+**Option contracts cannot be replayed at all** unless a chain snapshot was
+stored at the time. NSE serves only a live chain and keeps no archive, so a
+chain fetched now describes now: an audit of a 10:00 replay found every
+printed spot equal to that day's close, ten for ten. Capture chains with the
+dashboard's Instrument sync tab and replays after the first capture can read
+a real one.
+
+Replayed rows are flagged in `scan_log.csv` so they can never be mistaken
+for a live scan made at that time.
+
+## Instrument discovery
+
+Nothing in the scanner carries a hardcoded symbol list. `discover.py`
+fetches the universe from NSE and Zerodha at run time and caches it to
+`instruments/universe.json`, one current file rather than a history, so a
+scan can say exactly which instruments were listed when it ran.
+
+| | Count | Source |
+|---|---|---|
+| Listed equities | 2,571 | NSE `EQUITY_L` master |
+| F&O indices / single stocks | 6 / 210 | derived from the master file's own section row |
+| Underlyings with live OI and turnover | 216 | one NSE request |
+| Futures contracts | 647 | Zerodha's public instrument master |
+
+The index-versus-stock split comes from the section row inside NSE's F&O
+file, not a maintained list. That is not pedantry: the hand-written list it
+replaced was missing `NIFTYFPI`, so every scan requested it as an equity and
+logged a 404, and no test could have caught it because the list *was* the
+definition of truth. Deriving found 6 indices where 5 were hardcoded.
+
+## Zerodha Kite
+
+Two tiers, and the boundary matters.
+
+**No credentials needed.** `kite_instruments.py` reads Zerodha's public
+instrument master: 647 futures contracts, 32,437 option contracts, 10,111
+cash equities and 236 indices in one unauthenticated request. This closes a
+gap that looked permanent - NSE serves no bulk per-contract futures data,
+because the derivatives bhavcopy 404s on every published URL and
+`/api/quote-derivative` has been withdrawn. Lot sizes cross-check exactly
+against NSE's own market-lot file on all 216 underlyings.
+
+Note that indices carry `instrument_type` EQ and `exchange` NSE, differing
+from equities by **segment alone**. Filtering on exchange returns 136 of
+them as tradeable equities, NIFTY 50 and NIFTY BANK among them.
+
+**Your own subscription and login.** Quotes, historical candles and the tick
+stream.
+
+```bash
+setx KITE_API_KEY     your_key
+setx KITE_API_SECRET  your_secret
+# open a NEW terminal - setx only affects shells started afterwards
+.venv\Scripts\python -m kite_login
+```
+
+Credentials are read from the environment and never written into this repo,
+never logged and never echoed. The login is yours to perform: Kite issues a
+`request_token` only after an interactive login with your password and 2FA,
+so no tool can authenticate as you unattended. The resulting access token
+lands in a gitignored, owner-readable file and expires around 6am the next
+day, with no non-interactive refresh for retail apps.
+
+### Why the historical API matters more than the tick feed
+
+`kite_client.historical()` serves minute candles reaching back **at least
+six years**, against yfinance's eight days of 1-minute and about sixty of
+5-minute. Frames come back in the same column shape the rest of the project
+consumes, so they drop into `edge_lab` without translation, and `oi=True`
+adds historical open interest - the one field NSE never publishes, and the
+one every past-date replay previously had to discard as lookahead.
+
+That depth is what turns the edge search from suggestive into conclusive.
+The current measurement rests on 49 correlated sessions; a year of Kite data
+is 249. Speed does not fix a thin sample.
+
+### Live ticks
+
+```bash
+.venv\Scripts\python -m tick_recorder --fo --futures --mode full
+```
+
+`kite_ticker.py` implements Kite's binary protocol directly. The format is
+not self-describing: a packet's *meaning* comes from its byte *length* (8 is
+last price, 28 and 32 an index, 44 a quote, 184 a quote plus open interest
+and depth), and prices are integers whose divisor comes from the segment
+encoded in the instrument token's low byte. Get that wrong and you get
+plausible prices off by a factor of a hundred, silently, so the parsers are
+pure functions tested against hand-built frames rather than against a live
+market.
+
+The recorder is a **separate process**, not a thread inside Streamlit.
+Streamlit re-executes its script on every interaction, so a thread started
+there duplicates across reruns and dies with the session. This one owns one
+socket and one file, and keeps recording while nobody is watching.
+
+This is the only genuinely live source in the project. yfinance serves NSE
+roughly fifteen minutes late, so no polling frequency ever made it current.
+
+## Measuring a rule before trusting it
+
+`edge_lab.py` exists because the first rule failed in a way that could only
+be diagnosed by measurement. You write a rule, it measures what price did
+afterwards:
+
+```python
+def my_rule(ctx):
+    """Return "LONG", "SHORT" or None for the bar at ctx.i."""
+    if not ctx.orb_closed:
+        return None
+    return "LONG" if ctx.price > ctx.vwap[-1] and ctx.price > ctx.orb_high else None
+```
+
+`ctx` exposes only what had printed by bar `i` - arrays are pre-sliced and
+the ATR comes from prior sessions - so a rule cannot look ahead even by
+accident. Three disciplines are enforced by the harness rather than left to
+each rule: one signal per direction per session taken on the first bar it
+fires, a bar spanning both stop and target counted as a stop, and unresolved
+positions marked out at the close rather than discarded.
+
+The output is a grid of stop and target sizes with, for each, the hit rate,
+the hit rate a driftless random walk would give that same geometry, and the
+difference. That difference is the only evidence of predictive skill. A high
+hit rate at a reward-to-risk below 1 proves nothing: 87% wins at 0.33 R:R is
+what a random walk already pays.
 
 ## Monthly contribution planner (target weights)
 
@@ -323,7 +576,10 @@ Copy-Item holdings.example.csv holdings.csv
 Copy-Item targets.example.yaml targets.yaml
 ```
 
-Live prices come from yfinance (bare NSE symbols get a `.NS` suffix). If that is
+Live prices for the planner come from yfinance (bare NSE symbols get a
+`.NS` suffix), which serves NSE roughly fifteen minutes late. The intraday
+scanner can additionally read genuinely live prices from Zerodha Kite; see
+the Zerodha Kite section. If yfinance is
 unreachable the planner falls back to the price column in your CSV and says so in the
 report. `--offline` skips the network entirely.
 

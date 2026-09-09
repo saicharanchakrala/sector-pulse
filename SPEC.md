@@ -24,6 +24,23 @@ AI narrative-analysis section.
 | `market_data.py` | yfinance sector ETF momentum | market agent |
 | `claude_insights.py` | Optional Claude narrative analysis | insights agent |
 | `intraday.py` | yfinance intraday ETF snapshots | market agent |
+| `indicators.py` | pure intraday maths | intraday agent |
+| `levels.py` | entry/stop/target/size geometry | intraday agent |
+| `setups.py` | intraday gates and ranking | intraday agent |
+| `trade_costs.py` | Zerodha charge model | intraday agent |
+| `scan_data.py` | batched bars, point-in-time truncation | intraday agent |
+| `options_chain.py` | NSE chain and contract quality | intraday agent |
+| `scan_intraday.py` | intraday scanner CLI | intraday agent |
+| `instruments.py` | instrument discovery | discovery agent |
+| `discover.py` | discovery CLI | discovery agent |
+| `option_history.py` | option chain snapshots | discovery agent |
+| `edge_lab.py` | rule measurement harness | research agent |
+| `kite_instruments.py` | Zerodha instrument master (no auth) | kite agent |
+| `kite_client.py` | Kite session, quotes, historical | kite agent |
+| `kite_login.py` | Kite login helper | kite agent |
+| `kite_bars.py` | bulk Kite bars, parquet cache | kite agent |
+| `kite_ticker.py` | Kite WebSocket binary tick parser | kite agent |
+| `tick_recorder.py` | background tick recorder | kite agent |
 | `decision.py` | Daily BUY / DON'T BUY decision engine | analysis agent |
 | `daily_signal.py` | End-of-day signal CLI (report + signals.csv + last_signal.json) | core |
 | `news_archive.py` | Dated JSONL headline archive + replay loader | core |
@@ -182,7 +199,7 @@ def get_intraday_snapshots(tickers: list[str]) -> dict[str, IntradaySnapshot]
 @dataclass(frozen=True)
 class TradeSignal:
     sector: str
-    etf: str | None                 # None = no tradeable ETF (e.g. Realty/Media)
+    etf: str | None                 # None = no tradeable ETF (e.g. Media)
     action: str                     # "BUY" | "DON'T BUY"
     rank_score: float
     news_today: float               # news score computed on today-only items
@@ -270,6 +287,148 @@ the cached loaders take a hashable `profile_key: str` and resolve `get_profile()
 inside. See the UI requirements given to the ui agent. Streamlit executes scripts
 top-to-bottom - structure as small helper functions plus top-level flow (no
 `main()` guard needed).
+
+## Intraday scanner (second, independent system)
+
+Holds for hours where the 3:15 signal holds for weeks. Shares no threshold,
+no data source and no code path with it. Everything below is a contract, not
+a suggestion.
+
+### Non-negotiables
+
+These exist because each one was violated once and the violation was found
+by audit, not by reasoning.
+
+1. **A rule sees only what had printed.** Arrays are sliced to the current
+   bar; ATR comes from prior sessions. There is no field on a context object
+   that contains a future price.
+2. **The replay cutoff is strictly before the instant.** A bar is stamped at
+   its START, so the bar labelled 10:00 covers 10:00-10:05. `ts <= cutoff`
+   made every "10:00" entry a 10:05 entry: 16 actionable setups where a true
+   cutoff gives 12, 8 of them manufactured by that bar and 4 genuine ones
+   deleted.
+3. **A data source may inform a scan only if it predates the instant
+   scanned.** Tested by timestamp, never by date. `now.date() != today` let a
+   replay of 10:00 today bypass every guard and consume open interest
+   captured at 20:36 plus a live option chain quoting closing prices.
+4. **Absent data fails closed and says so.** Missing open interest scores
+   0.0 on its rank term, not a flattering neutral. Missing relative volume,
+   relative strength or turnover rejects the setup.
+5. **A structural impossibility is never reported as a market reading.**
+   Before 09:30 no breakout is representable, because the opening-range
+   bounds are computed from the same bar as the price compared against them.
+   The report says that, rather than printing an empty result.
+6. **A data failure is never reported as a quiet market.** Zero bars
+   returned is its own message.
+7. **Replayed output is marked.** `scan_log.csv` carries a `replayed`
+   column, and `append_log` rotates a file whose header predates a column
+   change rather than misaligning every row.
+
+### Module contracts
+
+#### indicators.py
+Pure maths over bar frames. Deterministic, network-free, returns `None`
+rather than inventing a value. Callers must gate on `None` explicitly; a
+caller treating it as zero fails open.
+
+- `vwap` returns `None` when volume is absent or sums to zero. A zero-volume
+  VWAP silently collapses to a simple mean, which is a different indicator
+  wearing VWAP's name.
+- `atr` smooths per-session true ranges via `true_range_by_session`, never
+  across a session boundary. An overnight gap is not a tradeable move: with
+  a constant 1.0 intraday range and a 20-rupee gap, whole-frame ATR read
+  2.21 three bars in against a true 1.0, doubling every stop in the first
+  hour. Each session's opening bar keeps its own high-low span.
+- `relative_volume` compares today's cumulative volume against the **median**
+  of prior sessions at the same time of day, and skips any prior session
+  whose curve does not reach that clock. A mean baseline lets one frenzied
+  day hide a genuine doubling; an early-ending session inflated a reading
+  from 2.0 to 3.16 on nothing but missing data.
+- `opening_range_closed` is a precondition, not a nicety. See non-negotiable 5.
+
+#### levels.py
+One horizon governs everything: `sigma = atr_per_bar * sqrt(bars_left)`.
+Stop is a fraction of that sigma, target a multiple of the stop distance.
+Sizing stop and target on different horizons is incoherent and rejected
+every setup.
+
+- The structural window is `[(1-band)*base, base]` and never exceeds `base`.
+  Accepting a wider structural stop scales the target past sigma, which the
+  reachability check then rejects: every structural stop in `(base,
+  1.4*base]` was a guaranteed rejection.
+- Quantity is capped by `capital * leverage / entry`. Risk-based sizing
+  alone printed a 6.94 lakh position on 1 lakh of capital.
+- `required_win_rate` solves `p*reward - (1-p)*risk = costs`. This is the
+  number that makes a reward-to-risk ratio mean anything and must appear in
+  every report.
+- `cost_multiple` returns `0.0`, never `inf`, when cost is unknown, so the
+  cost gate fails closed.
+
+#### setups.py
+Nine gates, each recording its own PASS/FAIL line. A setup is actionable
+only when all pass. The rank score is a bounded weighted sum of per-symbol
+readings, never scaled against the rest of the scan, so one symbol's score
+does not move when another is added.
+
+Direction requires price-vs-VWAP and the opening-range break to **agree**.
+Disagreement is chop and yields nothing.
+
+Documented weakness: of 99 rejected directional candidates in one run,
+relative volume rejected 84 and reachability 8. The cost and win-rate gates
+rejected 0 of 115. The trail implies nine filters; one does the work.
+
+#### scan_data.py
+The seam where a broker feed replaces yfinance. Everything downstream
+consumes plain OHLCV frames, so a Kite provider changes no indicator, gate
+or level. `truncate` implements non-negotiable 2.
+
+#### instruments.py, discover.py
+No hardcoded symbol list anywhere. The index-versus-stock split derives from
+the section row inside NSE's F&O master. One current file, written
+atomically via `os.replace`, because with no history a truncated write
+leaves nothing to fall back on.
+
+#### edge_lab.py
+Rules are measured, not argued about. Contract: `rule(ctx) -> "LONG" |
+"SHORT" | None`. Reports favourable and adverse excursion distributions plus
+a stop-and-target grid, and for each cell the hit rate a driftless random
+walk would give that same geometry. **That difference is the only evidence
+of predictive skill.** A high hit rate at a reward-to-risk below 1 proves
+nothing.
+
+Measured result for the shipped rule, which must not be quietly dropped from
+this document: 3,537 signals, mean MFE 0.601 sigma against mean MAE 0.629,
+so adverse excursion exceeds favourable at every percentile. 16 of 20 grid
+cells lose at zero cost. The shipped geometry is 10.2 percentage points
+worse than a coin flip. No rule in this repo has a demonstrated edge.
+
+### Zerodha modules
+
+#### kite_instruments.py
+Public, unauthenticated. Contract universe only, never prices. Filter cash
+equities on **segment**, not exchange: indices carry `instrument_type` EQ
+and `exchange` NSE and differ by segment alone, so filtering on exchange
+returns 136 indices as tradeable equities.
+
+#### kite_client.py, kite_login.py
+Credentials are read from the environment. Never logged, never printed,
+never written into the repo, never placed in an exception message. The
+access token travels in the WebSocket query string because Kite accepts it
+nowhere else, so that URL must never reach a log. The session file is
+gitignored and chmod 600.
+
+Historical requests are chunked by an interval-aware span and paced under a
+lock at Kite's documented 3 per second; the pacer serialises request starts,
+not the waiting, so concurrent callers hide latency without exceeding the
+limit.
+
+#### kite_ticker.py
+The wire format is not self-describing: a packet's meaning comes from its
+byte length, and prices are integers whose divisor comes from the segment in
+the token's low byte. A misread yields plausible wrong prices with no error.
+Parsers are therefore pure functions over bytes, tested against hand-built
+frames including truncated tails, unknown lengths, heartbeats and a frame
+that overstates its own packet count.
 
 ## Error-handling policy (all modules)
 
