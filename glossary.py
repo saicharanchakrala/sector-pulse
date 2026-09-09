@@ -189,10 +189,11 @@ CONCEPTS = {
         "Every broker shows the same seven numbers, worked out from "
         "yesterday's high, low and close: a central pivot, three levels "
         "above it (R1-R3) and three below (S1-S3). The usual claim is that "
-        "price tends to stall or turn at them. We checked that on 79,000 "
-        "cases and could not show it - so we show them because they are "
-        "useful landmarks for orientation, and we do not place stops or "
-        "targets on them.",
+        "price tends to stall or turn at them. We checked on 79,000 cases "
+        "and could not show it - comparing within the same trading day, a "
+        "stop placed on a pivot was hit slightly MORE often, not less. So "
+        "we show them as landmarks for orientation, and we do not place "
+        "stops or targets on them.",
     "What 'volume vs normal' tells you":
         "Volume is how many shares changed hands. Comparing it to the same "
         "time of day in recent sessions tells you whether today is unusual. "

@@ -216,13 +216,13 @@ class PivotLadder:
     the open and cannot move during the day.
 
     FOR DISPLAY, NOT FOR PLACEMENT. Using these as stops was built and
-    then measured on 79,725 candidate stops across 249 dates: paired
-    within the same session, a stop sitting on a pivot was hit +0.445 pp
-    MORE often than one at the same distance elsewhere, CI [-1.30, +2.22],
-    sign test p 0.37. See levels._structural_levels for the full figures
-    and why an unpaired version of the test misleadingly read -2.19 pp.
-    So these levels are shown because they are worth seeing and cost
-    nothing, not because they predict where price turns.
+    then measured; `python -m pivot_measurement` reproduces it. Holding
+    the session fixed, Mantel-Haenszel over 8,687 sessions gives an odds
+    ratio of 1.100 (p 0.616) and above 1.0 means the pivot stop is hit
+    MORE often. See levels._structural_levels for the full account,
+    including why an unpaired reading of -2.19 pp was selection rather
+    than signal. These levels are shown because they are worth seeing and
+    cost nothing, not because price turns at them.
     """
 
     pivot: float
@@ -232,16 +232,6 @@ class PivotLadder:
     s1: float
     s2: float
     s3: float
-
-    @property
-    def supports(self) -> tuple:
-        """S1, S2, S3 - nearest first."""
-        return (self.s1, self.s2, self.s3)
-
-    @property
-    def resistances(self) -> tuple:
-        """R1, R2, R3 - nearest first."""
-        return (self.r1, self.r2, self.r3)
 
     def below(self, price: float) -> tuple:
         """Every level under `price`, nearest first.
@@ -276,11 +266,16 @@ def pivot_ladder(prev_high: float, prev_low: float,
     for value in (prev_high, prev_low, prev_close):
         if value is None or _finite(value) is None or value <= 0.0:
             return None
-    if prev_high < prev_low:
+    # The close must lie INSIDE the range. These guards were copied from
+    # central_pivot_range, which is order-insensitive because it takes a
+    # max and a min; a seven-rung ladder is not. With a close outside the
+    # range the rungs interleave - pivot_ladder(100, 90, 500) put S1 at
+    # 360 and R2 at 240 - which inverts the ordering this class promises.
+    if not (prev_low <= prev_close <= prev_high):
         return None
     span = prev_high - prev_low
     pivot = (prev_high + prev_low + prev_close) / 3.0
-    return PivotLadder(
+    ladder = PivotLadder(
         pivot=pivot,
         r1=2.0 * pivot - prev_low,
         r2=pivot + span,
@@ -289,6 +284,13 @@ def pivot_ladder(prev_high: float, prev_low: float,
         s2=pivot - span,
         s3=prev_low - 2.0 * (prev_high - pivot),
     )
+    # A range wide relative to its own price drives the lower rungs
+    # negative: pivot_ladder(100, 1, 1) gave S3 = -131, and the display
+    # would have shown it as a level with a -485% distance. The docstring
+    # already claimed this was refused; now it is.
+    if ladder.s3 <= 0.0:
+        return None
+    return ladder
 
 
 def true_range(bars: pd.DataFrame) -> "pd.Series | None":

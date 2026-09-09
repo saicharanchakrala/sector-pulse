@@ -55,11 +55,7 @@ class Readings:
     bars_left: int
     session_bar_count: int = 0        # bars traded today at the scan instant
     range_closed: bool = True         # has the session passed its opening range
-    # Built from the SAME previous session as the CPR, so the two can never
-    # describe different days. DISPLAY only: measured on 79,725 candidate
-    # stops and found not to improve stop survival, so it enters no gate,
-    # no score and not the stop either.
-    pivots: "indicators.PivotLadder | None" = None
+
 
 
 @dataclass(frozen=True)
@@ -123,7 +119,7 @@ def measure(symbol: str, ticker: str, intraday: pd.DataFrame,
         return None
 
     prev_close = turnover = None
-    cpr = pivots = None
+    cpr = None
     if daily is not None and not daily.empty:
         prior = daily.dropna(subset=["Close"])
         # Exclude today's partial daily bar: its high and low are incomplete,
@@ -156,8 +152,6 @@ def measure(symbol: str, ticker: str, intraday: pd.DataFrame,
                 prev_low = float(prior["Low"].iloc[-1])
                 cpr = indicators.central_pivot_range(prev_high, prev_low,
                                                      prev_close)
-                pivots = indicators.pivot_ladder(prev_high, prev_low,
-                                                 prev_close)
 
     vwap = indicators.vwap(today)
     day_change = indicators.percent_change(last, prev_close) if prev_close else None
@@ -178,7 +172,6 @@ def measure(symbol: str, ticker: str, intraday: pd.DataFrame,
         vwap_distance_pct=indicators.percent_change(last, vwap) if vwap else None,
         opening_range=indicators.opening_range(intraday),
         cpr=cpr,
-        pivots=pivots,
         atr_bar=indicators.atr(intraday),
         rvol=indicators.relative_volume(intraday),
         relative_strength=indicators.relative_strength(day_change,

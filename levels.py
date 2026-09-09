@@ -131,17 +131,36 @@ def _structural_levels(direction: str, opening_low: "float | None",
     session low was never tried, so the fallback could not fire.
 
     THE PIVOT LADDER IS DELIBERATELY ABSENT, and this is a measurement
-    rather than an oversight. Adding S1-S3/R1-R3 here was built, and then
-    tested on 79,725 candidate stops over 249 dates: paired within the
-    same session, a stop sitting on a pivot was hit +0.445 pp MORE often
-    than one at the same distance that was not, CI [-1.30, +2.22], sign
-    test p 0.37 on 145 discordant sessions. An unpaired version of the
-    same test read -2.19 pp and looked significant; that was selection,
-    because sessions with a pivot inside the usable window are not like
-    sessions without one. Since a pivot stop is always TIGHTER than the
-    volatility stop it would replace, shipping it would have raised the
-    stop-hit rate for a benefit that is not there. indicators.pivot_ladder
-    is kept for DISPLAY only.
+    rather than an oversight. Adding S1-S3/R1-R3 here was built and then
+    tested; run `python -m pivot_measurement` to reproduce every figure.
+
+    Conditioning on the session - which holds the date, the symbol and the
+    session's own path fixed - finds nothing. Mantel-Haenszel over 8,687
+    sessions gives a common odds ratio of 1.100, p 0.616, and above 1.0
+    means a pivot stop is hit MORE often. Paired session means agree:
+    +0.445 pp, CI [-1.299, +2.218].
+
+    An unpaired estimate over the same data read -2.19 pp and looked
+    convincing. It was selection: control stops, which are placed at
+    random and so cannot be influenced by a pivot at all, are hit 40.75%
+    in sessions that have a pivot in the usable window against 42.72% in
+    sessions that do not. That -1.97 pp gap is almost the whole apparent
+    effect - pivot-bearing sessions are simply quieter.
+
+    Two cautions for anyone re-running this. Pairing does NOT hold
+    distance constant by itself; over the full 0.15-2.0 sigma range the
+    same paired estimator returns +6.27 pp, a pure distance artefact. It
+    is the [0.30, 0.50] sigma WINDOW that makes it honest. And a
+    permutation test that shuffles the pivot label within distance buckets
+    only is invalid here - it treats 79,725 observations from 14,474
+    sessions as exchangeable, and returns p 0.02 for an estimate whose
+    date-blocked interval spans zero.
+
+    What is fairly excluded is a benefit larger than about 1.3 pp on a
+    ~40% hit rate. A smaller edge would not be detected. Since a pivot
+    stop is always TIGHTER than the volatility stop it would replace,
+    shipping it on that basis would raise the stop-hit rate for an effect
+    no test can find. indicators.pivot_ladder is kept for DISPLAY only.
     """
     if direction == LONG:
         pairs = ((opening_low, "opening-range low"), (day_low, "session low"))

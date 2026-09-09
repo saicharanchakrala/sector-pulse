@@ -1281,15 +1281,14 @@ def test_a_price_outside_the_ladder_has_nothing_on_one_side() -> None:
 
 def test_the_ladder_is_not_used_for_stop_placement() -> None:
     # A DECISION, recorded as a test. Placing stops on pivots was built
-    # and then measured on 79,725 candidate stops across 249 dates.
-    # Paired within the same session - holding distance, date, symbol and
-    # the session's own path fixed - a stop on a pivot was hit +0.445 pp
-    # MORE often than one at the same distance elsewhere, CI
-    # [-1.30, +2.22], sign test p 0.37 on 145 discordant sessions. An
-    # unpaired version read -2.19 pp and looked significant; that was
-    # selection. Since a pivot stop is always tighter than the volatility
-    # stop it replaces, shipping it would have raised the stop-hit rate
-    # for nothing. This test fails if anyone wires it back in.
+    # and then measured - `python -m pivot_measurement` reproduces it.
+    # Conditioning on the session, Mantel-Haenszel over 8,687 sessions
+    # gives an odds ratio of 1.100 (p 0.616), and above 1.0 means the
+    # pivot stop is hit MORE often. An unpaired reading of -2.19 pp was
+    # selection, not signal. Since a pivot stop is always tighter than
+    # the volatility stop it replaces, shipping it would have raised the
+    # stop-hit rate for an effect no test can find. This fails if anyone
+    # wires it back in.
     import inspect
 
     assert "pivots" not in inspect.signature(
@@ -1321,8 +1320,59 @@ def test_intraday_structure_is_still_preferred_over_volatility() -> None:
     assert trade.stop == pytest.approx(98.75)
 
 
-def test_the_ladder_reaches_readings_for_display() -> None:
-    # Display is the one thing it IS for, so it has to survive the trip
-    # into Readings rather than being computed and dropped.
-    fields = setups.Readings.__dataclass_fields__
-    assert "pivots" in fields
+def test_the_scan_does_not_compute_a_ladder_it_never_shows() -> None:
+    # It was on Readings for a while, built for every symbol on every scan
+    # and read by nothing - the display path builds its own from the daily
+    # store. Recomputing it 216 times a scan to throw it away is the kind
+    # of thing that survives only because no test objects.
+    assert "pivots" not in setups.Readings.__dataclass_fields__
+
+
+def test_the_displayed_ladder_excludes_todays_partial_bar() -> None:
+    # The UI calls these "yesterday's" levels. Today's daily bar is still
+    # forming, so a ladder built from it drifts through the session and
+    # the label is false - which it was, because the daily store does
+    # carry today's bar.
+    import instrument_report
+
+    index = pd.DatetimeIndex([
+        pd.Timestamp("2026-09-08 00:00", tz=IST),
+        pd.Timestamp(datetime.now(IST).date(), tz=IST),
+    ])
+    frame = pd.DataFrame(
+        {"High": [110.0, 500.0], "Low": [90.0, 400.0],
+         "Close": [100.0, 450.0]}, index=index)
+    ladder = instrument_report._previous_session_pivots(frame)
+    assert ladder is not None
+    # Built from 8 Sep (H110 L90 C100), so the pivot is 100 - not anything
+    # derived from today's 400-500 range.
+    assert ladder.pivot == pytest.approx(100.0)
+
+
+def test_no_complete_session_means_no_levels_rather_than_todays() -> None:
+    import instrument_report
+
+    index = pd.DatetimeIndex([pd.Timestamp(datetime.now(IST).date(), tz=IST)])
+    frame = pd.DataFrame({"High": [110.0], "Low": [90.0], "Close": [100.0]},
+                         index=index)
+    assert instrument_report._previous_session_pivots(frame) is None
+
+
+def test_a_ladder_whose_lower_rungs_go_negative_is_refused() -> None:
+    # A range wide relative to its own price drives S3 below zero:
+    # (100, 1, 1) gave S3 = -131, and the display would have shown it as a
+    # level at -485%. The docstring already claimed this was refused.
+    assert indicators.pivot_ladder(100.0, 1.0, 1.0) is None
+
+
+def test_a_close_outside_the_previous_range_is_refused() -> None:
+    # With no low <= close <= high check the rungs interleave:
+    # (100, 90, 500) put S1 at 360 and R2 at 240, so "supports" sat above
+    # "resistances" and the documented ordering was violated. The guards
+    # were copied from central_pivot_range, which is order-insensitive
+    # because it takes a max and a min; a seven-rung ladder is not.
+    assert indicators.pivot_ladder(100.0, 90.0, 500.0) is None
+    assert indicators.pivot_ladder(100.0, 90.0, 50.0) is None
+    # A close exactly on either bound is still valid.
+    assert indicators.pivot_ladder(100.0, 90.0, 100.0) is not None
+    assert indicators.pivot_ladder(100.0, 90.0, 90.0) is not None
