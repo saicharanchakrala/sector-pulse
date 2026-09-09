@@ -26,6 +26,18 @@ COLUMNS = {
             "(SHORT) than the market. Not a recommendation.",
     "Entry": "The price the calculations assume you get in at. It is the "
              "last traded price, not a guaranteed fill.",
+    "Entry price": "The price the calculations assume you get in at. It is "
+                   "the last traded price, not a guaranteed fill - a real "
+                   "order may fill a little away from it.",
+    "Stop loss at": "Sell here if it goes against you. Placed using how "
+                    "much this instrument typically moves, so ordinary "
+                    "wobble should not reach it. Not a prediction that it "
+                    "will hold - it is where you have decided to stop "
+                    "losing money.",
+    "Exit price": "Where the position would be closed in profit. Set at "
+                  "twice the distance to the stop, so one winner pays for "
+                  "two losers. It is arithmetic from recent volatility, "
+                  "not a price forecast.",
     "Stop": "The price at which the trade would be abandoned. Set from how "
             "much this stock typically moves, so it is far enough away not "
             "to be hit by ordinary wobble.",
@@ -108,6 +120,42 @@ COLUMNS = {
     "Blocked by": "The specific check that failed. This is the useful part "
                   "of a NO BUY.",
     "Detail": "The most relevant supporting number for this horizon.",
+    # --- the end-of-day sector tab ---
+    "Sector": "The market sector being scored.",
+    "ETF": "The fund used to price this sector. Blank means no tradable "
+           "fund is mapped to it.",
+    "Composite": "News sentiment and price momentum blended into one "
+                 "number. Higher means more attention and more strength at "
+                 "once. A description of today, not a forecast.",
+    "News score": "How positive or negative recent coverage of this sector "
+                  "reads, from -1 to +1. Zero means neutral or no news.",
+    "Articles": "How many news items fed this sector's score.",
+    "N": "How many news items about this sector arrived today.",
+    "News today": "How positive or negative today's coverage reads, from "
+                  "-1 to +1.",
+    "Buzz %": "This sector's share of all the news collected. High buzz "
+              "means the story is concentrated here.",
+    "5d %": "Price change over the last 5 trading days, in percent.",
+    "21d %": "Price change over the last 21 trading days - about a month.",
+    "63d %": "Price change over the last 63 trading days - about a "
+             "quarter.",
+    "Momentum": "Recent price strength across several windows, combined. "
+                "Past movement, not a forecast.",
+    "Day %": "Price change so far today, in percent.",
+    "Last hr %": "Price change over the last hour, in percent.",
+    "Rank": "Where this sector sits in today's ordering. Not validated as "
+            "predictive - read it as a description of current conditions.",
+    "Action": "What the end-of-day rule suggests for this sector. It is a "
+              "rule applied to today's numbers, not advice.",
+    "Illiquid": "True means this fund trades too thinly to enter or exit "
+                "reliably at the price shown.",
+    # --- the pivot levels expander ---
+    "Level": "A pivot level worked out from yesterday's high, low and "
+             "close. S1-S3 sit below, R1-R3 above. Landmarks, not signals - "
+             "we tested whether price turns at them and could not show it "
+             "does.",
+    "vs now": "How far this level sits from the current price, in percent. "
+              "Negative means the level is below where price is now.",
 }
 
 # --- concepts worth an expander ------------------------------------------
@@ -137,6 +185,14 @@ CONCEPTS = {
         "better. So the ordering carries no forecasting power. What does "
         "hold up is the arithmetic: what a trade costs, how far the stock "
         "is likely to move, and whether the second covers the first.",
+    "What the pivot levels are":
+        "Every broker shows the same seven numbers, worked out from "
+        "yesterday's high, low and close: a central pivot, three levels "
+        "above it (R1-R3) and three below (S1-S3). The usual claim is that "
+        "price tends to stall or turn at them. We checked that on 79,000 "
+        "cases and could not show it - so we show them because they are "
+        "useful landmarks for orientation, and we do not place stops or "
+        "targets on them.",
     "What 'volume vs normal' tells you":
         "Volume is how many shares changed hands. Comparing it to the same "
         "time of day in recent sessions tells you whether today is unusual. "

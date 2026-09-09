@@ -110,6 +110,43 @@ class Assessment:
         """Whether the plausible move covers the round trip at least 3x."""
         return self.cost_multiple >= 3.0
 
+    @property
+    def stop_distance_pct(self) -> float:
+        """Half the plausible move, in percent.
+
+        Half, so that an exit at the full plausible move gives 2:1 reward
+        to risk - the same convention the intraday sizer uses, and the one
+        the required-win-rate arithmetic assumes. Any other split would
+        make the two halves of this project disagree about what a trade
+        is.
+        """
+        move = self.expected_move
+        return move / 2.0 if move == move else float("nan")
+
+    @property
+    def stop_price(self) -> float:
+        """Where the stop would sit, in rupees, or NaN if unknowable.
+
+        Placed against `direction`, which describes whether the instrument
+        is currently stronger or weaker than the index. It is NOT a
+        prediction, so this is "the stop for that position" rather than
+        "the stop for the trade you should take".
+        """
+        gap = self.stop_distance_pct
+        if gap != gap or self.price <= 0:
+            return float("nan")
+        step = self.price * gap / 100.0
+        return self.price - step if self.direction == "LONG" else self.price + step
+
+    @property
+    def target_price(self) -> float:
+        """Where the exit would sit: the plausible move away from here."""
+        move = self.expected_move
+        if move != move or self.price <= 0:
+            return float("nan")
+        step = self.price * move / 100.0
+        return self.price + step if self.direction == "LONG" else self.price - step
+
 
 def _sessions_for(horizon: str) -> int:
     return int(HORIZONS[horizon]["sessions"])
@@ -429,6 +466,8 @@ def to_frame(assessments: list) -> pd.DataFrame:
         "Symbol": a.symbol,
         "View": a.direction,
         "Price": round(a.price, 2),
+        "Stop loss at": round(a.stop_price, 2),
+        "Exit price": round(a.target_price, 2),
         "Cost %": round(a.cost_pct, 3),
         "Plausible move %": round(a.expected_move, 2),
         "Move vs fees": f"{a.cost_multiple:.1f}x",

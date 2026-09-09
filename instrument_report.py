@@ -69,6 +69,9 @@ class Report:
     lot_size: int = 0
     note: str = ""
     verdicts: dict = field(default_factory=dict)
+    # Previous session's pivot levels, for DISPLAY. Measured and found not
+    # to improve stop placement, so it informs no verdict here.
+    pivots: object = None
 
     @property
     def buys(self) -> list:
@@ -101,23 +104,6 @@ def resolve(query: str) -> tuple:
     # Unknown to the snapshot, but the master may still list it - a cash
     # name outside the F&O universe is perfectly analysable.
     return (wanted, False, 0) if market_source.token_for(wanted) else ("", False, 0)
-
-
-def suggest(query: str, limit: int = 12) -> list:
-    """Symbols containing the query, for a search box."""
-    import instruments
-
-    text = (query or "").strip().upper()
-    snapshot = instruments.load_latest()
-    if snapshot is None:
-        return []
-    pool = sorted({i.symbol for i in snapshot.fo_underlyings}
-                  | {i.symbol for i in snapshot.equities})
-    if not text:
-        return pool[:limit]
-    starts = [s for s in pool if s.startswith(text)]
-    contains = [s for s in pool if text in s and s not in starts]
-    return (starts + contains)[:limit]
 
 
 def _daily_verdicts(symbol: str, frames: dict) -> dict:
@@ -202,12 +188,20 @@ def analyse(query: str, include_intraday: bool = True) -> Report:
                            "Run `python -m bar_store` after fetching, or "
                            "fetch this symbol's history first.")
     price = float(daily["Close"].dropna().iloc[-1])
+    pivots = None
+    usable = daily.dropna(subset=["Close"])
+    if {"High", "Low"} <= set(usable.columns) and len(usable):
+        import indicators
+        last = usable.iloc[-1]
+        pivots = indicators.pivot_ladder(float(last["High"]),
+                                         float(last["Low"]),
+                                         float(last["Close"]))
     verdicts = _daily_verdicts(symbol, frames)
     if include_intraday:
         verdicts = {"intraday": _intraday_verdict(symbol), **verdicts}
     return Report(symbol=symbol, found=True, price=price,
                   as_of=daily.index[-1].to_pydatetime(), in_fo=in_fo,
-                  lot_size=lot, verdicts=verdicts)
+                  lot_size=lot, verdicts=verdicts, pivots=pivots)
 
 
 def summary_frame(report: Report) -> pd.DataFrame:
@@ -218,18 +212,21 @@ def summary_frame(report: Report) -> pd.DataFrame:
     for name, verdict in report.verdicts.items():
         assessment = verdict.assessment
         setup = verdict.setup
+        stop = exit_at = None
         if assessment is not None:
             move = f"{assessment.expected_move:.2f}%"
             cost = f"{assessment.cost_pct:.3f}%"
             covers = f"{assessment.cost_multiple:.1f}x"
             view = assessment.direction
             extra = f"{assessment.relative:+.2f}pp vs index"
+            stop, exit_at = assessment.stop_price, assessment.target_price
         elif setup is not None and setup.levels is not None:
             move = f"{setup.levels.target_pct:.2f}%"
             cost = f"{setup.levels.breakeven_pct:.3f}%"
             covers = f"{setup.levels.cost_multiple:.1f}x"
             view = setup.direction
             extra = f"needs {setup.levels.required_win_rate * 100:.1f}% win rate"
+            stop, exit_at = setup.levels.stop, setup.levels.target
         else:
             move = cost = covers = view = "-"
             extra = ""
@@ -238,6 +235,10 @@ def summary_frame(report: Report) -> pd.DataFrame:
             "Held": f"{horizons.HORIZONS[name]['sessions']} session(s)",
             "Verdict": verdict.verdict,
             "View": view,
+            "Stop loss at": (None if stop is None or stop != stop
+                             else round(float(stop), 2)),
+            "Exit price": (None if exit_at is None or exit_at != exit_at
+                           else round(float(exit_at), 2)),
             "Plausible move": move,
             "Round trip": cost,
             "Move vs fees": covers,
