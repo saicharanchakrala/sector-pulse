@@ -49,23 +49,56 @@ def store_path(interval: str) -> Path:
     return STORE / f"bars_{interval}.parquet"
 
 
-def _source_files(interval: str) -> list:
-    """Per-symbol parquets for one interval, deepest span per symbol.
+def _span_end(span: str) -> str:
+    """The end date out of a cache filename's span, or "" if unparseable.
 
-    A symbol can have several spans cached from different runs. Only the
-    longest is folded in, because a short window adds nothing a long one
-    does not already carry and would only create duplicate rows to drop.
+    Spans look like "20260823_20260909.parquet". Returned as the raw
+    eight-digit string because YYYYMMDD sorts correctly as text, so no
+    date parsing - and no date-parsing failure mode - is needed.
     """
-    best: dict[str, tuple] = {}
+    stem = span.split(".")[0]
+    tail = stem.rsplit("_", 1)[-1]
+    return tail if len(tail) == 8 and tail.isdigit() else ""
+
+
+def _source_files(interval: str) -> list:
+    """Every per-symbol parquet for one interval, oldest write first.
+
+    A symbol can have several spans cached from different runs, and ALL of
+    them are folded in. Taking only the biggest file was wrong twice over:
+    file size is not span length, and neither is freshness. A name cached
+    over a year-long window in the spring and refreshed over a ten-day one
+    this morning has a larger stale file and a smaller current one, so the
+    fold kept the stale one and lost today. Measured on this cache: of the
+    460 five-minute symbols holding more than one span, 216 had their
+    latest bar in a file that was not the largest - so the store lost the
+    current session for 47% of the intraday universe.
+
+    Ordering puts the freshest data last, which is what makes
+    `keep="last"` in rebuild() resolve collisions in favour of the newer
+    figure. Overlap costs nothing: duplicate (symbol, stamp) rows are
+    dropped there.
+
+    The sort key is the span END PARSED FROM THE FILENAME first and mtime
+    only as a tie-break, because mtime is the weaker signal - a restore, a
+    copy or a sync rewrites it and would silently reorder the fold, while
+    the span in `kite__RELIANCE__day__20160101_20260909.parquet` is a fact
+    about the contents. A name whose span cannot be parsed falls back to
+    mtime alone.
+    """
+    found: list[tuple] = []
     for path in CACHE.glob(f"kite__*__{interval}__*.parquet"):
         parts = path.name.split("__")
         if len(parts) < 4:
             continue
-        symbol = parts[1].replace("_", " ")
-        size = path.stat().st_size
-        if symbol not in best or size > best[symbol][0]:
-            best[symbol] = (size, path)
-    return [(symbol, path) for symbol, (_, path) in sorted(best.items())]
+        try:
+            modified = path.stat().st_mtime
+        except OSError:                     # vanished between glob and stat
+            continue
+        found.append((parts[1].replace("_", " "), _span_end(parts[3]),
+                      modified, path))
+    found.sort(key=lambda row: (row[0], row[1], row[2]))
+    return [(symbol, path) for symbol, _, _, path in found]
 
 
 def rebuild(interval: str = "day", verbose: bool = True) -> int:
@@ -108,7 +141,14 @@ def rebuild(interval: str = "day", verbose: bool = True) -> int:
     if not chunks:
         return 0
     joined = pd.concat(chunks, ignore_index=True)
-    joined = joined.sort_values(["symbol", "stamp"])
+    # Stability is what makes `keep="last"` below resolve a duplicate
+    # (symbol, stamp) in favour of the file folded latest - the freshest
+    # write. A multi-column sort_values IGNORES `kind` and routes through
+    # lexsort, which is already stable, so this argument is belt and
+    # braces rather than the load-bearing part. It is spelled out so a
+    # later move to a single-column sort cannot quietly lose the
+    # guarantee.
+    joined = joined.sort_values(["symbol", "stamp"], kind="stable")
     joined = joined.drop_duplicates(subset=["symbol", "stamp"], keep="last")
     joined["symbol"] = joined["symbol"].astype("category")
     target = store_path(interval)
@@ -143,7 +183,11 @@ def load(interval: str = "day", symbols: "list | None" = None,
     if start is not None:
         filters.append(("stamp", ">=", _as_ist(start)))
     if end is not None:
-        filters.append(("stamp", "<=", _as_ist(end) + pd.Timedelta(days=1)))
+        # STRICTLY before midnight of the following day, which is every bar
+        # on `end` and nothing after it. `<=` on that same instant admitted
+        # the next day's 00:00 daily bar: asked for end=2026-03-31 it
+        # returned 2026-04-01. In a backtest that is tomorrow's close.
+        filters.append(("stamp", "<", _as_ist(end) + pd.Timedelta(days=1)))
     try:
         frame = pd.read_parquet(path, filters=filters or None)
     except Exception as exc:
@@ -156,12 +200,30 @@ def load(interval: str = "day", symbols: "list | None" = None,
             logger.warning("Could not read %s: %s", path.name, inner)
             return {}
         if frame is not None and not frame.empty:
-            stamps = pd.DatetimeIndex(frame["stamp"])
-            if start is not None:
-                frame = frame[stamps >= _as_ist(start)]
+            try:
                 stamps = pd.DatetimeIndex(frame["stamp"])
-            if end is not None:
-                frame = frame[stamps <= _as_ist(end) + pd.Timedelta(days=1)]
+                # A file written before the stamps were localised holds
+                # naive values, and comparing those with an IST bound
+                # raises - out of the very retry that exists to survive a
+                # date failure. Aligned here instead.
+                if stamps.tz is None:
+                    stamps = stamps.tz_localize(IST)
+                else:
+                    stamps = stamps.tz_convert(IST)
+                if start is not None:
+                    keep = stamps >= _as_ist(start)
+                    frame, stamps = frame[keep], stamps[keep]
+                if end is not None:
+                    keep = stamps < _as_ist(end) + pd.Timedelta(days=1)
+                    frame = frame[keep]
+            except Exception as exc:
+                # Returning every row for the requested symbols would hand
+                # a backtest data from beyond its own cutoff, so this fails
+                # loudly rather than over-serving.
+                logger.warning("Could not apply date bounds to %s (%s); "
+                               "refusing to return unbounded rows",
+                               path.name, exc)
+                return {}
     if frame is None or frame.empty:
         return {}
     out = {}
