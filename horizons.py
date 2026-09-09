@@ -65,6 +65,15 @@ HONESTY = (
 
 # The same finding for anyone who wants the figures rather than the plain
 # summary. Kept beside it so the two can never drift apart.
+#
+# WHAT THESE FIGURES MEASURE, precisely, because it is easy to over-read
+# them. They come from the gradient-boosted pipeline in forecast_horizons,
+# which selects by calibrated probability. That is NOT the composite that
+# orders the tables here: rank() is a hand-weighted heuristic, it has
+# never been measured on its own, and neither module imports the other. So
+# these numbers establish that a model free to find any pattern it liked
+# found none. They do not certify the ordering on screen, which is if
+# anything the weaker of the two.
 HONESTY_DETAIL = (
     "Out-of-sample results on a survivorship-corrected universe of 2,254 "
     "companies. Short: -0.21% excess over the index, selection spread "
@@ -117,10 +126,56 @@ def _lookback_for(horizon: str) -> int:
 
 
 def _annualised_volatility(closes: np.ndarray) -> float:
-    if closes.size < 10:
+    """Annualised daily volatility, in percent, or NaN if unmeasurable.
+
+    Non-positive closes are DROPPED rather than clamped. Clamping the
+    divisor to 1e-9 turned one bad price into a return of about 1e11, and
+    since every rank here is cross-sectional that single value took the top
+    of the volatility column for the whole run.
+    """
+    usable = closes[np.isfinite(closes) & (closes > 0)]
+    if usable.size < 10:
         return float("nan")
-    returns = np.diff(closes) / np.maximum(closes[:-1], 1e-9)
+    returns = np.diff(usable) / usable[:-1]
+    returns = returns[np.isfinite(returns)]
+    if returns.size < 9:
+        return float("nan")
     return float(np.std(returns) * np.sqrt(252) * 100.0)
+
+
+def _benchmark_move(dates, benchmark, lookback: int) -> float:
+    """Benchmark return over the SAME DATES the stock's trend was measured.
+
+    Positional indexing compared different spans. `bench[-(lookback+1)]` is
+    the benchmark's 64th-from-last ROW, which is only the stock's window
+    start when the two series have identical trading calendars - and they
+    do not, whenever either has a suspension, a listing gap or a missing
+    bar. Reindexing onto the stock's dates and carrying the last known
+    close forward makes the two spans the same span.
+    """
+    if benchmark is None or "Close" not in benchmark.columns:
+        return float("nan")
+    closes = benchmark["Close"].dropna()
+    if closes.empty or len(dates) < lookback + 1:
+        return float("nan")
+    # The benchmark must actually REACH the end of the stock's window.
+    # ffill has no staleness limit, so an index frame that stops early
+    # would carry its last known close forward and be compared against
+    # the stock's current price - a fabricated excess return for every
+    # symbol at once. Checking the extent is what the positional version
+    # was doing, crudely, with `bench.size >= lookback + 1`.
+    try:
+        if closes.index.max() < dates[-1]:
+            return float("nan")
+        aligned = closes.reindex(dates, method="ffill")
+    except Exception:
+        return float("nan")
+    first, last = aligned.iloc[-(lookback + 1)], aligned.iloc[-1]
+    if not (first == first and last == last):
+        return float("nan")
+    if first <= 0 or last <= 0:
+        return float("nan")
+    return (float(last) / float(first) - 1.0) * 100.0
 
 
 def assess_daily(symbol: str, frame: pd.DataFrame, horizon: str,
@@ -132,7 +187,14 @@ def assess_daily(symbol: str, frame: pd.DataFrame, horizon: str,
     """
     if frame is None or "Close" not in frame.columns:
         return None
-    closes = frame["Close"].dropna().to_numpy(dtype=float)
+    series = frame["Close"].dropna()
+    # Non-positive and non-finite closes are removed ONCE, here, so every
+    # reading below is computed on the same trustworthy prices. Cleaning
+    # inside the volatility helper alone left position_in_range and
+    # drawdown - both of them scored - reading the raw array, where a
+    # single zero sets `low` and therefore the whole range position.
+    series = series[np.isfinite(series) & (series > 0)]
+    closes = series.to_numpy(dtype=float)
     lookback = _lookback_for(horizon)
     if closes.size < lookback + 5:
         return None
@@ -140,19 +202,24 @@ def assess_daily(symbol: str, frame: pd.DataFrame, horizon: str,
     if price <= 0:
         return None
     window = closes[-(lookback + 1):]
-    trend = (price / window[0] - 1.0) * 100.0
+    # The FIRST close of the window is a divisor, and only the last was
+    # being checked. A zero start gives an infinite trend and a negative
+    # one flips its sign, and either then leads the cross-sectional rank.
+    base = float(window[0])
+    if not (base > 0) or not np.isfinite(base):
+        return None
+    trend = (price / base - 1.0) * 100.0
+    if not np.isfinite(trend):
+        return None
     volatility = _annualised_volatility(closes[-max(lookback, 60):])
     trailing = closes[-lookback:]
     high, low = float(trailing.max()), float(trailing.min())
     span = max(high - low, 1e-9)
 
     relative = trend
-    if benchmark is not None and "Close" in benchmark.columns:
-        bench = benchmark["Close"].dropna().to_numpy(dtype=float)
-        if bench.size >= lookback + 1:
-            bench_move = (float(bench[-1]) / float(bench[-(lookback + 1)])
-                          - 1.0) * 100.0
-            relative = trend - bench_move
+    bench_move = _benchmark_move(series.index, benchmark, lookback)
+    if bench_move == bench_move:
+        relative = trend - bench_move
 
     sessions = _sessions_for(horizon)
     # Volatility scaled to the horizon by root time, which is the same
@@ -267,13 +334,36 @@ def rank(assessments: list, top: int = 20) -> list:
     usable = [a for a in assessments if a is not None]
     if not usable:
         return []
+    # No `multiple` column. cost_multiple is expected_move / cost_pct, and
+    # cost_pct is a constant per horizon, so it is volatility times a
+    # constant - measured at a ratio of exactly 2.173913 across 372 names,
+    # spearman(multiple, -volatility) = -1.000000 (the ratio is 0.866108
+    # at short and 4.347826 at long - constant at every horizon). Scoring
+    # both put 0.10 + 0.20 x rank(multiple) into the total: a POSITIVE
+    # loading on volatility, so the penalty this weight exists to apply
+    # was inverted. Controlling for the other two columns, the old
+    # composite's marginal correlation with volatility was +1.0.
+    #
+    # Two things this does NOT achieve, stated so they are not over-read.
+    # The TOTAL correlation with volatility stays positive at short and
+    # mid (+0.05 and +0.16, down from +0.49 and +0.55), because relative
+    # strength and range position both co-vary with volatility; only the
+    # marginal loading is corrected. And cost coverage now reaches the
+    # ordering solely through the `pays_for_itself` partition below, which
+    # 2,469 of 2,470 names clear - so the ranking carries almost no cost
+    # content. That is still the right trade, since the alternative was a
+    # column that inverted the penalty, but it means the measured part of
+    # this module is the cost COLUMNS in the table, not the order.
     frame = pd.DataFrame([{
-        "i": i, "relative": a.relative, "multiple": a.cost_multiple,
+        "i": i, "relative": a.relative,
         "position": a.position_in_range,
         "volatility": -(a.volatility if a.volatility == a.volatility else 0.0),
     } for i, a in enumerate(usable)])
-    for column, weight in (("relative", 0.45), ("multiple", 0.30),
-                           ("position", 0.15), ("volatility", 0.10)):
+    # The old proportions, renormalised over the three survivors. Not
+    # re-chosen: nothing in this module has shown predictive skill, so new
+    # numbers would imply a basis for preferring them that does not exist.
+    for column, weight in (("relative", 0.643), ("position", 0.214),
+                           ("volatility", 0.143)):
         ranks = frame[column].rank(pct=True).fillna(0.0)
         frame[f"w_{column}"] = ranks * weight
     frame["score"] = frame[[c for c in frame.columns
