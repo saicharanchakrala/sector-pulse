@@ -1297,16 +1297,29 @@ def test_the_ladder_is_not_used_for_stop_placement() -> None:
         levels_mod._structural_levels).parameters
 
 
-def test_a_pivot_in_the_window_does_not_move_the_stop() -> None:
-    # The pivot here lands 1.2 below the entry, inside the structural
-    # window, so it WOULD have been chosen. It must not be.
+def test_a_qualifying_pivot_is_still_not_used_as_the_stop() -> None:
+    # This test has to prove the level would REALLY have qualified,
+    # otherwise "the stop is the volatility one" is true for the boring
+    # reason that no level was in range. So the window is computed the way
+    # build_levels computes it and the pivot's gap is checked to fall
+    # inside it. What the test then shows is that a level which passes
+    # every structural criterion is nonetheless not used - because the
+    # measurement said it should not be, and because build_levels has no
+    # parameter through which it could see the ladder at all.
+    entry, atr, bars = 100.0, 0.6, 20
     lad = indicators.pivot_ladder(101.0, 97.0, 98.4)      # pivot at 98.80
-    assert lad is not None and abs(lad.pivot - 98.80) < 1e-9
-    trade = levels_mod.build_levels("LONG", entry=100.0, atr_per_bar=0.6,
-                                    bars_left=20)
+    assert lad is not None and lad.pivot == pytest.approx(98.80)
+    sigma = levels_mod.expected_remaining_range(atr, bars)
+    base = sigma * config.SCAN_STOP_FRACTION
+    gap = entry - lad.pivot
+    # The level really is inside the acceptance window.
+    assert (1.0 - config.SCAN_STRUCTURE_BAND) * base <= gap <= base, (
+        gap, base)
+    trade = levels_mod.build_levels("LONG", entry=entry, atr_per_bar=atr,
+                                    bars_left=bars)
     assert trade is not None
     assert trade.stop_source == "volatility"
-    assert trade.stop != pytest.approx(98.80)
+    assert trade.stop != pytest.approx(lad.pivot)
 
 
 def test_intraday_structure_is_still_preferred_over_volatility() -> None:
