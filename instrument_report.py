@@ -106,6 +106,36 @@ def resolve(query: str) -> tuple:
     return (wanted, False, 0) if market_source.token_for(wanted) else ("", False, 0)
 
 
+def _previous_session_pivots(daily: pd.DataFrame):
+    """The pivot ladder from the last COMPLETE session, or None.
+
+    Anchored on the clock, the same way setups.measure anchors its CPR and
+    for the same reason: today's daily bar is still forming, so its high
+    and low are incomplete and a level built from them moves during the
+    session. The UI labels these "yesterday's", which was simply untrue
+    while the store carried today's bar.
+    """
+    if daily is None or not {"High", "Low", "Close"} <= set(daily.columns):
+        return None
+    usable = daily.dropna(subset=["High", "Low", "Close"])
+    if usable.empty:
+        return None
+    try:
+        today = datetime.now(IST).date()
+        prior = usable.loc[[ts for ts in usable.index if ts.date() < today]]
+    except AttributeError:
+        # An index without dates cannot be filtered, and serving an
+        # unfiltered one would silently show today's drifting levels.
+        logger.warning("Daily index is not timestamped; no pivot levels")
+        return None
+    if prior.empty:
+        return None
+    import indicators
+    last = prior.iloc[-1]
+    return indicators.pivot_ladder(float(last["High"]), float(last["Low"]),
+                                   float(last["Close"]))
+
+
 def _daily_verdicts(symbol: str, frames: dict) -> dict:
     """Short, mid and long verdicts from the consolidated daily store."""
     frame = frames.get(symbol)
@@ -188,14 +218,7 @@ def analyse(query: str, include_intraday: bool = True) -> Report:
                            "Run `python -m bar_store` after fetching, or "
                            "fetch this symbol's history first.")
     price = float(daily["Close"].dropna().iloc[-1])
-    pivots = None
-    usable = daily.dropna(subset=["Close"])
-    if {"High", "Low"} <= set(usable.columns) and len(usable):
-        import indicators
-        last = usable.iloc[-1]
-        pivots = indicators.pivot_ladder(float(last["High"]),
-                                         float(last["Low"]),
-                                         float(last["Close"]))
+    pivots = _previous_session_pivots(daily)
     verdicts = _daily_verdicts(symbol, frames)
     if include_intraday:
         verdicts = {"intraday": _intraday_verdict(symbol), **verdicts}

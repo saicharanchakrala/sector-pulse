@@ -728,17 +728,22 @@ def render_scan_refresh_controls(replaying: bool,
              "track the live bars instead of freezing at whenever you last "
              "pressed Run. Off by default because each refresh re-scores "
              "every symbol in scope - it is a real scan, not a repaint.")
-    if not enabled:
-        return None
-    requested = st.select_slider(
-        "Refresh every", options=list(config.SCAN_AUTO_REFRESH_CHOICES),
-        value=st.session_state.get("scan_auto_every",
-                                   config.SCAN_AUTO_REFRESH_SECONDS),
-        format_func=lambda s: f"{s}s" if s < 60 else f"{s // 60} min",
-        key="scan_auto_every")
+    requested = config.SCAN_AUTO_REFRESH_SECONDS
+    if enabled:
+        requested = st.select_slider(
+            "Refresh every",
+            options=list(config.SCAN_AUTO_REFRESH_CHOICES),
+            value=st.session_state.get("scan_auto_every",
+                                       config.SCAN_AUTO_REFRESH_SECONDS),
+            format_func=lambda s: f"{s}s" if s < 60 else f"{s // 60} min",
+            key="scan_auto_every")
     feed = live_feed_state()
+    # `enabled` is PASSED rather than short-circuited here, so the rule
+    # lives in exactly one place and production exercises the same branch
+    # the tests do. Returning early instead left the function's own
+    # `enabled` check dead outside the test suite.
     interval, note = scan_data.auto_refresh_interval(
-        enabled=True, requested=int(requested), replaying=replaying,
+        enabled=bool(enabled), requested=int(requested), replaying=replaying,
         want_options=want_options,
         in_trading_hours=live_bars_in_hours(),
         feed_running=bool(feed.get("running")),
@@ -774,6 +779,14 @@ def refresh_scan_fragment() -> None:
     if params is None:
         st.info("Run a scan first; the timer refreshes an existing one.")
         return
+    # A fragment body also runs INLINE on the script run that declares it,
+    # so without this the first "refresh" fired the instant the box was
+    # ticked - which on a 20-second scan reads as the page hanging. The
+    # already-rendered results stand until the first real tick.
+    if not st.session_state.get("scan_auto_armed"):
+        st.session_state["scan_auto_armed"] = True
+        render_scan_results(*st.session_state["scan"], with_terms=False)
+        return
     started = time.monotonic()
     with st.spinner("refreshing from the live feed..."):
         ranked, bars, benchmark, now, past = run_scan(
@@ -784,7 +797,16 @@ def refresh_scan_fragment() -> None:
     st.caption(f"Auto-refreshed at {now:%H:%M:%S} IST in "
                f"{st.session_state['scan_seconds']:.0f}s.")
     render_scan_results(ranked, bars, benchmark, now,
-                        params["want_options"], past)
+                        params["want_options"], past, with_terms=False)
+    # F6: the interval is fixed when the fragment is wrapped, and a
+    # fragment rerun does not re-execute the controls - so a scan that has
+    # slowed down cannot raise its own floor. A full rerun re-evaluates
+    # the rule with the duration just measured.
+    taken = st.session_state["scan_seconds"]
+    if taken * 2 > float(st.session_state.get("scan_auto_every",
+                                              config.SCAN_AUTO_REFRESH_SECONDS)):
+        st.session_state.pop("scan_auto_armed", None)
+        st.rerun()
 
 
 def render_scan_controls() -> tuple[float, float, str, bool, "datetime | None", bool]:
@@ -963,7 +985,8 @@ def render_scan_option_picks(actionable: list[setups.Setup]) -> None:
 
 def render_scan_results(ranked: list[setups.Setup], bars: scan_data.BarSet,
                         benchmark, now: datetime, want_options: bool,
-                        replaying: bool = False) -> None:
+                        replaying: bool = False,
+                        with_terms: bool = True) -> None:
     """Render one scan's headline counts, table, gate detail and options."""
     actionable = [s for s in ranked if s.actionable]
     directional = [s for s in ranked
@@ -1275,10 +1298,9 @@ def render_pivot_levels(levels: "dict | None", price: float) -> None:
 
     Shown because they are on every broker's screen and cost nothing to
     display. NOT used for anything: placing stops on them was built and
-    measured on 79,725 candidate stops across 249 dates, and paired within
-    the same session a pivot stop was hit +0.445 pp MORE often than one at
-    the same distance elsewhere (sign test p 0.37). So they are levels to
-    look at, not levels to trade against.
+    measured, and conditioning on the session the pivot stop is hit if
+    anything MORE often (odds ratio 1.100, p 0.616 over 8,687 sessions).
+    See pivot_measurement. Levels to look at, not to trade against.
     """
     if not levels:
         return
@@ -1299,6 +1321,7 @@ def render_pivot_levels(levels: "dict | None", price: float) -> None:
         # tooltips from one helper, and bypassing it is how a column ends
         # up explained in one place and bare in another.
         show_table(frame)
+        show_terms("What the pivot levels are")
 
 
 def render_derivative_panel(symbol: str, kind: str, underlying: str,
@@ -1345,6 +1368,11 @@ def render_derivative_panel(symbol: str, kind: str, underlying: str,
                                 key=f"jump_{symbol}"):
         st.session_state["lookup_last"] = underlying
         st.session_state["lookup_symbol"] = underlying
+        # The picker has to be cleared as well. This contract's own label
+        # is still among the matches for its underlying, so leaving the
+        # selection in place made Streamlit restore it and render this
+        # same panel again - the escape hatch never escaped.
+        st.session_state.pop("lookup_pick", None)
         st.rerun()
     if kind == instrument_search.KIND_OPTION:
         render_option_cost_arithmetic(lot_size)
@@ -1390,6 +1418,11 @@ def render_option_cost_arithmetic(lot_size: int) -> None:
             )
 
 
+# The first entry in the match picker. A sentinel rather than a default
+# selection, so that typing does not analyse whatever ranks first.
+PICK_PROMPT = "- pick an instrument -"
+
+
 def render_instrument_search() -> None:
     """Search one instrument and show its verdict at every horizon."""
     st.subheader("Look up one instrument")
@@ -1416,26 +1449,46 @@ def render_instrument_search() -> None:
     right.markdown("&nbsp;")
     pressed = right.button("Analyse", key="lookup_go")
     text = (typed or "").strip()
-    query = ""
+    query, picked = "", None
     if text:
         with st.spinner("searching..."):
             matches = search_instruments(text.upper(), 25)
         if not matches:
-            st.caption(f"nothing matched {text.upper()!r} - check the "
-                       f"spelling, or type more of the symbol")
-            return
-        # One exact hit needs no picker; anything else does, and the picker
-        # is the typeahead. Labels carry expiry, strike and lot size,
-        # because a bare list of near-identical symbols cannot be chosen
-        # between.
-        labels = [row[1] for row in matches]
-        chosen_label = st.selectbox(
-            f"{len(matches)} match(es)", labels, key="lookup_pick",
-            help="Ordered stock first, then futures by expiry, then option "
-                 "strikes - the underlying is usually what you want.")
-        picked = matches[labels.index(chosen_label)]
-        # Choosing from the picker IS the commit, so the Analyse button is
-        # only needed to re-run the same choice.
+            # NOT a dead end. The horizon assessment reads the daily store
+            # and needs no instrument master at all, so a symbol the
+            # typeahead cannot offer is still analysable. Returning here
+            # meant one failed download of Kite's CSV made every symbol
+            # un-analysable while the UI blamed the user's spelling.
+            if instrument_search.catalogue():
+                st.caption(
+                    f"No instrument matches {text.upper()!r}. Press Analyse "
+                    f"to try it against the daily store anyway.")
+            else:
+                st.warning(
+                    "The instrument list could not be downloaded, so the "
+                    "typeahead is empty. Analysis still works - it reads "
+                    "the daily store, not the instrument list - so type the "
+                    "exact symbol and press Analyse."
+                )
+            if pressed:
+                query = text.upper()
+        elif len(matches) == 1:
+            # An unambiguous hit needs no picker.
+            picked = matches[0]
+        else:
+            # A sentinel first, so that TYPING does not analyse whatever
+            # happens to rank first. Without it, "R" silently analysed the
+            # top match on every keystroke and clearing the box brought it
+            # back through lookup_last.
+            labels = [PICK_PROMPT] + [row[1] for row in matches]
+            chosen = st.selectbox(
+                f"{len(matches)} match(es)", labels, key="lookup_pick",
+                help="Ordered stock first, then futures by expiry, then "
+                     "option strikes - the underlying is usually what you "
+                     "want.")
+            if chosen != PICK_PROMPT:
+                picked = matches[labels.index(chosen) - 1]
+    if picked is not None:
         st.session_state["lookup_last"] = picked[0]
         query = picked[0]
         if picked[2] in (instrument_search.KIND_FUTURE,
@@ -1558,6 +1611,7 @@ def render_scan_tab() -> None:
             # decoration time.
             st.fragment(refresh_scan_fragment, run_every=every)()
         else:
+            st.session_state.pop("scan_auto_armed", None)
             render_scan_results(*stored)
 
     st.divider()
