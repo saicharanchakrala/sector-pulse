@@ -1,9 +1,16 @@
-"""Intraday ETF snapshots via two batched yfinance downloads.
+"""Intraday ETF snapshots from Kite: one daily fetch and one intraday fetch.
 
-One daily download (period=2mo) provides previous session closes and
-20-session average volumes; one intraday download (period=1d, interval=5m)
-provides today's price action. Like market_data, this module degrades
-gracefully: bad tickers are omitted and nothing here ever raises.
+The daily bars provide previous-session closes and 20-session average
+volumes; the intraday bars provide today's price action. Like market_data,
+this module degrades gracefully - a symbol that fails is omitted and nothing
+here raises, including the absence of a Kite session, because the caller
+treats an empty result as "market closed today" and that is a survivable
+reading.
+
+Prices are now live rather than roughly fifteen minutes late, which matters
+here more than anywhere else in the project: this module exists to confirm
+that today's price action backs up what the news is claiming, and a stale
+quote confirms nothing.
 """
 from __future__ import annotations
 
@@ -13,7 +20,8 @@ from dataclasses import dataclass
 from datetime import datetime
 
 import pandas as pd
-import yfinance as yf
+
+import market_source
 
 logger = logging.getLogger(__name__)
 
@@ -26,47 +34,42 @@ class IntradaySnapshot:
 
     ticker: str
     last_price: float
-    asof: datetime                  # tz-aware, exchange tz as returned by yfinance
+    asof: datetime                  # tz-aware, IST as returned by Kite
     day_change_pct: float           # last vs previous session close
     last_hour_change_pct: float     # last vs ~12 5-minute bars earlier
     range_position: float           # (last - day_low) / (day_high - day_low), 0..1
     avg_volume_20d: float           # 20-session mean daily volume
 
 
-def field_series(data: pd.DataFrame, field: str, ticker: str,
-                 requested_tickers: list[str]) -> "pd.Series | None":
-    """Return one ticker's column for a field, handling MultiIndex vs flat frames.
-
-    Public because the intraday scanner needs the same MultiIndex-versus-flat
-    defence over High, Low and Volume. Duplicating it once produced a scanner
-    that silently saw no volume on batched downloads.
-    """
-    columns = data.columns
-    series = None
-    if isinstance(columns, pd.MultiIndex):
-        for key in ((field, ticker), (ticker, field)):
-            if key in columns:
-                series = data[key]
-                break
-    elif field in columns:
-        if len(requested_tickers) == 1 and requested_tickers[0] == ticker:
-            series = data[field]
-    if series is None or not isinstance(series, pd.Series):
-        return None
-    return series.dropna()
-
-
-def _download(tickers: list[str], **kwargs: object) -> "pd.DataFrame | None":
-    """Batched yf.download that returns None instead of raising or going empty."""
+def _fetch_daily(tickers: list[str]) -> dict[str, pd.DataFrame]:
+    """Daily bars per symbol, or {} rather than raising."""
     try:
-        data = yf.download(tickers, auto_adjust=True, progress=False, **kwargs)
-    except Exception as exc:  # yfinance raises heterogeneous network/parse errors
-        logger.warning("yfinance download failed (%s): %s", kwargs, exc)
-        return None
-    if data is None or data.empty:
-        logger.warning("yfinance returned no data (%s)", kwargs)
-        return None
-    return data
+        return market_source.daily_bars(tickers, months=2)
+    except market_source.NoSession as exc:
+        logger.warning("%s", exc)
+        return {}
+    except Exception as exc:  # network and parse failures are heterogeneous
+        logger.warning("Daily fetch failed for %d symbol(s): %s",
+                       len(tickers), exc)
+        return {}
+
+
+def _fetch_intraday(tickers: list[str]) -> dict[str, pd.DataFrame]:
+    """Recent 5-minute bars per symbol, or {} rather than raising.
+
+    Five calendar days rather than one, so a Monday scan still has Friday's
+    session behind it and a holiday does not empty the frame.
+    """
+    try:
+        return market_source.intraday_bars(tickers, days=5,
+                                           interval="5minute")
+    except market_source.NoSession as exc:
+        logger.warning("%s", exc)
+        return {}
+    except Exception as exc:
+        logger.warning("Intraday fetch failed for %d symbol(s): %s",
+                       len(tickers), exc)
+        return {}
 
 
 def _previous_close(closes: pd.Series, today) -> "float | None":
@@ -92,25 +95,31 @@ def _avg_volume_20d(volumes: "pd.Series | None") -> float:
     return 0.0 if math.isnan(mean) else mean
 
 
-def _today_frame(intraday: pd.DataFrame, ticker: str,
-                 tickers: list[str]) -> "pd.DataFrame | None":
-    """Today's 5-minute Close/High/Low bars for one ticker, or None."""
-    closes = field_series(intraday, "Close", ticker, tickers)
-    if closes is None or closes.empty:
+def _today_frame(frame: "pd.DataFrame | None") -> "pd.DataFrame | None":
+    """The latest session's 5-minute Close/High/Low bars, or None.
+
+    Takes one symbol's flat frame now that Kite returns per-symbol frames,
+    so the MultiIndex-versus-flat defence the yfinance route needed does not
+    apply on this path.
+    """
+    if frame is None or frame.empty or "Close" not in frame.columns:
         return None
-    tz = getattr(closes.index, "tz", None)
-    today = datetime.now(tz).date() if tz is not None else datetime.now().date()
-    mask = [ts.date() == today for ts in closes.index]
-    if not any(mask):
+    closes = frame["Close"].dropna()
+    if closes.empty:
         return None
-    highs = field_series(intraday, "High", ticker, tickers)
-    lows = field_series(intraday, "Low", ticker, tickers)
-    frame = pd.DataFrame({"Close": closes})
-    if highs is not None:
-        frame["High"] = highs
-    if lows is not None:
-        frame["Low"] = lows
-    return frame.loc[[ts for ts, keep in zip(closes.index, mask) if keep]]
+    # The frame's OWN last session, not the wall clock. Asking for "today"
+    # returned nothing on a holiday or before the first print, which read as
+    # "market closed" when the real answer was "no bars yet".
+    try:
+        session_day = closes.index[-1].date()
+    except AttributeError:
+        return None
+    keep = [ts for ts in closes.index if ts.date() == session_day]
+    if not keep:
+        return None
+    wanted = [c for c in ("Close", "High", "Low", "Volume")
+              if c in frame.columns]
+    return frame.loc[keep, wanted]
 
 
 def _snapshot_for(ticker: str, today_bars: pd.DataFrame, prev_close: float,
@@ -143,27 +152,32 @@ def _snapshot_for(ticker: str, today_bars: pd.DataFrame, prev_close: float,
 
 
 def get_intraday_snapshots(tickers: list[str]) -> dict[str, IntradaySnapshot]:
-    """Build intraday snapshots per ticker; {} when the market has not traded today."""
+    """Build intraday snapshots per ticker; {} when nothing traded."""
     if not tickers:
         return {}
-    daily = _download(tickers, period="2mo", interval="1d")
-    intraday = _download(tickers, period="1d", interval="5m")
-    if intraday is None:
+    daily = _fetch_daily(tickers)
+    intraday = _fetch_intraday(tickers)
+    if not intraday:
         return {}
     snapshots: dict[str, IntradaySnapshot] = {}
     for ticker in tickers:
         try:
-            today_bars = _today_frame(intraday, ticker, tickers)
+            today_bars = _today_frame(intraday.get(ticker))
             if today_bars is None:
-                logger.warning("No intraday bars for %s today; skipping", ticker)
+                logger.warning("No intraday bars for %s; skipping", ticker)
                 continue
             prev_close = None
             avg_volume = 0.0
-            if daily is not None:
-                closes = field_series(daily, "Close", ticker, tickers)
-                today = today_bars.index[-1].date()
-                prev_close = _previous_close(closes, today) if closes is not None else None
-                avg_volume = _avg_volume_20d(field_series(daily, "Volume", ticker, tickers))
+            day_frame = daily.get(ticker)
+            if day_frame is not None and not day_frame.empty:
+                session_day = today_bars.index[-1].date()
+                closes = (day_frame["Close"].dropna()
+                          if "Close" in day_frame.columns else None)
+                prev_close = (_previous_close(closes, session_day)
+                              if closes is not None else None)
+                avg_volume = _avg_volume_20d(
+                    day_frame["Volume"].dropna()
+                    if "Volume" in day_frame.columns else None)
             if prev_close is None:
                 logger.warning("No previous close for %s; skipping", ticker)
                 continue

@@ -45,8 +45,8 @@ HORIZON_SWING = "SWING"
 
 CALL_KINDS = (KIND_EQUITY, KIND_OPTION, KIND_FUTURE)
 
-# Channel shorthand to NSE symbol. Seeded with names verified live against
-# yfinance; extend via the alias CSV rather than editing this.
+# Channel shorthand to NSE symbol. Extend via the alias CSV rather than
+# editing this. These are NSE tradingsymbols, which is what Kite takes.
 _ALIASES: dict[str, str] = {
     "CORDS CABLES": "CORDSCABLE",
     "CORDSCABLES": "CORDSCABLE",

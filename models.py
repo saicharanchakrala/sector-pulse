@@ -7,10 +7,10 @@ from datetime import datetime
 
 @dataclass
 class SectorDef:
-    """Static definition of a GICS sector tracked by the app."""
+    """Static definition of a market sector tracked by the app."""
 
     name: str
-    etf: str                      # SPDR sector ETF ticker
+    etf: str                      # sector index or ETF tradingsymbol
     keywords: list[str]           # lowercase phrases for news classification
 
 

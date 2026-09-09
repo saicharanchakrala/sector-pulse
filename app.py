@@ -60,7 +60,7 @@ def load_news(max_age_hours: int, profile_key: str) -> list[NewsItem]:
 
 @st.cache_data(ttl=config.CACHE_TTL_SECONDS)
 def load_momentum(profile_key: str) -> dict[str, SectorMomentum]:
-    """Fetch and cache sector index/ETF momentum from yfinance.
+    """Fetch and cache sector index/ETF momentum from Kite daily bars.
 
     Keyed on the profile key alone, but the result depends on the profile's
     trade_etfs. Editing a profile while the dashboard is running keeps
@@ -221,7 +221,7 @@ def render_sidebar() -> tuple[str, float, int]:
                 "into that market's sectors via keyword matching. A finance-tuned "
                 "VADER model scores headline sentiment, recency-weighted so fresh "
                 "news counts more. Each sector's index or ETF momentum is measured "
-                "over 5, 21 and 63 trading days via yfinance. The composite score "
+                "over 5, 21 and 63 trading days from Kite daily bars. The score "
                 "blends news sentiment and momentum using the weight slider above."
             )
         st.warning("Educational tool - not financial advice.")
@@ -869,11 +869,12 @@ def render_scan_tab() -> None:
         "threshold is shared between the two."
     )
     st.warning(
-        "Unbacktested. yfinance caps 5-minute history near 60 days, far too "
-        "little to establish whether this rule makes money, and its bars are "
-        "delayed rather than live - so treat every entry price as indicative, "
-        "not executable. The levels are arithmetic from today's range and "
-        "volatility, not a forecast."
+        "Measured, and it showed no directional edge. Across 56,825 signals "
+        "on 210 names over 248 sessions, this rule finished level with a coin "
+        "flip taken at the same instants: best excess 0.0015 R per trade "
+        "before costs, -0.034 R after them. Treat the output as a structured "
+        "way to read the tape, not as an expectation of profit. The levels "
+        "are arithmetic from today's range and volatility, not a forecast."
     )
     capital, risk_pct, scope, want_options, as_of, run = render_scan_controls()
     if run:
@@ -924,7 +925,9 @@ def render_positional_tab(profile_key: str, news_weight: float,
         st.info("News data unavailable - rankings reflect momentum only.")
 
     if not momentum:
-        st.info("Momentum data unavailable - rankings reflect news sentiment only.")
+        st.info("Momentum data unavailable - rankings reflect news sentiment "
+                "only. The usual cause is a missing or expired Kite session; "
+                "it expires around 6am, so run `python -m kite_login`.")
 
     scores = analyzer.analyze(items, momentum, news_weight=news_weight,
                               profile=profile)

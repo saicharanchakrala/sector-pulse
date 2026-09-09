@@ -635,14 +635,15 @@ def _to_universe(payload: dict) -> Universe:
     )
 
 
-def to_ticker(symbol: str, suffix: str = ".NS") -> str:
-    """Map a discovered NSE symbol to its yfinance ticker.
+def to_ticker(symbol: str) -> str:
+    """Map a discovered NSE symbol to the identifier the data source uses.
 
-    A rule, not a table: every listed equity is SYMBOL.NS. Indices are not
-    mapped at all, because they cannot be bought as equity and the scan
-    excludes them.
+    Kite takes bare tradingsymbols, so this is close to an identity. It
+    survives only to strip yfinance's leftovers - a `.NS` suffix or a `^`
+    index prefix - from any string written before the migration. New code
+    should pass the Kite symbol directly.
     """
-    cleaned = symbol.strip().upper()
-    if not cleaned or cleaned.startswith("^") or "." in cleaned:
-        return cleaned
-    return f"{cleaned}{suffix}"
+    # Local: market_source pulls in pandas and the Kite client, and
+    # instruments is imported by tooling that only wants the symbol lists.
+    import market_source
+    return market_source.canonical(symbol)

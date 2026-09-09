@@ -1,8 +1,9 @@
 """India (NSE) market profile: Nifty sectoral indices + Indian financial press.
 
-Every feed URL below was live-verified on 2026-06-12 and every index symbol
-was verified live on yfinance the same day; the tradeable ETFs were
-re-verified on 2026-09-08. Three global feeds are included because Indian
+Every feed URL below was live-verified on 2026-06-12. Symbols are Kite
+tradingsymbols: all thirteen index names and all eleven ETFs were resolved
+against Kite's public instrument master on 2026-09-09, when the last of the
+Yahoo spellings was retired. Three global feeds are included because Indian
 markets move on global cues.
 """
 from __future__ import annotations
@@ -87,7 +88,7 @@ _FEEDS: list[dict] = [
 _SECTORS: dict[str, SectorDef] = {
     "Banks": SectorDef(
         name="Banks",
-        etf="^NSEBANK",
+        etf="NIFTY BANK",
         keywords=[
             "hdfc bank", "icici", "icici bank", "kotak", "kotak mahindra",
             "axis bank", "indusind", "indusind bank", "yes bank", "idfc first",
@@ -104,7 +105,7 @@ _SECTORS: dict[str, SectorDef] = {
     ),
     "Financial Services": SectorDef(
         name="Financial Services",
-        etf="NIFTY_FIN_SERVICE.NS",
+        etf="NIFTY FIN SERVICE",
         keywords=[
             "bajaj finance", "bajaj finserv", "hdfc life", "sbi life", "icici lombard",
             "icici prudential", "lic", "life insurance corporation", "hdfc amc",
@@ -121,7 +122,7 @@ _SECTORS: dict[str, SectorDef] = {
     ),
     "IT": SectorDef(
         name="IT",
-        etf="^CNXIT",
+        etf="NIFTY IT",
         keywords=[
             "tcs", "tata consultancy", "infosys", "wipro", "hcl tech", "hcltech",
             "tech mahindra", "ltimindtree", "lti mindtree", "mphasis", "coforge",
@@ -138,7 +139,7 @@ _SECTORS: dict[str, SectorDef] = {
     ),
     "Pharma": SectorDef(
         name="Pharma",
-        etf="^CNXPHARMA",
+        etf="NIFTY PHARMA",
         keywords=[
             "sun pharma", "cipla", "dr reddy", "dr. reddy", "divis", "divi's",
             "lupin", "aurobindo", "aurobindo pharma", "zydus", "torrent pharma",
@@ -155,7 +156,7 @@ _SECTORS: dict[str, SectorDef] = {
     ),
     "Auto": SectorDef(
         name="Auto",
-        etf="^CNXAUTO",
+        etf="NIFTY AUTO",
         keywords=[
             "maruti", "maruti suzuki", "tata motors", "mahindra", "m&m",
             "mahindra & mahindra", "bajaj auto", "hero motocorp", "tvs",
@@ -174,7 +175,7 @@ _SECTORS: dict[str, SectorDef] = {
     ),
     "FMCG": SectorDef(
         name="FMCG",
-        etf="^CNXFMCG",
+        etf="NIFTY FMCG",
         keywords=[
             "hul", "hindustan unilever", "itc", "britannia", "nestle india",
             "dabur", "marico", "godrej consumer", "colgate-palmolive",
@@ -192,7 +193,7 @@ _SECTORS: dict[str, SectorDef] = {
     ),
     "Metal": SectorDef(
         name="Metal",
-        etf="^CNXMETAL",
+        etf="NIFTY METAL",
         keywords=[
             "tata steel", "jsw steel", "hindalco", "vedanta", "sail",
             "steel authority", "nmdc", "jindal", "jindal steel", "jspl",
@@ -209,7 +210,7 @@ _SECTORS: dict[str, SectorDef] = {
     ),
     "Energy": SectorDef(
         name="Energy",
-        etf="^CNXENERGY",
+        etf="NIFTY ENERGY",
         keywords=[
             "reliance", "reliance industries", "ril", "ongc", "oil india",
             "ioc", "indian oil", "bpcl", "hpcl", "gail", "petronet",
@@ -227,7 +228,7 @@ _SECTORS: dict[str, SectorDef] = {
     ),
     "Realty": SectorDef(
         name="Realty",
-        etf="^CNXREALTY",
+        etf="NIFTY REALTY",
         keywords=[
             "dlf", "godrej properties", "oberoi realty", "lodha", "macrotech",
             "prestige estates", "brigade", "brigade enterprises", "sobha",
@@ -245,7 +246,7 @@ _SECTORS: dict[str, SectorDef] = {
     ),
     "Infrastructure": SectorDef(
         name="Infrastructure",
-        etf="^CNXINFRA",
+        etf="NIFTY INFRA",
         keywords=[
             "l&t", "larsen", "larsen & toubro", "adani ports", "gmr",
             "gmr airports", "irb", "irb infra", "kalpataru", "kec international",
@@ -263,7 +264,7 @@ _SECTORS: dict[str, SectorDef] = {
     ),
     "PSU Banks": SectorDef(
         name="PSU Banks",
-        etf="^CNXPSUBANK",
+        etf="NIFTY PSU BANK",
         keywords=[
             "sbi", "state bank", "state bank of india", "pnb", "punjab national",
             "punjab national bank", "bank of baroda", "bob", "canara bank",
@@ -282,7 +283,7 @@ _SECTORS: dict[str, SectorDef] = {
     ),
     "Media": SectorDef(
         name="Media",
-        etf="^CNXMEDIA",
+        etf="NIFTY MEDIA",
         keywords=[
             "zee", "zee entertainment", "zeel", "sun tv", "pvr inox", "pvr",
             "nazara", "nazara technologies", "network18", "tv18", "tips music",
@@ -332,24 +333,25 @@ _PHRASES: dict[str, float] = {
     "open offer": 0.8,
 }
 
-# Tradeable NSE sector ETFs (verified live on yfinance with volume, 2026-09-08).
+# Tradeable NSE sector ETFs (verified with volume 2026-09-08, resolved
+# against Kite's instrument master 2026-09-09).
 # Media has no listed sector ETF and so gets no entry.
 #
 # These tickers are also the momentum source (see market_data), so each one
 # must be the fund actually bought - a sibling ETF tracking the same index
 # still has its own premium, tracking error and liquidity.
 _TRADE_ETFS: dict[str, str] = {
-    "Banks": "BANKBEES.NS",
-    "Financial Services": "BFSI.NS",
-    "IT": "ITETF.NS",
-    "Pharma": "PHARMABEES.NS",
-    "Auto": "AUTOBEES.NS",
-    "FMCG": "FMCGIETF.NS",
-    "Metal": "METALIETF.NS",
-    "Energy": "OILIETF.NS",
-    "Infrastructure": "INFRAIETF.NS",
-    "PSU Banks": "PSUBANK.NS",
-    "Realty": "MOREALTY.NS",
+    "Banks": "BANKBEES",
+    "Financial Services": "BFSI",
+    "IT": "ITETF",
+    "Pharma": "PHARMABEES",
+    "Auto": "AUTOBEES",
+    "FMCG": "FMCGIETF",
+    "Metal": "METALIETF",
+    "Energy": "OILIETF",
+    "Infrastructure": "INFRAIETF",
+    "PSU Banks": "PSUBANK",
+    "Realty": "MOREALTY",
 }
 
 IN_PROFILE = MarketProfile(

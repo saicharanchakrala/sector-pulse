@@ -47,7 +47,9 @@ def _parse_args() -> argparse.Namespace:
                         help="skip orders below this rupee value "
                              "(default: %(default)s)")
     parser.add_argument("--offline", action="store_true",
-                        help="use last prices from the CSV instead of yfinance")
+                        help="use last prices from the CSV instead of "
+                             "fetching live ones (also the way to run "
+                             "without a Kite session)")
     parser.add_argument("--force", action="store_true",
                         help="plan orders even when the cadence says HOLD")
     parser.add_argument("--record", action="store_true",
@@ -63,14 +65,26 @@ def _parse_args() -> argparse.Namespace:
 
 
 def fetch_prices(symbols: list[str]) -> dict[str, float]:
-    """Fetch live prices, degrading to an empty dict if yfinance is unusable."""
+    """Live last-traded prices, or {} when they cannot be fetched.
+
+    Returning {} rather than raising is safe here only because the caller
+    falls back to the CSV price for every symbol it did not get and then
+    says so in the report. A missing Kite session is the common case now -
+    it expires every morning - so it is handled as an expected outcome and
+    not an error.
+    """
     try:
         from quotes import fetch_last_prices
+        import market_source
     # A broken pandas or numpy install raises at import time, not just ImportError.
     except (ImportError, OSError, ValueError, RuntimeError) as exc:
         logger.warning("Price fetching unavailable: %s", exc)
         return {}
-    return fetch_last_prices(symbols)
+    try:
+        return fetch_last_prices(symbols)
+    except market_source.NoSession as exc:
+        logger.warning("%s", exc)
+        return {}
 
 
 def _describe_source(fetched: int, wanted: int, offline: bool) -> str:
@@ -78,10 +92,10 @@ def _describe_source(fetched: int, wanted: int, offline: bool) -> str:
     if offline:
         return "csv (offline)"
     if fetched == 0:
-        return "csv (yfinance unavailable)"
+        return "csv (no live prices - is there a Kite session?)"
     if fetched < wanted:
-        return f"yfinance {fetched}/{wanted}, {wanted - fetched} from csv"
-    return "yfinance"
+        return f"kite {fetched}/{wanted}, {wanted - fetched} from csv"
+    return "kite (live)"
 
 
 def _resolve_prices(held: list[Holding], targets: dict[str, float],

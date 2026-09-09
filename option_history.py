@@ -1,11 +1,15 @@
 """Persist option chains, because NSE keeps no history and nobody sells it.
 
-Equity bars can be replayed: yfinance still has 5-minute history, so a scan
-can be re-run honestly at any past minute of the last ten days. Option
-chains cannot. NSE's API serves one live snapshot and no archive, yfinance
-exposes no Indian option data at all, and there is no free source for a past
-premium. Every option figure in a replay is therefore a reconstruction from
-the underlying plus a delta estimate, not a measurement.
+Equity bars can be replayed: Kite serves minute candles going back years,
+so a scan can be re-run honestly at almost any past minute. Option chains
+cannot, and the move to Kite did not fix it. Kite will serve historical
+candles for an option contract that still exists, but an expired contract
+leaves the instrument master and takes its token with it - so the chain as
+it stood on a past date, which strikes were listed and which were liquid,
+is not reconstructible afterwards. NSE's own API serves one live snapshot
+and no archive. Every option figure in a replay is therefore a
+reconstruction from the underlying plus a delta estimate, not a
+measurement.
 
 The only fix is to start recording. This module writes a timestamped,
 gzipped snapshot of whichever chains were asked for, so from the first

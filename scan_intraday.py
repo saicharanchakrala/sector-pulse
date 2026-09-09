@@ -7,13 +7,15 @@ tradeable for the top names.
 
 Read this before using it:
 
-  * Nothing here is backtested. The gates and weights are conventional
-    technical-analysis choices, not measured edges. yfinance caps 5-minute
-    history near 60 days, which is far too little to establish whether this
-    rule makes money, so the scan reports what it measured and stops there.
-  * Bars are delayed, not live. Every level is computed from the last bar
-    yfinance served, which can be 15 minutes stale. Do not treat the entry
-    price as executable.
+  * This rule has now been measured, and it has no directional edge. On
+    56,825 Kite signals across 210 names and 248 sessions it performed the
+    same as a coin flip taken at the same instants - best excess 0.0015 R
+    per trade before costs, -0.034 R after them. The gates and weights are
+    conventional technical-analysis choices, and measuring them did not turn
+    them into an edge. The scan reports what it measured and stops there.
+  * Bars are live, but a bar is not a fill. Levels come from the last
+    completed Kite candle, so the entry price is the last print rather than
+    an executable quote, and slippage is not modelled beyond the cost stack.
   * It places no orders and never will.
 
 Educational decision support. Not financial advice.
@@ -85,9 +87,8 @@ def _parse_args(argv: "list[str] | None" = None) -> argparse.Namespace:
                         help="replay at a past instant: 'HH:MM' for today, or "
                              "'YYYY-MM-DD HH:MM' for an earlier session. Bars "
                              "after that instant are discarded, so the scan "
-                             "sees only what was knowable then. Limited to the "
-                             f"last {config.SCAN_MAX_REPLAY_DAYS} days, which "
-                             "is where yfinance stops serving 5-minute bars")
+                             "sees only what was knowable then. Limited to "
+                             f"the last {config.SCAN_MAX_REPLAY_DAYS} days")
     args = parser.parse_args(argv)
     if args.capital <= 0:
         parser.error(f"--capital must be positive, got {args.capital}")
@@ -103,10 +104,12 @@ def _parse_args(argv: "list[str] | None" = None) -> argparse.Namespace:
         age = (datetime.now(IST).date() - moment.date()).days
         if age > config.SCAN_MAX_REPLAY_DAYS:
             parser.error(
-                f"{moment.date()} is {age} days back. yfinance stops serving "
-                f"5-minute bars near 60 days, so replays are capped at "
-                f"{config.SCAN_MAX_REPLAY_DAYS} days. Nothing older can be "
-                f"replayed from free data at all.")
+                f"{moment.date()} is {age} days back, and replays are capped "
+                f"at {config.SCAN_MAX_REPLAY_DAYS} days. Kite serves the "
+                f"equity bars for far longer. The cap is there because the "
+                f"instrument universe is a single latest snapshot, so a "
+                f"replay scans a past session using today's F&O list, and "
+                f"the further back you go the more that list has drifted.")
         if moment > datetime.now(IST):
             parser.error(
                 f"{moment.strftime('%Y-%m-%d %H:%M')} is in the future. A "

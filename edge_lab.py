@@ -13,10 +13,19 @@ cheat:
         '''Return "LONG", "SHORT" or None for the bar at ctx.i.'''
 
 `ctx` exposes only what had printed by bar `i`. Arrays are pre-sliced;
-scalars like the previous close and the ATR come from prior sessions. There
-is no field on the context that contains a future price, so a rule cannot
-look ahead even by accident. The harness then measures what happened after
-the signal - which is the part the rule never sees.
+scalars like the previous close and the ATR come from prior sessions, and
+the opening range is derived from the sliced arrays rather than handed in,
+so it cannot exist before the bars that form it have printed. The harness
+then measures what happened after the signal - which is the part the rule
+never sees.
+
+One exception, and it is the caller's: `benchmark_change` is whatever dict
+the caller passes. kite_bars.benchmark_day_changes fills it with each
+session's FULL-day change, so a rule reading ctx.benchmark_change or
+ctx.relative_strength off that dict is reading the index's outcome for a
+day it is still trading. Treat those two as opt-in lookahead unless the
+caller supplies a point-in-time series; every other field is safe by
+construction.
 
 Three disciplines, all enforced here rather than left to each rule:
 
@@ -27,21 +36,23 @@ Three disciplines, all enforced here rather than left to each rule:
   unresolved positions are marked out at the close, not discarded, because a
     rule that leaves most trades open must be judged on what that pays.
 
-Sample-size honesty: 5-minute bars reach about 59 sessions. Signals within a
-session are correlated, so an edge measured here is provisional. Treat a
-result that survives only at one parameter setting as noise.
+Sample-size honesty: every path now loads from Kite, which reaches years -
+the 5-minute set in bar_cache spans 239 sessions across 210 names - so a
+result here is not short of rows. It is still short of independence:
+signals within a session are correlated, so treat a result that survives
+only at one parameter setting as noise.
 """
 from __future__ import annotations
 
 import logging
 import math
+from datetime import date, timedelta
 from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
 
 import config
-import instruments
 
 logger = logging.getLogger(__name__)
 
@@ -80,10 +91,8 @@ class Context:
     prev_close: float            # prior session's close
     prev_high: float
     prev_low: float
-    orb_high: float              # opening range, None until it has closed
-    orb_low: float
     rvol: float                  # cumulative volume vs prior sessions at bar i
-    benchmark_change: "float | None"   # index % change on the day so far
+    benchmark_change: "float | None"   # caller-supplied; see module docstring
 
     @property
     def price(self) -> float:
@@ -109,6 +118,28 @@ class Context:
     def orb_closed(self) -> bool:
         """Whether the opening range has finished forming."""
         return self.i >= BARS_PER_ORB
+
+    @property
+    def orb_high(self) -> float:
+        """Opening range high, NaN until the range has actually closed.
+
+        Computed from the sliced session arrays, so the value cannot
+        contain a bar that has not printed by `i`. It used to be handed in
+        precomputed, which meant that at i=0 it already carried the highs
+        of bars 1 and 2 and a rule that forgot ctx.orb_closed was reading
+        the future. NaN rather than a number because every comparison
+        against NaN is False, so such a rule now simply does not fire.
+        """
+        if not self.orb_closed:
+            return float("nan")
+        return float(np.max(self.high[:BARS_PER_ORB]))
+
+    @property
+    def orb_low(self) -> float:
+        """Opening range low, NaN until the range has actually closed."""
+        if not self.orb_closed:
+            return float("nan")
+        return float(np.min(self.low[:BARS_PER_ORB]))
 
     @property
     def day_change_pct(self) -> "float | None":
@@ -178,6 +209,16 @@ def _wilder(values: np.ndarray, period: int) -> "float | None":
     return out
 
 
+def _span_days(period: str, default: int = 60) -> int:
+    """Calendar days from a '60d' or '3mo' style span.
+
+    See market_source.calendar_days: "60d" is sixty trading sessions, which
+    is about ninety calendar days, not sixty.
+    """
+    import market_source
+    return market_source.calendar_days(period, default)
+
+
 def load_bars(symbols: list[str], period: str = "60d",
               interval: str = "5m", refresh: bool = False
               ) -> dict[str, pd.DataFrame]:
@@ -186,10 +227,13 @@ def load_bars(symbols: list[str], period: str = "60d",
     Parquet rather than pickle: the cache is data, and data should not be
     able to execute on load.
     """
-    import scan_data  # local: scan_data imports yfinance, which is slow
-
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    tag = f"{interval}_{period}"
+    # "kite_" in the tag on purpose. bar_cache still holds files named
+    # SYMBOL__5m_60d.parquet from the yfinance era - auto_adjust=True
+    # back-adjusted Yahoo bars, with the index named Datetime where
+    # kite_client names it Date. They carry no provenance marker, so the
+    # only way not to read them as Kite data is to not look there.
+    tag = f"kite_{interval}_{period}"
     out: dict[str, pd.DataFrame] = {}
     missing: list[str] = []
     for symbol in symbols:
@@ -202,17 +246,20 @@ def load_bars(symbols: list[str], period: str = "60d",
                 logger.warning("Unreadable cache %s: %s", path.name, exc)
         missing.append(symbol)
     if missing:
-        import yfinance as yf
-        tickers = [instruments.to_ticker(s) for s in missing]
-        by_ticker: dict[str, pd.DataFrame] = {}
-        for batch in scan_data.chunks(tickers, config.SCAN_BATCH_SIZE):
-            raw = yf.download(batch, period=period, interval=interval,
-                              auto_adjust=True, progress=False,
-                              group_by="column")
-            if raw is not None and not raw.empty:
-                by_ticker.update(scan_data._unpack(raw, batch))
+        # Kite returns one flat frame per symbol, so the private
+        # scan_data._unpack this used to borrow is not needed on this path.
+        import market_source
+        span = _span_days(period)
+        end = date.today()
+        try:
+            by_symbol = market_source.bars(
+                missing, end - timedelta(days=span), end,
+                interval=market_source.kite_interval(interval))
+        except market_source.NoSession as exc:
+            logger.warning("%s", exc)
+            by_symbol = {}
         for symbol in missing:
-            frame = by_ticker.get(instruments.to_ticker(symbol))
+            frame = by_symbol.get(symbol)
             if frame is None or frame.empty:
                 continue
             path = CACHE_DIR / f"{symbol.replace('/', '_')}__{tag}.parquet"
@@ -279,6 +326,173 @@ def first_touch(high_path: np.ndarray, low_path: np.ndarray, direction: str,
     return "STOP" if stop_at <= target_at else "TARGET"
 
 
+def _prior_levels(sessions: dict, prior_days: list) -> "tuple | None":
+    """Wilder ATR over prior sessions plus the last prior session's levels.
+
+    None when there is nothing to size against - no prior sessions, or no
+    usable ATR from them. Fail closed: a session that cannot be sized is
+    skipped rather than measured against a guessed range.
+    """
+    if not prior_days:
+        return None
+    prior_tr = np.concatenate([sessions[d]["tr"] for d in prior_days])
+    atr = _wilder(prior_tr, config.SCAN_ATR_BARS)
+    if atr is None or atr <= 0:
+        return None
+    last = sessions[prior_days[-1]]
+    return (atr, float(last["close"][-1]), float(last["high"].max()),
+            float(last["low"].min()))
+
+
+def _rvol_baseline(sessions: dict, prior_days: list) -> np.ndarray:
+    """Median cumulative-volume curve across the recent prior sessions.
+
+    Computed once per session rather than per bar: per bar made the cost
+    grow with sessions squared, which is unusable past a few dozen
+    sessions. The window also matches the live scanner's 20-day baseline
+    instead of quietly widening with history.
+    """
+    curves = [np.cumsum(sessions[d]["volume"])
+              for d in prior_days[-RVOL_BASELINE_SESSIONS:]]
+    width = max((len(c) for c in curves), default=0)
+    if not width:
+        return np.zeros(0)
+    padded = np.full((len(curves), width), np.nan)
+    for row, curve in enumerate(curves):
+        padded[row, :len(curve)] = curve
+    with np.errstate(invalid="ignore"):
+        return np.nanmedian(padded, axis=0)
+
+
+def _session_vwap(bars: dict) -> tuple:
+    """Running session VWAP and cumulative volume, bar by bar."""
+    typical = (bars["high"] + bars["low"] + bars["close"]) / 3.0
+    cum_volume = np.cumsum(bars["volume"])
+    with np.errstate(divide="ignore", invalid="ignore"):
+        vwap = np.cumsum(typical * bars["volume"]) / cum_volume
+    return vwap, cum_volume
+
+
+@dataclass
+class _Session:
+    """One session's precomputed inputs for the bar loop.
+
+    Everything here is either the session's own bars, which get sliced per
+    bar before a rule sees them, or a scalar from PRIOR sessions.
+    """
+
+    symbol: str
+    day: object
+    bars: dict
+    n: int
+    atr: float
+    prev_close: float
+    prev_high: float
+    prev_low: float
+    vwap: np.ndarray
+    cum_volume: np.ndarray
+    baseline: np.ndarray
+    benchmark_change: "float | None"
+
+    def context(self, i: int) -> Context:
+        """The context for bar `i`, sliced so no later bar is reachable."""
+        bars = self.bars
+        at_i = float(self.baseline[i]) if i < len(self.baseline) else 0.0
+        rvol = (float(self.cum_volume[i]) / at_i
+                if at_i > 0 and np.isfinite(at_i) else 0.0)
+        return Context(
+            symbol=self.symbol, day=self.day, i=i, n=self.n,
+            open_=bars["open"][:i + 1], high=bars["high"][:i + 1],
+            low=bars["low"][:i + 1], close=bars["close"][:i + 1],
+            volume=bars["volume"][:i + 1], vwap=self.vwap[:i + 1],
+            atr=self.atr, prev_close=self.prev_close,
+            prev_high=self.prev_high, prev_low=self.prev_low,
+            rvol=rvol, benchmark_change=self.benchmark_change)
+
+
+def _prepare_session(symbol: str, day, sessions: dict, prior_days: list,
+                     change: "float | None") -> "_Session | None":
+    """One session's inputs, or None when it cannot be measured honestly."""
+    bars = sessions[day]
+    n = len(bars["close"])
+    if n <= BARS_PER_ORB + 1:
+        return None
+    levels = _prior_levels(sessions, prior_days)
+    if levels is None:
+        return None
+    atr, prev_close, prev_high, prev_low = levels
+    vwap, cum_volume = _session_vwap(bars)
+    return _Session(symbol=symbol, day=day, bars=bars, n=n, atr=atr,
+                    prev_close=prev_close, prev_high=prev_high,
+                    prev_low=prev_low, vwap=vwap, cum_volume=cum_volume,
+                    baseline=_rvol_baseline(sessions, prior_days),
+                    benchmark_change=change)
+
+
+def _signal_row(ctx: Context, bars: dict, direction: str,
+                stops: tuple, targets: tuple) -> dict:
+    """One signal plus the forward path the rule never saw.
+
+    The forward slice starts at i+1, so the entry bar's own extremes never
+    count as an excursion.
+    """
+    i, entry, sigma = ctx.i, ctx.price, ctx.sigma
+    forward_high = bars["high"][i + 1:]
+    forward_low = bars["low"][i + 1:]
+    session_close = float(bars["close"][-1])
+    if direction == LONG:
+        mfe = float(forward_high.max()) - entry
+        mae = entry - float(forward_low.min())
+        close_move = session_close - entry
+    else:
+        mfe = entry - float(forward_low.min())
+        mae = float(forward_high.max()) - entry
+        close_move = entry - session_close
+    row = {
+        "symbol": ctx.symbol, "day": ctx.day, "i": i,
+        "direction": direction, "entry": entry, "sigma": sigma,
+        "bars_left": ctx.bars_left, "rvol": ctx.rvol,
+        "relative_strength": ctx.relative_strength,
+        "mfe_sigma": max(0.0, mfe) / sigma,
+        "mae_sigma": max(0.0, mae) / sigma,
+        "close_move_sigma": close_move / sigma,
+    }
+    for stop in stops:
+        for target in targets:
+            row[(stop, target)] = first_touch(
+                forward_high, forward_low, direction, entry,
+                sigma * stop, sigma * target)
+    return row
+
+
+def _session_rows(rule, session: _Session, stops: tuple, targets: tuple,
+                  one_per_direction: bool) -> list[dict]:
+    """Measured signals from one session, at most one per direction.
+
+    The last bar is never a signal bar: there would be no forward path to
+    measure it against.
+    """
+    rows: list[dict] = []
+    fired: set[str] = set()
+    for i in range(session.n - 1):
+        if one_per_direction and len(fired) == 2:
+            break
+        ctx = session.context(i)
+        try:
+            direction = rule(ctx)
+        except Exception as exc:
+            logger.warning("%s rule raised on %s bar %d: %s",
+                           session.symbol, session.day, i, exc)
+            break
+        if direction not in (LONG, SHORT):
+            continue
+        if one_per_direction and direction in fired:
+            continue
+        fired.add(direction)
+        rows.append(_signal_row(ctx, session.bars, direction, stops, targets))
+    return rows
+
+
 def run_rule(rule, frames: dict[str, pd.DataFrame],
              benchmark_change: "dict | None" = None,
              stops: tuple = DEFAULT_STOPS, targets: tuple = DEFAULT_TARGETS,
@@ -300,99 +514,12 @@ def run_rule(rule, frames: dict[str, pd.DataFrame],
         for position, day in enumerate(unique):
             if position < warmup:
                 continue
-            bars = sessions[day]
-            n = len(bars["close"])
-            if n <= BARS_PER_ORB + 1:
+            session = _prepare_session(symbol, day, sessions,
+                                       unique[:position], changes.get(day))
+            if session is None:
                 continue
-            prior_days = unique[:position]
-            prior_tr = np.concatenate([sessions[d]["tr"] for d in prior_days])
-            atr = _wilder(prior_tr, config.SCAN_ATR_BARS)
-            if atr is None or atr <= 0:
-                continue
-            last_prior = sessions[prior_days[-1]]
-            prev_close = float(last_prior["close"][-1])
-            prev_high = float(last_prior["high"].max())
-            prev_low = float(last_prior["low"].min())
-            # Relative-volume baseline: the MEDIAN cumulative-volume curve
-            # across the most recent prior sessions, computed once per
-            # session rather than per bar. Recomputing it per bar made the
-            # cost grow with sessions squared, which is unusable past a few
-            # dozen sessions. The window also matches the live scanner's
-            # 20-day baseline instead of quietly widening with history.
-            recent = prior_days[-RVOL_BASELINE_SESSIONS:]
-            curves = [np.cumsum(sessions[d]["volume"]) for d in recent]
-            width = max((len(c) for c in curves), default=0)
-            baseline_curve = np.zeros(width)
-            if curves and width:
-                padded = np.full((len(curves), width), np.nan)
-                for row, curve in enumerate(curves):
-                    padded[row, :len(curve)] = curve
-                with np.errstate(invalid="ignore"):
-                    baseline_curve = np.nanmedian(padded, axis=0)
-            typical = (bars["high"] + bars["low"] + bars["close"]) / 3.0
-            cum_volume = np.cumsum(bars["volume"])
-            with np.errstate(divide="ignore", invalid="ignore"):
-                vwap = np.cumsum(typical * bars["volume"]) / cum_volume
-            orb_high = float(bars["high"][:BARS_PER_ORB].max())
-            orb_low = float(bars["low"][:BARS_PER_ORB].min())
-            fired: set[str] = set()
-            for i in range(n - 1):
-                if one_per_direction and len(fired) == 2:
-                    break
-                baseline = (float(baseline_curve[i])
-                            if i < len(baseline_curve) else 0.0)
-                rvol = (float(cum_volume[i]) / baseline
-                        if baseline > 0 and np.isfinite(baseline) else 0.0)
-                ctx = Context(
-                    symbol=symbol, day=day, i=i, n=n,
-                    open_=bars["open"][:i + 1], high=bars["high"][:i + 1],
-                    low=bars["low"][:i + 1], close=bars["close"][:i + 1],
-                    volume=bars["volume"][:i + 1], vwap=vwap[:i + 1],
-                    atr=atr, prev_close=prev_close, prev_high=prev_high,
-                    prev_low=prev_low, orb_high=orb_high, orb_low=orb_low,
-                    rvol=rvol, benchmark_change=changes.get(day))
-                try:
-                    direction = rule(ctx)
-                except Exception as exc:
-                    logger.warning("%s rule raised on %s %s bar %d: %s",
-                                   symbol, day, symbol, i, exc)
-                    break
-                if direction not in (LONG, SHORT):
-                    continue
-                if one_per_direction and direction in fired:
-                    continue
-                fired.add(direction)
-                sigma = ctx.sigma
-                if sigma <= 0:
-                    continue
-                entry = ctx.price
-                forward_high = bars["high"][i + 1:]
-                forward_low = bars["low"][i + 1:]
-                if forward_high.size == 0:
-                    continue
-                if direction == LONG:
-                    mfe = float(forward_high.max()) - entry
-                    mae = entry - float(forward_low.min())
-                    close_move = float(bars["close"][-1]) - entry
-                else:
-                    mfe = entry - float(forward_low.min())
-                    mae = float(forward_high.max()) - entry
-                    close_move = entry - float(bars["close"][-1])
-                row = {
-                    "symbol": symbol, "day": day, "i": i,
-                    "direction": direction, "entry": entry, "sigma": sigma,
-                    "bars_left": ctx.bars_left, "rvol": rvol,
-                    "relative_strength": ctx.relative_strength,
-                    "mfe_sigma": max(0.0, mfe) / sigma,
-                    "mae_sigma": max(0.0, mae) / sigma,
-                    "close_move_sigma": close_move / sigma,
-                }
-                for stop in stops:
-                    for target in targets:
-                        row[(stop, target)] = first_touch(
-                            forward_high, forward_low, direction, entry,
-                            sigma * stop, sigma * target)
-                rows.append(row)
+            rows.extend(_session_rows(rule, session, stops, targets,
+                                      one_per_direction))
     return rows
 
 
@@ -417,6 +544,14 @@ def summarise(rows: list[dict], stops: tuple = DEFAULT_STOPS,
     }
     grid = []
     for stop in stops:
+        # Median stop distance as a fraction of entry. It depends only on
+        # the stop, so it is computed once per stop rather than once per
+        # (stop, target) cell.
+        stop_fracs = [r["sigma"] * stop / r["entry"] for r in rows
+                      if r["entry"] > 0]
+        median_stop_frac = float(np.median(stop_fracs)) if stop_fracs else 0.0
+        cost_in_r = (COST_FRACTION / median_stop_frac
+                     if median_stop_frac > 0 else 0.0)
         for target in targets:
             verdicts = [r[(stop, target)] for r in rows if (stop, target) in r]
             hits = verdicts.count("TARGET")
@@ -428,12 +563,6 @@ def summarise(rows: list[dict], stops: tuple = DEFAULT_STOPS,
                 continue
             reward_risk = target / stop
             gross = (hits * reward_risk - stopped) / total
-            # Median stop distance as a fraction of entry, per geometry.
-            stop_fracs = [r["sigma"] * stop / r["entry"] for r in rows
-                          if r["entry"] > 0]
-            median_stop_frac = float(np.median(stop_fracs)) if stop_fracs else 0.0
-            cost_in_r = (COST_FRACTION / median_stop_frac
-                         if median_stop_frac > 0 else 0.0)
             grid.append({
                 "stop": stop, "target": target, "reward_risk": reward_risk,
                 "signals": total, "resolved": resolved,
@@ -455,6 +584,17 @@ def best_geometry(summary: dict) -> "dict | None":
     """The (stop, target) pair with the highest net expectancy."""
     grid = [g for g in summary.get("grid", []) if g.get("net_r") is not None]
     return max(grid, key=lambda g: g["net_r"]) if grid else None
+
+
+def _net_r_desc(row: dict) -> float:
+    """Sort key putting the best net expectancy first, unscored rows last.
+
+    An explicit None check rather than `or`, which treated a net_r of
+    exactly 0.0 as missing and sorted a break-even geometry below every
+    losing one.
+    """
+    value = row.get("net_r")
+    return float("inf") if value is None else -float(value)
 
 
 def print_report(name: str, summary: dict) -> None:
@@ -480,7 +620,7 @@ def print_report(name: str, summary: dict) -> None:
     print(f"  {'stop':>5}{'tgt':>6}{'R:R':>5}{'resolved':>9}{'hit%':>7}"
           f"{'rand%':>7}{'edge':>7}{'grossR':>8}{'netR':>8}")
     print("  " + "-" * 62)
-    for row in sorted(summary["grid"], key=lambda g: -(g["net_r"] or -9)):
+    for row in sorted(summary["grid"], key=_net_r_desc):
         if row["hit_rate"] is None:
             continue
         mark = "  <<" if best and row is best else ""

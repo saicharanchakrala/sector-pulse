@@ -76,7 +76,7 @@ def max_abs_drift(rows: list[DriftRow], tracked_only: bool = True) -> float:
     - Untracked holdings: their drift is their whole portfolio weight, and
       only a sale can reduce it.
     - Unpriced rows: with no price there is nothing to buy, so a target
-      symbol that yfinance cannot resolve would otherwise sit at -100pp.
+      symbol the data source cannot resolve would otherwise sit at -100pp.
     """
     considered = ([row for row in rows
                    if not row.untracked and row.last_price > 0.0]

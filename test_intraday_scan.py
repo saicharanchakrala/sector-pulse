@@ -833,11 +833,16 @@ def test_equity_master_refuses_a_file_with_no_symbol_column() -> None:
     assert instruments.parse_equity_master("") == []
 
 
-def test_ticker_mapping_is_a_rule_not_a_table() -> None:
-    assert instruments.to_ticker("RELIANCE") == "RELIANCE.NS"
-    assert instruments.to_ticker("M&M") == "M&M.NS"
-    assert instruments.to_ticker("^NSEI") == "^NSEI"
-    assert instruments.to_ticker("RELIANCE.NS") == "RELIANCE.NS"
+def test_ticker_mapping_returns_kite_symbols_and_strips_yahoo_leftovers() -> None:
+    # Kite takes bare tradingsymbols, so this is near-identity for a live
+    # symbol and a cleanup for anything written before the migration.
+    assert instruments.to_ticker("RELIANCE") == "RELIANCE"
+    assert instruments.to_ticker("M&M") == "M&M"
+    assert instruments.to_ticker("RELIANCE.NS") == "RELIANCE"
+    # The Yahoo index spellings map to Kite index names, not to a bare strip:
+    # "NSEI" is not an instrument, "NIFTY 50" is.
+    assert instruments.to_ticker("^NSEI") == "NIFTY 50"
+    assert instruments.to_ticker("^CNXIT") == "NIFTY IT"
 
 
 def test_fo_state_keeps_lakh_and_rupee_fields_apart() -> None:
@@ -979,21 +984,34 @@ def test_truncate_excludes_the_bar_stamped_at_the_cutoff() -> None:
                             failed=[])
     cutoff = pd.Timestamp("2026-09-08 10:00", tz=IST)
     kept = scan_data.truncate(bars, cutoff).intraday["T.NS"]
-    assert all(ts < cutoff for ts in kept.index)
     assert kept.index[-1] == pd.Timestamp("2026-09-08 09:55", tz=IST)
     assert cutoff not in set(kept.index), "the cutoff bar must not survive"
+    # Stronger than the two above, which lean on a sorted index that
+    # truncate does not itself guarantee.
+    assert all(ts < cutoff for ts in kept.index)
 
 
 def test_truncate_cuts_daily_bars_on_date() -> None:
+    # The cutoff date needs a row of its own here. Without one, "<= cutoff
+    # date" and "< cutoff date" keep exactly the same rows and the boundary
+    # this test is named for goes unmeasured. The cut is strictly before the
+    # cutoff date: the replay date's daily bar is already complete when a
+    # replay runs, so keeping it would hand the scan the very session it is
+    # supposed to be blind to.
     daily = pd.DataFrame(
-        {"Open": [1.0, 2.0], "High": [1.0, 2.0], "Low": [1.0, 2.0],
-         "Close": [1.0, 2.0], "Volume": [1.0, 2.0]},
+        {"Open": [1.0, 2.0, 3.0], "High": [1.0, 2.0, 3.0],
+         "Low": [1.0, 2.0, 3.0], "Close": [1.0, 2.0, 3.0],
+         "Volume": [1.0, 2.0, 3.0]},
         index=pd.DatetimeIndex([pd.Timestamp("2026-09-07", tz=IST),
+                                pd.Timestamp("2026-09-08", tz=IST),
                                 pd.Timestamp("2026-09-09", tz=IST)]))
     bars = scan_data.BarSet(intraday={}, daily={"T.NS": daily}, requested=1,
                             failed=[])
     kept = scan_data.truncate(bars, pd.Timestamp("2026-09-08 10:00", tz=IST))
-    assert list(kept.daily["T.NS"].index.date) == [date(2026, 9, 7)]
+    surviving = list(kept.daily["T.NS"].index.date)
+    assert surviving == [date(2026, 9, 7)]
+    assert date(2026, 9, 8) not in surviving, (
+        "the cutoff date's own daily bar must not survive")
 
 
 def test_append_log_rotates_a_file_with_an_older_column_set(tmp_path,
@@ -1038,30 +1056,6 @@ def test_parse_as_of_accepts_a_bare_time_and_a_full_timestamp() -> None:
             scan_intraday.parse_as_of(bad)
 
 
-# --- batching ------------------------------------------------------------
-
-def test_chunks_splits_without_dropping_or_duplicating() -> None:
-    items = [str(i) for i in range(10)]
-    batches = scan_data.chunks(items, 4)
-    assert [len(b) for b in batches] == [4, 4, 2]
-    assert [x for b in batches for x in b] == items
-
-
-def test_chunks_rejects_a_nonpositive_size() -> None:
-    with pytest.raises(ValueError, match="chunk size must be positive"):
-        scan_data.chunks(["a"], 0)
-
-
-def test_unpack_keeps_a_ticker_without_volume_and_drops_one_without_close() -> None:
-    index = pd.DatetimeIndex([pd.Timestamp("2026-09-08 09:15", tz=IST)])
-    frame = pd.DataFrame(
-        {("Close", "A.NS"): [100.0], ("High", "B.NS"): [1.0]}, index=index)
-    frame.columns = pd.MultiIndex.from_tuples(frame.columns)
-    out = scan_data._unpack(frame, ["A.NS", "B.NS"])
-    assert "A.NS" in out and "B.NS" not in out
-    assert "Volume" not in out["A.NS"].columns
-
-
 # --- setups.measure ------------------------------------------------------
 
 def _daily(rows: list[tuple], start: str = "2026-09-04") -> pd.DataFrame:
@@ -1088,6 +1082,25 @@ def test_measure_excludes_todays_partial_daily_bar() -> None:
     assert reading.cpr is not None
     # CPR must come from yesterday's 95/88/94, not today's 119/99/118.
     assert reading.cpr.pivot == pytest.approx((95.0 + 88.0 + 94.0) / 3.0)
+
+
+def test_measure_anchors_prev_close_on_the_clock_not_the_last_bar() -> None:
+    # The cutoff falls before the replay date's first intraday bar, so the
+    # last surviving session is D-1 while the clock says D. Anchoring the
+    # daily filter on that last bar instead of on the clock kept D's own
+    # completed daily bar, and its close became prev_close: a replay of
+    # yesterday reading today's finished session. prev_close must be D-1's
+    # 174.0, not D's 274.0, and day_change_pct and relative strength with it.
+    intraday = _session("2026-09-07", 100.0, bars=20)
+    daily = _daily([("2026-09-07", 170.0, 175.0, 168.0, 174.0, 1e6),
+                    ("2026-09-08", 180.0, 285.0, 179.0, 274.0, 1e6)])
+    reading = setups.measure("T", "T.NS", intraday, daily, None,
+                             datetime(2026, 9, 8, 9, 15, tzinfo=IST))
+    assert reading is not None
+    assert reading.prev_close == pytest.approx(174.0)
+    # The CPR shares the anchor, so it must come from 175/168/174 as well.
+    assert reading.cpr is not None
+    assert reading.cpr.pivot == pytest.approx((175.0 + 168.0 + 174.0) / 3.0)
 
 
 def test_measure_drops_daily_context_rather_than_leaking_it() -> None:

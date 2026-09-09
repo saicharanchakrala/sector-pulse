@@ -1,45 +1,17 @@
-"""Sector ETF price momentum via a single batched yfinance download."""
+"""Sector ETF price momentum from daily Kite bars."""
 from __future__ import annotations
 
 import logging
 import math
 
 import pandas as pd
-import yfinance as yf
 
 import config
+import market_source
 from models import SectorMomentum
 from profiles import MarketProfile, get_profile
 
 logger = logging.getLogger(__name__)
-
-
-def close_series(data: pd.DataFrame, ticker: str,
-                  requested_tickers: "list[str]") -> "pd.Series | None":
-    """Return the Close series (leading NaNs trimmed) for one ticker, or None."""
-    columns = data.columns
-    series = None
-    if isinstance(columns, pd.MultiIndex):
-        # yf.download column layout depends on group_by: ("Close", ticker) by
-        # default, (ticker, "Close") with group_by="ticker" - accept either.
-        for key in (("Close", ticker), (ticker, "Close")):
-            if key in columns:
-                series = data[key]
-                break
-    elif "Close" in columns:
-        # A flat (single-level) frame carries no ticker label, so it is only
-        # trustworthy when the download was for exactly this one ticker.
-        if len(requested_tickers) == 1 and requested_tickers[0] == ticker:
-            series = data["Close"]
-    if series is None or not isinstance(series, pd.Series):
-        return None
-    # Trim only leading NaNs; interior/trailing NaNs must stay in place so that
-    # _window_return can skip windows per the spec instead of silently
-    # compacting the series onto older closes.
-    first_valid = series.first_valid_index()
-    if first_valid is None:
-        return None
-    return series.loc[first_valid:]
 
 
 def _window_return(closes: pd.Series, trading_days: int) -> "float | None":
@@ -82,29 +54,31 @@ def get_sector_momentum(
     """Compute weighted tanh-squashed multi-window momentum per sector ticker."""
     resolved = get_profile() if profile is None else profile
     # Prefer the tradeable ETF over the sector index. You buy the ETF, so its
-    # own history is the relevant one, and it is far better served: yfinance
-    # returned 34-35 daily bars since 2026-07-20 for the Indian sector ETFs
-    # against a single bar for 9 of the 12 underlying indices.
+    # own history is the relevant one, and it carries its own premium and
+    # tracking error. The original reason was a yfinance data gap - 34 bars
+    # for the ETFs against one for most indices - which no longer applies on
+    # Kite, but the first reason stands on its own.
     tickers = [resolved.trade_etfs.get(name) or sector_def.etf
                for name, sector_def in resolved.sectors.items()]
     try:
-        data = yf.download(tickers, period="6mo", interval="1d",
-                           auto_adjust=True, progress=False)
-    except Exception as exc:  # yfinance raises heterogeneous network/parse errors
-        logger.warning("yfinance download failed: %s", exc)
+        frames = market_source.daily_bars(tickers, months=6)
+    except market_source.NoSession as exc:
+        logger.warning("%s", exc)
         return {}
-    if data is None or data.empty:
-        logger.warning("yfinance returned no price data for sector ETFs")
+    if not frames:
+        logger.warning("No price data returned for %d sector ticker(s)",
+                       len(tickers))
         return {}
     momentum: dict[str, SectorMomentum] = {}
     for name, sector_def in resolved.sectors.items():
         ticker = resolved.trade_etfs.get(name) or sector_def.etf
         try:
-            closes = close_series(data, ticker, tickers)
-            if closes is None:
+            frame = frames.get(ticker)
+            if frame is None or "Close" not in frame.columns:
                 logger.warning("No usable close prices for %s (%s)",
                                name, ticker)
                 continue
+            closes = frame["Close"]
             entry = _momentum_for(name, ticker, closes)
         except (KeyError, IndexError, TypeError, ValueError) as exc:
             logger.warning("Momentum computation failed for %s (%s): %s",

@@ -170,31 +170,38 @@ def test_liquidity_gate_uses_rupee_turnover_not_unit_count() -> None:
 
 
 def test_genuinely_thin_etf_is_still_illiquid() -> None:
-    thin = _snapshot("OILIETF.NS", price=11.40, volume=20_000.0)
+    # Read from the profile, not written as a literal. Retargeting a
+    # sector's ETF once stranded literals like this and the gate under test
+    # silently stopped being exercised at all.
+    energy = get_profile("IN").trade_etfs["Energy"]
+    thin = _snapshot(energy, price=11.40, volume=20_000.0)
     assert 11.40 * 20_000.0 < config.SIGNAL_MIN_AVG_TURNOVER
-    by_sector = _decide_with({"OILIETF.NS": thin})
+    by_sector = _decide_with({energy: thin})
     assert by_sector["Energy"].illiquid is True
 
 
 def test_illiquid_blocks_a_buy_that_would_otherwise_pass() -> None:
     # Same sector, same price action; only turnover differs.
-    liquid = _snapshot("METALIETF.NS", price=13.40, volume=8_000_000.0)
-    thin = _snapshot("METALIETF.NS", price=13.40, volume=1_000.0)
-    assert _decide_with({"METALIETF.NS": liquid})["Metal"].illiquid is False
-    assert _decide_with({"METALIETF.NS": thin})["Metal"].illiquid is True
+    metal = get_profile("IN").trade_etfs["Metal"]
+    liquid = _snapshot(metal, price=13.40, volume=8_000_000.0)
+    thin = _snapshot(metal, price=13.40, volume=1_000.0)
+    assert _decide_with({metal: liquid})["Metal"].illiquid is False
+    assert _decide_with({metal: thin})["Metal"].illiquid is True
 
 
 def test_liquidity_reason_is_reported_in_rupees() -> None:
+    metal = get_profile("IN").trade_etfs["Metal"]
     by_sector = _decide_with(
-        {"METALIETF.NS": _snapshot("METALIETF.NS", 13.40, 8_000_000.0)})
+        {metal: _snapshot(metal, 13.40, 8_000_000.0)})
     reasons = " ".join(by_sector["Metal"].reasons)
     assert "turnover" in reasons
     assert "107,200,000" in reasons, reasons
 
 
 def test_explanation_mentions_turnover_not_units() -> None:
+    metal = get_profile("IN").trade_etfs["Metal"]
     by_sector = _decide_with(
-        {"METALIETF.NS": _snapshot("METALIETF.NS", 13.40, 1_000.0)})
+        {metal: _snapshot(metal, 13.40, 1_000.0)})
     text = decision.explain(by_sector["Metal"])
     assert "rupees a day" in text, text
     assert "units a day" not in text, text
@@ -253,11 +260,11 @@ def test_threshold_boundary_is_inclusive() -> None:
 
 def test_decide_reports_the_window_weight_it_used() -> None:
     from models import SectorMomentum
-    full = SectorMomentum(sector="Metal", etf="METALIETF.NS",
+    full = SectorMomentum(sector="Metal", etf="METALIETF",
                           returns={"5d": 1.0, "21d": 2.0, "63d": 3.0}, score=0.4)
-    thin = SectorMomentum(sector="Metal", etf="METALIETF.NS",
+    thin = SectorMomentum(sector="Metal", etf="METALIETF",
                           returns={"63d": 3.0}, score=0.4)
-    snaps = {"METALIETF.NS": _snapshot("METALIETF.NS", 13.40, 8_000_000.0)}
+    snaps = {"METALIETF": _snapshot("METALIETF", 13.40, 8_000_000.0)}
     for mom, expected in ((full, 1.0), (thin, 0.2)):
         signals = decision.decide([], {"Metal": mom}, snaps, get_profile("IN"))
         metal = next(s for s in signals if s.sector == "Metal")
@@ -271,9 +278,9 @@ def test_decide_reports_the_window_weight_it_used() -> None:
 
 def test_declining_diagnostic_needs_reliable_momentum_too() -> None:
     from models import SectorMomentum
-    bearish = SectorMomentum(sector="Metal", etf="METALIETF.NS",
+    bearish = SectorMomentum(sector="Metal", etf="METALIETF",
                              returns={"63d": -9.0}, score=-0.6)
-    snaps = {"METALIETF.NS": _snapshot("METALIETF.NS", 13.40, 8_000_000.0,
+    snaps = {"METALIETF": _snapshot("METALIETF", 13.40, 8_000_000.0,
                                        day_change=-1.5, last_hour=-0.5)}
     signals = decision.decide([], {"Metal": bearish}, snaps, get_profile("IN"))
     metal = next(s for s in signals if s.sector == "Metal")
@@ -289,7 +296,7 @@ def test_declining_needs_a_real_downtrend_not_merely_a_weak_uptrend() -> None:
     snap = _snapshot("X.NS", 100.0, 5_000_000.0, day_change=-1.5, last_hour=-0.5)
 
     def declining(momentum: float) -> bool:
-        signal = TradeSignal("Metal", "METALIETF.NS", decision.ACTION_NO_BUY,
+        signal = TradeSignal("Metal", "METALIETF", decision.ACTION_NO_BUY,
                              0.0, -0.5, 5, config.SIGNAL_MIN_ARTICLES,
                              momentum, 1.0, snap, False, [])
         return decision.is_declining(signal)
@@ -484,10 +491,10 @@ def test_persist_run_writes_all_three_artifacts() -> None:
     import daily_signal
     from decision import TradeSignal
 
-    snap = _snapshot("METALIETF.NS", 13.40, 8_000_000.0)
-    buy = TradeSignal("Metal", "METALIETF.NS", decision.ACTION_BUY, 0.5, 0.4, 6,
+    snap = _snapshot("METALIETF", 13.40, 8_000_000.0)
+    buy = TradeSignal("Metal", "METALIETF", decision.ACTION_BUY, 0.5, 0.4, 6,
                       config.SIGNAL_MIN_ARTICLES, 0.3, 1.0, snap, False, [])
-    skip = TradeSignal("IT", "ITBEES.NS", decision.ACTION_NO_BUY, -0.1, -0.2, 4,
+    skip = TradeSignal("IT", "ITETF", decision.ACTION_NO_BUY, -0.1, -0.2, 4,
                        config.SIGNAL_MIN_ARTICLES, 0.1, 1.0, snap, False, [])
     items = [_item(i) for i in range(3)]
     now = datetime(2026, 9, 8, 15, 15, tzinfo=timezone.utc)
@@ -511,7 +518,7 @@ def test_persist_run_writes_all_three_artifacts() -> None:
             payload = _json.loads(
                 config.LAST_SIGNAL_JSON.read_text(encoding="utf-8"))
             assert payload["market"] == "IN"
-            assert payload["top_pick"]["etf"] == "METALIETF.NS"
+            assert payload["top_pick"]["etf"] == "METALIETF"
             assert payload["top_pick"]["explanation"], "prose must be stored"
             assert len(news_archive.archived_days(config.NEWS_ARCHIVE_DIR)) == 1
         finally:
@@ -522,8 +529,8 @@ def test_persist_run_writes_all_three_artifacts() -> None:
 def test_persist_run_returns_zero_when_nothing_new_to_archive() -> None:
     import daily_signal
     from decision import TradeSignal
-    snap = _snapshot("METALIETF.NS", 13.40, 8_000_000.0)
-    sig = TradeSignal("Metal", "METALIETF.NS", decision.ACTION_NO_BUY, 0.0, 0.0,
+    snap = _snapshot("METALIETF", 13.40, 8_000_000.0)
+    sig = TradeSignal("Metal", "METALIETF", decision.ACTION_NO_BUY, 0.0, 0.0,
                       1, config.SIGNAL_MIN_ARTICLES, 0.0, 1.0, snap, False, [])
     now = datetime(2026, 9, 8, 15, 15, tzinfo=timezone.utc)
     with tempfile.TemporaryDirectory() as tmp:

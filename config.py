@@ -59,7 +59,8 @@ SIGNAL_BASELINE_MAX_DAYS = 60    # trailing window, so cost stays bounded
 SIGNAL_MIN_INTRADAY_PCT = 0.2    # gate: intraday day-change floor (%)
 SIGNAL_MIN_MOMENTUM = -0.2       # gate: multi-day momentum floor (not a falling knife)
 # Fraction of MOMENTUM_WINDOWS weight that must actually be computable
-# before the momentum gate is trusted. yfinance served only 1 daily bar
+# before the momentum gate is trusted. The gap that motivated it is gone
+# now that bars come from Kite, but the gate stays: yfinance served 1 daily bar
 # since 2026-07-20 for 9 of 12 Nifty sector indices, silently reducing
 # their score to the 63d window alone (weight 0.2). A gate measured on a
 # fifth of its inputs must not be treated as having passed.
@@ -91,7 +92,6 @@ REBALANCE_BAND_PP = 5.0           # off-cycle trigger: |drift| this many pp or m
 MIN_DAYS_BETWEEN_BUYS = 7
 MIN_ORDER_VALUE = 500.0           # skip dribble orders below this rupee value
 DEFAULT_ALLOCATION_MODE = "fill"  # "fill" (waterfall) or "spread" (proportional)
-QUOTE_SUFFIX = ".NS"              # yfinance suffix for bare NSE symbols
 HOLDINGS_CSV = PROJECT_ROOT / "holdings.csv"
 TARGETS_YAML = PROJECT_ROOT / "targets.yaml"
 CONTRIBUTIONS_CSV = PROJECT_ROOT / "contributions.csv"
@@ -104,16 +104,21 @@ NEWS_ARCHIVE_DIR = PROJECT_ROOT / "news_archive"
 # The positional signal holds for weeks; this one holds for hours. Different
 # data, different costs, different failure mode - so it gets its own gates
 # and never shares a threshold with the EOD path.
-SCAN_BAR_INTERVAL = "5m"          # yfinance intraday bar size
-# 10 days of 5-minute bars: about 7 trading sessions. That is the intraday
-# working set - enough prior sessions for a relative-volume median and for a
-# gap-free ATR, without dragging a month of bars through every scan. The
-# median baseline is noisier on 6 prior sessions than on 20; that is the
-# trade for a baseline that reflects this week rather than last month.
+SCAN_BAR_INTERVAL = "5m"          # intraday bar size (Kite: "5minute")
+# Ten trading SESSIONS of 5-minute bars, which market_source.calendar_days
+# turns into about seventeen calendar days. That is the intraday working set
+# - enough prior sessions for a relative-volume median and a gap-free ATR,
+# without dragging a month of bars through every scan. The median baseline
+# is noisier on a dozen prior sessions than on twenty; that is the trade for
+# a baseline reflecting this week rather than last month. Raise this if you
+# want the steadier median instead.
 SCAN_BAR_LOOKBACK = "10d"
 SCAN_DAILY_LOOKBACK = "3mo"       # daily bars for ATR and previous-session levels
-SCAN_BATCH_SIZE = 40              # tickers per yfinance download call
-SCAN_BENCHMARK = "^NSEI"          # relative-strength benchmark (Nifty 50)
+# Kept for callers that still pass it, but it no longer batches anything:
+# Kite is queried per instrument and paced centrally at its documented
+# rate, so grouping symbols buys nothing.
+SCAN_BATCH_SIZE = 40
+SCAN_BENCHMARK = "NIFTY 50"       # relative-strength benchmark, as Kite names it
 
 SCAN_OPENING_RANGE_MINUTES = 15   # opening range = first N minutes of the session
 SCAN_ATR_BARS = 14                # ATR period on 5m bars, for intraday stops
@@ -146,7 +151,11 @@ SCAN_MIN_OI_CHANGE_PCT = 0.0      # only consulted when the above is True
 # rejection threshold - nothing gates on reward:risk, because the target is
 # constructed from it rather than measured against it.
 SCAN_REWARD_RISK = 2.0
-SCAN_RVOL_MIN = 1.2               # today's pace vs same-time-of-day 20d median
+# Today's cumulative volume against the median of the PRIOR SESSIONS
+# PRESENT IN THE FRAME at the same clock time - which is however many
+# SCAN_BAR_LOOKBACK supplies, currently about a dozen, not twenty. The old
+# "20d median" label here was never true of the code.
+SCAN_RVOL_MIN = 1.2
 SCAN_MIN_TURNOVER = 50_000_000.0  # 5 crore/day: intraday needs depth, not just listing
 SCAN_MIN_PRICE = 20.0             # sub-20 names move in ticks too coarse to manage
 SCAN_MIN_MINUTES_LEFT = 45        # no entry without time for the target to work
@@ -183,11 +192,24 @@ OPT_STRIKES_EITHER_SIDE = 5       # ATM window to report
 SCAN_CAPITAL = 100_000.0          # intraday capital assumed by the sizer
 SCAN_RISK_PCT_PER_TRADE = 1.0     # percent of capital risked between entry and stop
 
-# Replaying a past date is bounded by yfinance, not by choice: 5-minute bars
-# stop dead at about 60 calendar days (period=70d returns nothing at all).
-# Measured 2026-09-08: bars reached back to 2026-06-17, 59 sessions. The
-# margin below keeps a request off that cliff.
-SCAN_MAX_REPLAY_DAYS = 57
+# This was 57 because yfinance stopped serving 5-minute bars near day 60.
+# Kite serves them for years, so that cliff is gone and the cap now rests on
+# two limits that are real but softer, and worth knowing before trusting an
+# old replay:
+#
+#   * The instrument universe is a single latest snapshot, by choice - no
+#     history is kept. So a replay reconstructs a past session using TODAY'S
+#     F&O list. The further back you go, the more that list has drifted, and
+#     the drift is survivorship-shaped: names added since are scanned on
+#     dates they were not yet tradeable, and names dropped are missing.
+#   * Expired option contracts leave the instrument master and take their
+#     tokens with them, so no past chain is recoverable except from a
+#     snapshot recorded at the time (see option_history).
+#
+# A year keeps the equity replay useful - which is most of why Kite was
+# worth the migration - while staying inside one instrument cycle. Lower it
+# if the universe drift matters more to you than the reach.
+SCAN_MAX_REPLAY_DAYS = 365
 # How far back the dashboard's date picker reaches. Deliberately shorter
 # than the CLI cap: a few sessions is what anyone reviews by hand, and the
 # picker stays honest about weekends by reporting an empty session rather

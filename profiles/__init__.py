@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 class MarketProfile:
     """Static configuration bundle describing one tracked market."""
 
-    key: str                                  # short registry key, e.g. "US"
+    key: str                                  # short registry key, e.g. "IN"
     label: str                                # human-readable market name
     currency: str                             # ISO currency code, e.g. "USD"
     feeds: list[dict]                         # {"name", "url", "category"} dicts
@@ -31,10 +31,12 @@ class MarketProfile:
 
 
 from profiles.india import IN_PROFILE  # noqa: E402  (needs MarketProfile above)
-from profiles.us import US_PROFILE  # noqa: E402
 
+# India only. The US profile was eleven SPDR sector ETFs served by yfinance,
+# and it went with that dependency: Zerodha Kite is an Indian broker and
+# serves no US instrument, so keeping the profile would have meant keeping a
+# second data source alive for a market this book has no position in.
 PROFILES: dict[str, MarketProfile] = {
-    US_PROFILE.key: US_PROFILE,
     IN_PROFILE.key: IN_PROFILE,
 }
 

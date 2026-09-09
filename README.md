@@ -1,22 +1,24 @@
 # Sector Pulse
 
-A local Streamlit dashboard that gathers finance and major world news from free RSS feeds, measures sector index/ETF price momentum via yfinance, and scores a market profile's sectors on a composite of news sentiment and price momentum. It then ranks the sectors to highlight where market attention and strength are concentrated. Two market profiles ship out of the box - **US** (11 GICS sectors via SPDR ETFs) and **IN** (12 Nifty sectoral indices). No API keys are required for the core app; an optional Claude-powered narrative section activates when `ANTHROPIC_API_KEY` is set.
+A local Streamlit dashboard that gathers finance and major world news from free RSS feeds, measures sector index/ETF price momentum from Zerodha Kite, and scores a market profile's sectors on a composite of news sentiment and price momentum. It then ranks the sectors to highlight where market attention and strength are concentrated. One market profile ships today: **IN** (12 Nifty sectoral indices). An optional Claude-powered narrative section activates when `ANTHROPIC_API_KEY` is set.
+
+> **Every price now comes from Zerodha Kite, so the app needs a Kite subscription and a login.** There is no free fallback any more. Kite issues an access token only after an interactive login with your password and 2FA, and it expires around 6am each morning, so `.venv\Scripts\python -m kite_login` is a daily step before anything that prices instruments. See [Zerodha Kite](#zerodha-kite-live-and-historical-data). What that buys: prices are live rather than roughly fifteen minutes late, minute candles reach back years instead of eight days, and historical open interest becomes available. What it costs: the news and sentiment half of the dashboard still runs unauthenticated, but momentum and the intraday scanner do not. The contribution planner degrades instead of failing - with no session it prices your book from the CSV and labels the source, and `--offline` skips the network entirely.
 
 > **Not financial advice - educational use only.** Sector Pulse is a learning tool for exploring news sentiment and market momentum. Nothing it produces is a recommendation to buy or sell any security.
 
 ## Features
 
-- Config-driven market profiles (US and India today) selectable in the app sidebar
+- Config-driven market profiles (India today) selectable in the app sidebar
 - Aggregates free, live RSS/Atom feeds covering the selected market plus world news
 - Concurrent feed fetching with timeouts, HTML stripping, and cross-feed deduplication
 - Classifies headlines into the profile's sectors using rich keyword regexes
 - VADER sentiment analysis with a finance-specific lexicon overlay, plus per-profile unigram and multi-word phrase boosts
 - Recency-weighted news scoring (article weight halves every 24 hours by default)
-- Sector momentum from yfinance - SPDR ETFs for the US, Nifty sectoral indices for India - across 5d / 21d / 63d windows
+- Sector momentum from Kite daily bars - the tradeable Nifty sector ETFs - across 5d / 21d / 63d windows
 - Composite score blending news sentiment and momentum, with a tunable news weight
 - Top headlines per sector, ranked by recency-weighted sentiment strength
 - Optional AI insights section powered by the Claude API (`ANTHROPIC_API_KEY`)
-- Resilient by design: a dead feed is skipped, a yfinance outage degrades to news-only scores, and a missing API key simply hides the AI section
+- Resilient by design: a dead feed is skipped, an unavailable price source degrades to news-only scores, and a missing API key simply hides the AI section
 
 ## Architecture
 
@@ -25,12 +27,12 @@ A local Streamlit dashboard that gathers finance and major world news from free 
 | `models.py` | Shared dataclasses |
 | `config.py` | Tunables + default market |
 | `profiles/__init__.py` | `MarketProfile` dataclass, `PROFILES` registry, `get_profile()` |
-| `profiles/us.py` | US profile: SPDR sector ETFs + US/world feeds |
 | `profiles/india.py` | India profile: Nifty sectoral indices + Indian press feeds |
 | `news_fetcher.py` | Concurrent RSS fetching, parsing, dedupe |
 | `analyzer.py` | Classification, sentiment, composite scoring |
-| `market_data.py` | yfinance sector index/ETF momentum |
-| `intraday.py` | yfinance intraday ETF snapshots (5-minute bars) |
+| `market_source.py` | the single price source: Kite symbols, bars, quotes |
+| `market_data.py` | sector ETF momentum from daily bars |
+| `intraday.py` | intraday ETF snapshots (5-minute bars) |
 | `scan_intraday.py` | intraday scanner CLI: gates, levels, sizing, replay |
 | `setups.py` | per-symbol gates and the ranked verdict |
 | `indicators.py` | pure intraday maths: VWAP, opening range, CPR, ATR, RVOL |
@@ -87,15 +89,17 @@ Sector Pulse is profile-driven: each market bundles its own RSS feeds, sector
 definitions (with index/ETF tickers and classification keywords), and sentiment
 lexicon additions.
 
-- **In-app selector** - the `Market` dropdown at the top of the sidebar switches
-  between profiles (`US - United States`, `IN - India (NSE)`).
-- **Default market** - `IN`. Both the dashboard and every `profile=None` call
-  resolve to India unless the `SECTOR_PULSE_MARKET` environment variable overrides
-  it:
-
-  ```powershell
-  $env:SECTOR_PULSE_MARKET = "US"
-  ```
+- **In-app selector** - the `Market` dropdown at the top of the sidebar. Only
+  `IN - India (NSE)` is registered today, so it has one entry.
+- **Default market** - `IN`, which both the dashboard and every `profile=None`
+  call resolve to. `SECTOR_PULSE_MARKET` still overrides it, but there is
+  nothing else to select.
+- **The US profile was removed** when yfinance went. It was eleven SPDR sector
+  ETFs, and it went with that dependency: Kite is an Indian broker and serves
+  no US instrument, so keeping the profile would have meant keeping a second
+  price source alive for a market this book has no position in. The
+  `MarketProfile` machinery is untouched, so a second profile can return the
+  day a source for it does.
 
 - **The India profile** tracks 12 Nifty sectoral indices (Bank Nifty, Financial
   Services, IT, Pharma, Auto, FMCG, Metal, Energy, Realty, Infrastructure, PSU
@@ -164,11 +168,14 @@ A sector is a BUY only when **all** BUY gates pass:
    the last hour is not falling (price confirming into the close).
 4. Multi-day momentum >= `SIGNAL_MIN_MOMENTUM` (-0.2), **and** computed on at
    least `SIGNAL_MIN_MOMENTUM_WEIGHT` (80%) of the configured window weight.
-   Momentum is measured on the tradeable ETF, not the sector index: yfinance
-   served only 1 daily bar since 2026-07-20 for 9 of the 12 Nifty indices while
-   the ETFs had 34-35, which had silently reduced those sectors to the 63d
-   window alone. A missing score used to arrive as 0.0, and 0.0 >= -0.2, so a
-   data outage made this gate PASS. It now fails closed.
+   Momentum is measured on the tradeable ETF, not the sector index. The
+   original reason was a yfinance data gap - 1 daily bar since 2026-07-20 for
+   9 of the 12 Nifty indices against 34-35 for the ETFs, silently reducing
+   those sectors to the 63d window alone - and that gap is gone on Kite. The
+   choice stands on its own anyway: you buy the ETF, so its own history, with
+   its own premium and tracking error, is the relevant one. A missing score
+   used to arrive as 0.0, and 0.0 >= -0.2, so a data outage made this gate
+   PASS. It now fails closed.
 5. Liquidity: 20-session average daily **turnover** >=
    `SIGNAL_MIN_AVG_TURNOVER` (Rs 25,00,000). Turnover, not a unit count: a
    50,000-unit floor was 84x stricter for INFRABEES at Rs 958/unit than for
@@ -246,11 +253,14 @@ schtasks /Delete /TN "SectorPulseDailySignal" /F
 
 > **Strong caveats - read before relying on this.**
 >
-> - Yahoo Finance intraday data **may be delayed** by several minutes; the
->   15:15 snapshot may not reflect the true last traded price.
+> - The 15:15 snapshot needs a **live Kite session**. Kite's token expires
+>   around 6am, so a scheduled run started before you logged in that morning
+>   will print no prices at all rather than stale ones.
 > - The gate rule is **unvalidated**: it has no backtest behind it and earns
 >   credibility only as `signals.csv` accumulates a real track record you can
->   evaluate yourself.
+>   evaluate yourself. Note that the *intraday* rule, which has now been
+>   measured properly, turned out to have no edge - that is not evidence
+>   about this rule, but it is a fair warning about how these usually end.
 > - This is **decision support, not financial advice**. It is an educational
 >   tool; treat every BUY line as a prompt to do your own research.
 > - It **never places orders** - it only prints, logs to CSV, and writes a
@@ -435,11 +445,13 @@ day, with no non-interactive refresh for retail apps.
 ### Why the historical API matters more than the tick feed
 
 `kite_client.historical()` serves minute candles reaching back **at least
-six years**, against yfinance's eight days of 1-minute and about sixty of
-5-minute. Frames come back in the same column shape the rest of the project
-consumes, so they drop into `edge_lab` without translation, and `oi=True`
-adds historical open interest - the one field NSE never publishes, and the
-one every past-date replay previously had to discard as lookahead.
+six years**, where yfinance served eight days of 1-minute and about sixty of
+5-minute. That gap is the whole reason this migration was worth doing.
+Frames come back in the same column shape the rest of the project consumes,
+so they drop into `edge_lab` without translation, and `oi=True` adds
+historical open interest - the one field NSE never publishes. Note that no
+caller passes `oi=True` yet: the scanner and the dashboard still drop open
+interest for a replayed session and say so. The capability is there, unused.
 
 That depth is what turns the edge search from suggestive into conclusive.
 The current measurement rests on 49 correlated sessions; a year of Kite data
@@ -465,8 +477,10 @@ Streamlit re-executes its script on every interaction, so a thread started
 there duplicates across reruns and dies with the session. This one owns one
 socket and one file, and keeps recording while nobody is watching.
 
-This is the only genuinely live source in the project. yfinance serves NSE
-roughly fifteen minutes late, so no polling frequency ever made it current.
+The tick feed is push rather than poll, which is what separates it from
+`kite_client.quote()`. The quote endpoint is live but sampled: you learn the
+last price at the moment you asked. The tick stream delivers every change,
+which is the only way to reconstruct what happened between two polls.
 
 ## Measuring a rule before trusting it
 
@@ -576,12 +590,17 @@ Copy-Item holdings.example.csv holdings.csv
 Copy-Item targets.example.yaml targets.yaml
 ```
 
-Live prices for the planner come from yfinance (bare NSE symbols get a
-`.NS` suffix), which serves NSE roughly fifteen minutes late. The intraday
-scanner can additionally read genuinely live prices from Zerodha Kite; see
-the Zerodha Kite section. If yfinance is
-unreachable the planner falls back to the price column in your CSV and says so in the
-report. `--offline` skips the network entirely.
+Live prices for the planner come from Kite's quote endpoint - the actual
+last traded price, not the previous close, which is what you want when
+sizing an order. Symbols are bare NSE tradingsymbols; the `.NS` suffix went
+with yfinance.
+
+This means the planner needs a Kite session. If there is none, or a symbol
+returns no price, the planner falls back to the price column in your CSV and
+says which prices came from where in the report - look for the `Prices:`
+line, which reads `kite (live)`, `kite 9/11, 2 from csv`, or `csv (no live
+prices - is there a Kite session?)`. `--offline` skips the network entirely
+and is the way to run this without logging in at all.
 
 ### The cadence: why it is safe to run daily
 

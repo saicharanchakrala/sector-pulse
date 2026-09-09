@@ -1,15 +1,16 @@
-"""Batched bar downloads for the intraday scanner.
+"""Bar loading for the intraday scanner, on top of the Kite source.
 
-Scanning 210 symbols one request at a time would take minutes and get rate
-limited, so tickers go out in chunks and each chunk is unpacked into
-per-symbol OHLCV frames. Nothing here raises: a chunk that fails is logged
-and omitted, and the report says how many symbols actually returned data so
-a half-empty scan cannot be mistaken for a quiet market.
+This module was the seam where a real broker feed would replace yfinance,
+and that has now happened: market_source fetches from Kite and hands back
+one flat OHLCV frame per symbol. The claim that nothing downstream would
+change held - no indicator, gate or level was touched by the swap.
 
-This module is the seam where a real broker feed would replace yfinance.
-Everything downstream consumes plain OHLCV frames, so a Kite Connect
-provider only has to produce the same shape - no indicator, gate or level
-would change.
+Nothing here raises. A symbol that fails is logged and omitted, and the
+report says how many actually returned data, so a half-empty scan cannot be
+mistaken for a quiet market. The one thing that DOES now raise upstream is
+the absence of a Kite session, and market_source raises rather than
+returning empty precisely so it cannot be mistaken for a quiet market
+either.
 """
 from __future__ import annotations
 
@@ -18,15 +19,11 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 
 import pandas as pd
-import yfinance as yf
 
 import config
 import indicators
-from intraday import field_series
-
+import market_source
 logger = logging.getLogger(__name__)
-
-_FIELDS = ("Open", "High", "Low", "Close", "Volume")
 
 
 @dataclass
@@ -44,95 +41,76 @@ class BarSet:
         return len(self.intraday)
 
 
-def chunks(items: list[str], size: int) -> list[list[str]]:
-    """Split a list into consecutive chunks of at most `size`."""
-    if size <= 0:
-        raise ValueError(f"chunk size must be positive, got {size}")
-    return [items[i:i + size] for i in range(0, len(items), size)]
+def _fetch(symbols: list[str], start: date, end: date,
+           interval: str) -> dict[str, pd.DataFrame]:
+    """Bars per symbol from Kite, or {} rather than raising.
 
-
-def _download(tickers: list[str], period: str, interval: str,
-              start=None, end=None) -> "pd.DataFrame | None":
-    """One batched yfinance call that returns None instead of raising.
-
-    `start`/`end` take precedence over `period` when given, which is how a
-    past-date replay pulls the window around that date instead of the most
-    recent one.
+    market_source returns one flat frame per symbol, so the MultiIndex
+    unpacking the yfinance path needed is gone from this route entirely.
     """
-    window = ({"start": start, "end": end} if start is not None
-              else {"period": period})
     try:
-        data = yf.download(tickers, interval=interval, auto_adjust=True,
-                           progress=False, group_by="column", **window)
-    except Exception as exc:  # yfinance raises heterogeneous network errors
-        logger.warning("Download failed for %d ticker(s) at %s (%s): %s",
-                       len(tickers), interval, window, exc)
-        return None
-    if data is None or data.empty:
-        logger.warning("No %s data returned for %d ticker(s)",
-                       interval, len(tickers))
-        return None
-    return data
-
-
-def _unpack(data: pd.DataFrame, tickers: list[str]) -> dict[str, pd.DataFrame]:
-    """Split a batched frame into one OHLCV frame per ticker.
-
-    A ticker missing Close is dropped outright; a ticker missing Volume is
-    kept, because VWAP and relative volume already fail closed on absent
-    volume and the remaining gates still say something useful.
-    """
-    out: dict[str, pd.DataFrame] = {}
-    for ticker in tickers:
-        columns: dict[str, pd.Series] = {}
-        for name in _FIELDS:
-            series = field_series(data, name, ticker, tickers)
-            if series is not None and not series.empty:
-                columns[name] = series
-        if "Close" not in columns:
-            continue
-        frame = pd.DataFrame(columns).sort_index()
-        if not frame.empty:
-            out[ticker] = frame
-    return out
+        return market_source.bars(symbols, start, end, interval=interval)
+    except market_source.NoSession as exc:
+        logger.warning("%s", exc)
+        return {}
+    except Exception as exc:  # network and parse failures are heterogeneous
+        logger.warning("Fetch failed for %d symbol(s) at %s: %s",
+                       len(symbols), interval, exc)
+        return {}
 
 
 def replay_window(target: date,
                   lookback_days: int = config.SCAN_REPLAY_LOOKBACK_DAYS
-                  ) -> tuple[str, str]:
-    """The (start, end) yfinance needs to cover one past session plus context.
+                  ) -> tuple[date, date]:
+    """The (start, end) span covering one past session plus its context.
 
-    `end` is exclusive in yfinance, so it sits the day after the target.
+    Both ends are inclusive, which differs from the yfinance route this
+    replaced: Kite treats `to` as inclusive, so the end is the target date
+    itself rather than the day after it.
     """
     start = target - timedelta(days=max(1, lookback_days))
-    return start.isoformat(), (target + timedelta(days=1)).isoformat()
+    return start, target
+
+
+def _lookback_days(spec: str, default: int) -> int:
+    """Calendar days from a '10d' or '3mo' style span.
+
+    Delegates so this and edge_lab cannot drift apart; see
+    market_source.calendar_days for why "10d" is not ten days.
+    """
+    return market_source.calendar_days(spec, default)
 
 
 def fetch_bars(tickers: list[str], batch_size: int = config.SCAN_BATCH_SIZE,
                target: "date | None" = None) -> BarSet:
-    """Fetch intraday and daily bars for every ticker, in batches.
+    """Fetch intraday and daily bars for every symbol from Kite.
 
-    With `target` set, the window is pulled around that date instead of the
-    latest sessions, which is what makes a past-date replay possible at all.
+    With `target` set, the window ends at that date instead of today, which
+    is what makes a past-date replay possible at all.
+
+    `batch_size` is retained for callers that still pass it but no longer
+    batches anything: Kite is queried per instrument and paced centrally at
+    its documented rate, so grouping symbols buys nothing. It is kept rather
+    than removed to avoid breaking a caller for no gain.
     """
     unique = list(dict.fromkeys(t for t in tickers if t))
     if not unique:
         return BarSet({}, {}, 0, [])
-    start = end = None
+    end = target or date.today()
+    fine_days = _lookback_days(config.SCAN_BAR_LOOKBACK, 10)
+    coarse_days = _lookback_days(config.SCAN_DAILY_LOOKBACK, 92)
     if target is not None:
-        start, end = replay_window(target)
-    intraday: dict[str, pd.DataFrame] = {}
-    daily: dict[str, pd.DataFrame] = {}
-    for batch in chunks(unique, batch_size):
-        fine = _download(batch, config.SCAN_BAR_LOOKBACK,
-                         config.SCAN_BAR_INTERVAL, start=start, end=end)
-        if fine is not None:
-            intraday.update(_unpack(fine, batch))
-        coarse = _download(batch, config.SCAN_DAILY_LOOKBACK, "1d",
-                           start=start, end=end)
-        if coarse is not None:
-            daily.update(_unpack(coarse, batch))
-        logger.info("Fetched %d/%d symbols so far", len(intraday), len(unique))
+        # One definition of the replay window, not two. This used to compute
+        # its own span inline while replay_window sat unused beside it under
+        # a different rule.
+        fine_start, end = replay_window(target, max(
+            fine_days, config.SCAN_REPLAY_LOOKBACK_DAYS))
+        fine_days = (end - fine_start).days
+
+    intraday = _fetch(unique, end - timedelta(days=fine_days), end,
+                      config.SCAN_BAR_INTERVAL)
+    daily = _fetch(unique, end - timedelta(days=coarse_days), end, "day")
+    logger.info("Fetched %d/%d symbols", len(intraday), len(unique))
     failed = [t for t in unique if t not in intraday]
     if failed:
         logger.warning("No intraday bars for %d symbol(s): %s",

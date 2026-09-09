@@ -1,14 +1,16 @@
 # Sector Pulse - Build Specification
 
 A local Streamlit dashboard that gathers finance + major world news from free RSS
-feeds, measures sector index/ETF price momentum via yfinance, scores a market
+feeds, measures sector index/ETF price momentum from Zerodha Kite, scores a market
 profile's sectors on a composite of news sentiment and momentum, and ranks where to
-consider investing. Markets are config-driven **profiles** (US and IN today) - each
+consider investing. Markets are config-driven **profiles** (IN today) - each
 profile bundles its feeds, sector definitions, and sentiment-lexicon additions.
 **Educational tool - not financial advice.** The UI must say so prominently.
 
-No API keys are required to run the core app. `ANTHROPIC_API_KEY` optionally enables an
-AI narrative-analysis section.
+Every price comes from Kite, which needs a paid subscription and an interactive
+login whose token expires around 6am daily. The news and sentiment half runs
+unauthenticated; momentum, the intraday scanner and the planner do not.
+`ANTHROPIC_API_KEY` optionally enables an AI narrative-analysis section.
 
 ## File map and ownership
 
@@ -17,13 +19,13 @@ AI narrative-analysis section.
 | `models.py` | Shared dataclasses (pre-written - do not modify) | core |
 | `config.py` | Tunables + `DEFAULT_MARKET` | core |
 | `profiles/__init__.py` | `MarketProfile` dataclass, `PROFILES` registry, `get_profile()` | core |
-| `profiles/us.py` | US profile: SPDR ETF sectors + US/world feeds | news agent |
 | `profiles/india.py` | IN profile: Nifty sectoral indices + Indian press feeds | news agent |
 | `news_fetcher.py` | Concurrent RSS fetching, parsing, dedupe | news agent |
 | `analyzer.py` | Classification, sentiment, composite scoring | analysis agent |
-| `market_data.py` | yfinance sector ETF momentum | market agent |
+| `market_source.py` | the single price source: Kite symbols, bars, quotes | market agent |
+| `market_data.py` | sector ETF momentum from Kite daily bars | market agent |
 | `claude_insights.py` | Optional Claude narrative analysis | insights agent |
-| `intraday.py` | yfinance intraday ETF snapshots | market agent |
+| `intraday.py` | intraday ETF snapshots from Kite | market agent |
 | `indicators.py` | pure intraday maths | intraday agent |
 | `levels.py` | entry/stop/target/size geometry | intraday agent |
 | `setups.py` | intraday gates and ranking | intraday agent |
@@ -63,7 +65,7 @@ profile.sectors ──> market_data.get_sector_momentum(profile=...) ──> dic
 ```python
 @dataclass(frozen=True)
 class MarketProfile:
-    key: str                       # "US" | "IN"
+    key: str                       # "IN" (the US profile was removed with yfinance)
     label: str
     currency: str
     feeds: list[dict]              # {"name", "url", "category"} - see news feeds below
@@ -82,16 +84,17 @@ falls back to the configured default, then to the registry's first entry.
 
 ### Sector universes
 
-- **US** (`profiles/us.py`, 11 GICS sectors): Technology/XLK, Financials/XLF,
-  Energy/XLE, Healthcare/XLV, Industrials/XLI, Consumer Discretionary/XLY,
-  Consumer Staples/XLP, Utilities/XLU, Materials/XLB, Real Estate/XLRE,
-  Communication Services/XLC.
-- **IN** (`profiles/india.py`, 12 Nifty sectoral indices): Banks/^NSEBANK,
-  Financial Services/NIFTY_FIN_SERVICE.NS, IT/^CNXIT, Pharma/^CNXPHARMA,
-  Auto/^CNXAUTO, FMCG/^CNXFMCG, Metal/^CNXMETAL, Energy/^CNXENERGY,
-  Realty/^CNXREALTY, Infrastructure/^CNXINFRA, PSU Banks/^CNXPSUBANK,
-  Media/^CNXMEDIA. Feeds are the major Indian financial press plus three global
-  feeds (category `"world"`) because Indian markets move on global cues.
+- **IN** (`profiles/india.py`, 12 Nifty sectoral indices), as Kite names them:
+  Banks/NIFTY BANK, Financial Services/NIFTY FIN SERVICE, IT/NIFTY IT,
+  Pharma/NIFTY PHARMA, Auto/NIFTY AUTO, FMCG/NIFTY FMCG, Metal/NIFTY METAL,
+  Energy/NIFTY ENERGY, Realty/NIFTY REALTY, Infrastructure/NIFTY INFRA,
+  PSU Banks/NIFTY PSU BANK, Media/NIFTY MEDIA. Feeds are the major Indian
+  financial press plus three global feeds (category `"world"`) because Indian
+  markets move on global cues.
+- **US** was eleven SPDR sector ETFs and was removed with yfinance: Kite serves
+  no US instrument, so the profile could not be migrated. `market_source`
+  still translates the old Yahoo spellings (`^NSEI`, a trailing `.NS`) so a
+  string written before the migration resolves, but new code uses Kite names.
 
 Each `profile.feeds` entry is `{"name": str, "url": str, "category": "business" |
 "world" | "markets"}` - free, live-verified RSS/Atom feeds. Each
@@ -130,16 +133,26 @@ def get_sector_momentum(
 ```
 - `profile=None` resolves via `get_profile()`. The ticker per sector is
   `profile.trade_etfs.get(sector)` when present, else `sectors[s].etf` - the
-  tradeable ETF is both what you buy and far better served by yfinance.
-- One batched `yf.download([all profile tickers], period="6mo", interval="1d",
-  auto_adjust=True, progress=False)` call; read Close prices per ticker.
+  tradeable ETF is what you buy, so its own history, carrying its own premium
+  and tracking error, is the relevant one.
+- One `market_source.daily_bars(tickers, months=6)` call, which returns a flat
+  OHLCV frame per symbol; read `frame["Close"]` per ticker.
 - For each window in `config.MOMENTUM_WINDOWS` (`"5d": (weight, scale_pct)`, ...):
   pct return over the trailing N trading days = `(last / close[-(N+1)] - 1) * 100`
   (skip window if insufficient history or NaN).
 - `score = sum(weight * tanh(return_pct / scale_pct))` over available windows,
   renormalized by the sum of used weights → roughly [-1, 1].
-- Omit sectors with no usable data. Any network/yfinance failure → `logger.warning`
-  and return `{}`. Never raises.
+- Omit sectors with no usable data. Any network failure, and a missing Kite
+  session, → `logger.warning` and return `{}`. Never raises. (`market_source`
+  raises `NoSession`; this module catches it, because news-only scores are a
+  survivable degradation. `market_source.bars` handles `KiteError`,
+  `ValueError` and `OSError` itself, and `kite_instruments.fetch_master`
+  returns `[]` rather than raising, so `NoSession` is the only escape left.)
+- The planner catches `NoSession` too, but must not degrade *silently*: it
+  falls back to the CSV price per symbol and names the source in its report
+  (`kite (live)` / `kite 9/11, 2 from csv` / `csv (no live prices…)`), and
+  `build_plan` raises `HoldingsError` when nothing at all could be priced.
+  An unpriced book must never be mistaken for an empty one.
 
 ### analyzer.py
 ```python
@@ -178,7 +191,7 @@ def analyze(
 class IntradaySnapshot:
     ticker: str
     last_price: float
-    asof: datetime                  # tz-aware, exchange tz as returned by yfinance
+    asof: datetime                  # tz-aware, IST as returned by Kite
     day_change_pct: float           # last vs previous session close
     last_hour_change_pct: float     # last vs ~12 5-minute bars earlier
     range_position: float           # (last - day_low) / (day_high - day_low), 0..1
@@ -378,9 +391,11 @@ relative volume rejected 84 and reachability 8. The cost and win-rate gates
 rejected 0 of 115. The trail implies nine filters; one does the work.
 
 #### scan_data.py
-The seam where a broker feed replaces yfinance. Everything downstream
-consumes plain OHLCV frames, so a Kite provider changes no indicator, gate
-or level. `truncate` implements non-negotiable 2.
+The seam where a broker feed replaced yfinance, and that has now happened:
+`market_source` fetches from Kite and hands back one flat OHLCV frame per
+symbol. The claim that nothing downstream would change held - no indicator,
+gate or level was touched by the swap. `truncate` implements
+non-negotiable 2.
 
 #### instruments.py, discover.py
 No hardcoded symbol list anywhere. The index-versus-stock split derives from
@@ -433,7 +448,10 @@ that overstates its own packet count.
 ## Error-handling policy (all modules)
 
 - The app must keep working when any single data source is down: dead feed → skip;
-  yfinance down → news-only scores; no API key → no AI section.
+  no Kite session → news-only scores; no API key → no AI section. The one
+  deliberate exception is the planner, which must NOT degrade silently: with no
+  prices it falls back to CSV values and labels them, because an unpriced book
+  looks like an empty one.
 - Catch *specific* exceptions (`requests.RequestException`, `KeyError`, etc.) close to
   the call site. Never bare `except:`; never `except Exception: pass`.
 - `logging.getLogger(__name__)` per module; lazy `%s` formatting in log calls
