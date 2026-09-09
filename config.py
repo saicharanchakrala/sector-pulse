@@ -259,3 +259,9 @@ KITE_HISTORICAL_DEFAULT_SPAN = 60      # used for any interval not listed
 # Kite documents 3 requests/second for historical data. Pacing at 3/s keeps
 # a 1,500-request sweep inside the limit instead of collecting 429s.
 KITE_HISTORICAL_RATE_PER_SEC = 3.0
+# /quote is documented at 1 request/second, stricter than historical. It is a
+# separate budget with a separate clock in kite_client: pacing both endpoint
+# classes off one timestamp would let a quote sweep spend the historical
+# allowance, and pacing them together at the stricter rate would throw away
+# two thirds of the historical one.
+KITE_QUOTE_RATE_PER_SEC = 1.0

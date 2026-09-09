@@ -234,6 +234,48 @@ def _get(session: Session, path: str, params: "dict | None" = None) -> dict:
         raise KiteError(f"Non-JSON reply from {path}") from exc
 
 
+_PACE_HISTORICAL = "historical"
+_PACE_QUOTE = "quote"
+# Read through a callable so the rate is looked up when a request is about to
+# go out rather than when this module is imported, which is what makes the
+# limit configurable at run time.
+_PACE_RATES = {
+    _PACE_HISTORICAL: lambda: config.KITE_HISTORICAL_RATE_PER_SEC,
+    _PACE_QUOTE: lambda: config.KITE_QUOTE_RATE_PER_SEC,
+}
+# One last-start timestamp per endpoint class, never one shared stamp: Kite
+# meters /quote and historical separately, so sharing would have quote calls
+# spending the historical budget and vice versa.
+_LAST_CALL: dict[str, float] = {}
+_PACE_LOCK = threading.Lock()
+
+
+def _pace(rate_per_sec: "float | None" = None,
+          slot: str = _PACE_HISTORICAL) -> None:
+    """Block until another request in this endpoint class may start.
+
+    Kite documents 3 requests a second for historical data and 1 a second
+    for /quote, and exceeding either returns 429s that look like missing
+    data downstream. An unknown slot raises rather than defaulting to some
+    rate, because guessing a limit here means guessing wrong quietly.
+
+    The sleep happens while the lock is held, and that is what makes the
+    gate correct: two concurrent callers cannot both read the same
+    last-start time and then both go. What overlaps between callers is the
+    network round trip after this returns, not the wait.
+    """
+    if rate_per_sec is None:
+        rate_per_sec = _PACE_RATES[slot]()
+    if rate_per_sec <= 0:
+        return
+    gap = 1.0 / rate_per_sec
+    with _PACE_LOCK:
+        wait = gap - (time.monotonic() - _LAST_CALL.get(slot, 0.0))
+        if wait > 0:
+            time.sleep(wait)
+        _LAST_CALL[slot] = time.monotonic()
+
+
 def profile(session: "Session | None" = None) -> dict:
     """The logged-in user's profile: the cheapest way to test a session."""
     live = session or load_session()
@@ -243,7 +285,12 @@ def profile(session: "Session | None" = None) -> dict:
 
 
 def quote(instruments: list[str], session: "Session | None" = None) -> dict:
-    """Full quotes for up to 500 instruments, e.g. ["NSE:RELIANCE"]."""
+    """Full quotes for up to 500 instruments, e.g. ["NSE:RELIANCE"].
+
+    Paced on the quote budget, which Kite meters at 1 request a second:
+    a caller walking a universe in 500-name batches otherwise collects
+    429s, and a 429 arrives here as a KiteError, not as a quote.
+    """
     live = session or load_session()
     if live is None:
         raise KiteError("No Kite session. Run kite_login first.")
@@ -252,36 +299,19 @@ def quote(instruments: list[str], session: "Session | None" = None) -> dict:
     if len(instruments) > 500:
         raise ValueError(f"Kite caps a quote call at 500 instruments, "
                          f"got {len(instruments)}")
+    _pace(slot=_PACE_QUOTE)
     return _get(live, "/quote", params=[("i", i) for i in instruments])
-
-
-_LAST_CALL = [0.0]
-_PACE_LOCK = threading.Lock()
-
-
-def _pace(rate_per_sec: float = config.KITE_HISTORICAL_RATE_PER_SEC) -> None:
-    """Block until another request may start, at most  per second.
-
-    Kite documents 3 requests a second for historical data, and exceeding it
-    returns 429s that look like missing data downstream. The gate is global
-    and lock-protected because callers fetch concurrently to hide round-trip
-    latency: request starts are serialised here, the waiting is not.
-    """
-    if rate_per_sec <= 0:
-        return
-    gap = 1.0 / rate_per_sec
-    with _PACE_LOCK:
-        wait = gap - (time.monotonic() - _LAST_CALL[0])
-        if wait > 0:
-            time.sleep(wait)
-        _LAST_CALL[0] = time.monotonic()
 
 
 def historical(instrument_token: int, start: date, end: date,
                interval: str = "5minute", continuous: bool = False,
                oi: bool = False,
                session: "Session | None" = None) -> pd.DataFrame:
-    """Candles for one instrument, paged over Kite's 60-day request cap.
+    """Candles for one instrument, paged over Kite's per-request day cap.
+
+    The cap depends on the candle size, not on a single 60-day figure:
+    KITE_HISTORICAL_MAX_DAYS holds the table and any interval missing from
+    it falls back to the narrowest span rather than the widest.
 
     Returns a tz-aware DataFrame with the same Open/High/Low/Close/Volume
     column names the rest of this project uses, so a frame from here drops
@@ -305,7 +335,7 @@ def historical(instrument_token: int, start: date, end: date,
             params["continuous"] = "1"
         if oi:
             params["oi"] = "1"
-        _pace()
+        _pace(slot=_PACE_HISTORICAL)
         data = _get(live, f"/instruments/historical/{instrument_token}/{interval}",
                     params=params)
         candles = data.get("candles") or []
