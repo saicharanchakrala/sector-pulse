@@ -93,24 +93,16 @@ def tag(stop_fraction: float, reward: float) -> str:
 
 def day_bootstrap(values: np.ndarray, days: np.ndarray,
                   draws: int = 1500) -> tuple:
-    """(mean, lo, hi, one-sided p for mean>0) resampling whole session-days."""
-    if values.size == 0:
-        return float("nan"), float("nan"), float("nan"), float("nan")
-    order = np.argsort(days, kind="stable")
-    values, days = values[order], days[order]
-    edges = np.flatnonzero(np.r_[True, days[1:] != days[:-1]])
-    blocks = np.split(values, edges[1:])
-    if len(blocks) < 5:
-        return float(values.mean()), float("nan"), float("nan"), float("nan")
-    rng = np.random.default_rng(SEED)
-    n = len(blocks)
-    means = np.empty(draws)
-    for d in range(draws):
-        pick = rng.integers(0, n, size=n)
-        means[d] = np.concatenate([blocks[p] for p in pick]).mean()
-    lo, hi = np.percentile(means, [2.5, 97.5])
-    return (float(values.mean()), float(lo), float(hi),
-            float((means <= 0.0).mean()))
+    """(mean, lo, hi, one-sided p for mean>0) resampling whole session-days.
+
+    The third verbatim copy of this routine, now delegating like the other
+    two: the tested implementation should be the one producing the figures
+    this project publishes. Identical by inspection - same stable argsort,
+    same block edges, same seed, same five-block floor, same percentiles
+    and the same one-sided p definition.
+    """
+    return forecast_stats.block_bootstrap(values, days, draws=draws,
+                                          seed=SEED)
 
 
 def build_folds(days: list) -> list:

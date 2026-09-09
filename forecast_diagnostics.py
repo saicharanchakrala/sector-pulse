@@ -33,6 +33,7 @@ import pandas as pd
 
 import config          # noqa: E402
 import edge_lab        # noqa: E402
+import forecast_stats  # noqa: E402
 import indicators      # noqa: E402
 import setups          # noqa: E402
 from setups import Readings  # noqa: E402
@@ -369,21 +370,31 @@ def block_bootstrap_mean(data: pd.DataFrame, column: str,
 
     Resampling individual signals would treat correlated same-day trades as
     independent and shrink the interval to nothing. The day is the block.
+
+    Delegates to forecast_stats, which is tested, rather than keeping the
+    second copy this used to be. Agreement was verified to zero absolute
+    difference across 40 randomised trials - but NOT unconditionally, and
+    the difference is deliberate in both places it appears:
+
+      * Fewer than five day-blocks now returns a NaN interval instead of a
+        number. One day of signals cannot support a bootstrap interval,
+        and the old body returned [obs, obs] for a single block, which
+        reads as perfect precision. Per-decile calls with a thin decile
+        will therefore show [nan, nan] where they used to show a range.
+      * Rows with a NaN `day` used to be dropped silently by groupby and
+        are now kept as their own block, which widens the interval rather
+        than quietly discarding data.
+
+    The p-value is dropped on the way out only to keep this function's
+    existing three-value signature; callers wanting it use forecast_stats
+    directly.
     """
-    if data.empty:
+    if data.empty or column not in data.columns:
         return float("nan"), float("nan"), float("nan")
-    by_day = [group[column].to_numpy() for _, group in data.groupby("day")]
-    if not by_day:
-        return float("nan"), float("nan"), float("nan")
-    rng = np.random.default_rng(20260909)
-    n = len(by_day)
-    means = np.empty(draws)
-    for d in range(draws):
-        pick = rng.integers(0, n, size=n)
-        means[d] = np.concatenate([by_day[p] for p in pick]).mean()
-    observed = data[column].mean()
-    lo, hi = np.percentile(means, [2.5, 97.5])
-    return float(observed), float(lo), float(hi)
+    mean, low, high, _ = forecast_stats.block_bootstrap(
+        data[column].to_numpy(dtype=float), data["day"].to_numpy(),
+        draws=draws)
+    return mean, low, high
 
 
 def spearman(left: pd.Series, right: pd.Series) -> float:

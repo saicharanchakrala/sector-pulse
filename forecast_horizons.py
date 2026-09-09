@@ -31,6 +31,8 @@ from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import roc_auc_score
 
+import forecast_stats
+
 ROOT = Path(__file__).resolve().parent
 CACHE = ROOT / "bar_cache"
 OUT_DIR = ROOT / "forecast_cache"
@@ -108,24 +110,15 @@ def date_bootstrap(values: np.ndarray, dates: np.ndarray,
 
     Every name selected on the same date shares that date's market move, so
     the date is the unit of independence, not the row.
+
+    This was its own copy of the routine, which meant the figures this
+    project publishes were produced by code with no tests while the tested
+    implementation in forecast_stats had no callers. Verified identical to
+    zero absolute difference on all four returned values across 40
+    randomised trials before being replaced by the call.
     """
-    if values.size == 0:
-        return float("nan"), float("nan"), float("nan"), float("nan")
-    order = np.argsort(dates, kind="stable")
-    values, dates = values[order], dates[order]
-    edges = np.flatnonzero(np.r_[True, dates[1:] != dates[:-1]])
-    blocks = np.split(values, edges[1:])
-    if len(blocks) < 5:
-        return float(values.mean()), float("nan"), float("nan"), float("nan")
-    rng = np.random.default_rng(SEED)
-    n = len(blocks)
-    means = np.empty(draws)
-    for d in range(draws):
-        pick = rng.integers(0, n, size=n)
-        means[d] = np.concatenate([blocks[p] for p in pick]).mean()
-    lo, hi = np.percentile(means, [2.5, 97.5])
-    return (float(values.mean()), float(lo), float(hi),
-            float((means <= 0.0).mean()))
+    return forecast_stats.block_bootstrap(values, dates, draws=draws,
+                                          seed=SEED)
 
 
 def folds_for(dates: list, embargo_sessions: int) -> list:
