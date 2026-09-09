@@ -41,3 +41,13 @@ tick_store/
 
 # Rotated scan logs, kept when the column set changes
 scan_log.csv.superseded*
+
+# Forecasting datasets: derived from bar_cache, large, regenerable.
+forecast_cache/
+
+# Bars built from the live tick stream, plus the feed PID lock.
+# Regenerable from the feed and the historical cache.
+live_bars/
+
+# Local agent scratch: launch config is kept, worktrees are not.
+.claude/worktrees/
