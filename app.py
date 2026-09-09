@@ -44,6 +44,7 @@ import option_history
 import glossary
 import horizons
 import instrument_report
+import instrument_search
 import setups
 import trade_costs
 from levels import LONG
@@ -639,9 +640,9 @@ def scan_frame(actionable: list[setups.Setup]) -> pd.DataFrame:
         rows.append({
             "Symbol": s.symbol,
             "Side": s.direction,
-            "Entry": round(s.levels.entry, 2),
-            "Stop": round(s.levels.stop, 2),
-            "Target": round(s.levels.target, 2),
+            "Entry price": round(s.levels.entry, 2),
+            "Stop loss at": round(s.levels.stop, 2),
+            "Exit price": round(s.levels.target, 2),
             "Qty": s.levels.quantity,
             "Risk": round(s.levels.lot_risk, 0),
             "Cost": round(s.levels.cost_rupees, 0),
@@ -711,6 +712,79 @@ def render_replay_controls() -> "datetime | None":
             f"at the time."
         )
     return moment
+
+
+def render_scan_refresh_controls(replaying: bool,
+                                 want_options: bool) -> "int | None":
+    """The auto-refresh toggle for the intraday scan, or None when idle.
+
+    The toggle is rendered OUTSIDE the refreshing fragment on purpose: a
+    control that redraws itself on every tick is hard to interact with.
+    """
+    enabled = st.checkbox(
+        "Keep this scan up to date while the feed is running",
+        value=False, key="scan_auto_refresh",
+        help="Re-runs the scan on a timer, so entry, stop and the gates "
+             "track the live bars instead of freezing at whenever you last "
+             "pressed Run. Off by default because each refresh re-scores "
+             "every symbol in scope - it is a real scan, not a repaint.")
+    if not enabled:
+        return None
+    requested = st.select_slider(
+        "Refresh every", options=list(config.SCAN_AUTO_REFRESH_CHOICES),
+        value=st.session_state.get("scan_auto_every",
+                                   config.SCAN_AUTO_REFRESH_SECONDS),
+        format_func=lambda s: f"{s}s" if s < 60 else f"{s // 60} min",
+        key="scan_auto_every")
+    feed = live_feed_state()
+    interval, note = scan_data.auto_refresh_interval(
+        enabled=True, requested=int(requested), replaying=replaying,
+        want_options=want_options,
+        in_trading_hours=live_bars_in_hours(),
+        feed_running=bool(feed.get("running")),
+        feed_age=feed.get("age_seconds", float("nan")),
+        last_scan_seconds=float(st.session_state.get("scan_seconds", 0.0)))
+    if note:
+        st.caption(f"Auto-refresh {'idle' if interval is None else 'adjusted'}"
+                   f" - {note}.")
+    return interval
+
+
+def live_bars_in_hours() -> bool:
+    """Whether the clock is inside NSE trading hours right now."""
+    try:
+        import live_bars
+        now = datetime.now(IST_ZONE)
+        return live_bars.in_session(live_bars.bucket_start(now))
+    except Exception:
+        return False
+
+
+def refresh_scan_fragment() -> None:
+    """Re-run the stored scan and render it. The auto-refresh body.
+
+    Inputs come from session state rather than from arguments because a
+    fragment on a timer is re-invoked by Streamlit, not by this script -
+    reading them back each tick is the only way to be sure they are the
+    ones currently on screen.
+    """
+    import time
+
+    params = st.session_state.get("scan_params")
+    if params is None:
+        st.info("Run a scan first; the timer refreshes an existing one.")
+        return
+    started = time.monotonic()
+    with st.spinner("refreshing from the live feed..."):
+        ranked, bars, benchmark, now, past = run_scan(
+            params["capital"], params["risk_pct"], params["scope"], None)
+    st.session_state["scan_seconds"] = time.monotonic() - started
+    st.session_state["scan"] = (ranked, bars, benchmark, now,
+                                params["want_options"], past)
+    st.caption(f"Auto-refreshed at {now:%H:%M:%S} IST in "
+               f"{st.session_state['scan_seconds']:.0f}s.")
+    render_scan_results(ranked, bars, benchmark, now,
+                        params["want_options"], past)
 
 
 def render_scan_controls() -> tuple[float, float, str, bool, "datetime | None", bool]:
@@ -1172,23 +1246,166 @@ def analyse_instrument(symbol: str, with_intraday: bool) -> dict:
         "lot_size": report.lot_size, "buys": report.buys,
         "as_of": report.as_of,
         "table": instrument_report.summary_frame(report),
+        "pivots": (None if report.pivots is None else
+                   {"S3": report.pivots.s3, "S2": report.pivots.s2,
+                    "S1": report.pivots.s1, "Pivot": report.pivots.pivot,
+                    "R1": report.pivots.r1, "R2": report.pivots.r2,
+                    "R3": report.pivots.r3}),
         "detail": {name: {"verdict": v.verdict, "blocker": v.blocker,
                           "reasons": v.reasons}
                    for name, v in report.verdicts.items()},
     }
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def search_instruments(text: str, limit: int = 25) -> list:
+    """Typeahead matches, cached so a keystroke does not rebuild anything.
+
+    Returned as plain tuples rather than Match objects: Streamlit pickles
+    whatever a cached function returns, and a tuple cannot go stale against
+    a code change to the dataclass.
+    """
+    return [(m.symbol, m.label, m.kind, m.underlying,
+             m.expiry, m.strike, m.right, m.lot_size)
+            for m in instrument_search.search(text, limit=limit)]
+
+
+def render_pivot_levels(levels: "dict | None", price: float) -> None:
+    """The previous session's pivot ladder, purely as reference levels.
+
+    Shown because they are on every broker's screen and cost nothing to
+    display. NOT used for anything: placing stops on them was built and
+    measured on 79,725 candidate stops across 249 dates, and paired within
+    the same session a pivot stop was hit +0.445 pp MORE often than one at
+    the same distance elsewhere (sign test p 0.37). So they are levels to
+    look at, not levels to trade against.
+    """
+    if not levels:
+        return
+    with st.expander("Yesterday's pivot levels"):
+        st.caption(
+            "Arithmetic from yesterday's high, low and close - fixed before "
+            "today's open, and the same numbers every broker shows. We "
+            "tested whether price actually turns at them and could not "
+            "show that it does, so treat them as landmarks rather than as "
+            "signals."
+        )
+        rows = [{"Level": name, "Price": round(value, 2),
+                 "vs now": f"{(value / price - 1.0) * 100:+.2f}%"}
+                for name, value in levels.items()]
+        # Resistances first, descending, so the ladder reads like a chart.
+        frame = pd.DataFrame(rows).sort_values("Price", ascending=False)
+        # show_table, not st.dataframe: every table in this app gets its
+        # tooltips from one helper, and bypassing it is how a column ends
+        # up explained in one place and bare in another.
+        show_table(frame)
+
+
+def render_derivative_panel(symbol: str, kind: str, underlying: str,
+                            expiry, strike: float, right: str,
+                            lot_size: int) -> None:
+    """What is known about a contract, and what is honestly not.
+
+    A derivative reaches here rather than the horizon assessment because
+    the consolidated store holds cash daily bars only, and the assessment
+    also assumes a 0.23% delivery round trip and a holding period bounded
+    by nothing but the horizon. Neither holds for a contract with an
+    expiry, so producing a number would be worse than declining to.
+    """
+    side = {"CE": "call", "PE": "put"}.get(right, "")
+    title = f"**{symbol}**  |  {underlying} {kind}"
+    if side:
+        title += f", {side} at {strike:,.0f}"
+    st.markdown(title)
+    left, mid, right_col = st.columns(3)
+    left.metric("Lot size", f"{lot_size:,}")
+    if expiry is not None:
+        days = (expiry - datetime.now(IST_ZONE).date()).days
+        mid.metric("Expires", f"{expiry:%d %b %Y}")
+        right_col.metric("Days left", days)
+        if days < 0:
+            st.error("This contract has already expired.")
+        elif days <= 7:
+            st.warning(
+                f"{days} day(s) to expiry. Time decay dominates an option "
+                f"this close to expiry, and the horizon buckets here start "
+                f"at 10 sessions - none of them fits."
+            )
+    st.info(
+        "**No horizon assessment for contracts yet, and that is a limit "
+        "rather than a verdict.** The short, mid and long assessments read "
+        "cash daily bars from the consolidated store, price a 0.23% "
+        "delivery round trip, and assume you can hold as long as the "
+        "horizon says. A contract has none of those properties - it has an "
+        "expiry, its own cost stack, and for an option a price that moves "
+        "with the underlying only partly. Analysing the underlying is the "
+        "closest honest answer."
+    )
+    if underlying and st.button(f"Analyse {underlying} instead",
+                                key=f"jump_{symbol}"):
+        st.session_state["lookup_last"] = underlying
+        st.session_state["lookup_symbol"] = underlying
+        st.rerun()
+    if kind == instrument_search.KIND_OPTION:
+        render_option_cost_arithmetic(lot_size)
+
+
+def render_option_cost_arithmetic(lot_size: int) -> None:
+    """The one part of an option that IS measurable: what it costs to trade.
+
+    Charged on premium turnover, with brokerage a FLAT 20 rupees an order.
+    That is why a cheap option is expensive: the flat fee is a percentage
+    of premium that grows as the premium shrinks, and on a small position
+    it can dwarf every exchange charge put together.
+    """
+    with st.expander("What a round trip on this contract costs", expanded=True):
+        st.caption(
+            "This is arithmetic, not a forecast, and it is the half of this "
+            "tool that held up under measurement. Enter the premium you "
+            "would pay and it says how far the option has to move before "
+            "you keep anything."
+        )
+        cols = st.columns(2)
+        premium = cols[0].number_input(
+            "Premium per share (Rs)", min_value=0.05, value=50.0, step=1.0,
+            help="The quoted option price, per share - not per lot.")
+        lots = cols[1].number_input("Lots", min_value=1, value=1, step=1)
+        breakeven = trade_costs.options_breakeven_pct(
+            float(premium), int(lots), int(lot_size or 1))
+        outlay = float(premium) * int(lots) * int(lot_size or 1)
+        charges = trade_costs.options_cost(
+            float(premium), float(premium), int(lots),
+            int(lot_size or 1)).total
+        one, two, three = st.columns(3)
+        one.metric("Premium outlay", f"Rs {outlay:,.0f}")
+        two.metric("Round-trip charges", f"Rs {charges:,.0f}")
+        three.metric("Breakeven move", f"{breakeven:.2f}%",
+                     help="How far the premium must rise before the trade "
+                          "makes anything after charges.")
+        if breakeven >= 5.0:
+            st.warning(
+                f"Charges are {breakeven:.1f}% of the premium. Being right "
+                f"about direction is not enough at that level - the move "
+                f"has to clear this before anything reaches you."
+            )
+
+
 def render_instrument_search() -> None:
     """Search one instrument and show its verdict at every horizon."""
     st.subheader("Look up one instrument")
     st.caption(
-        "Any NSE symbol, in or out of the F&O universe. Every gate is shown "
+        "Any NSE stock, future or option contract. Every gate is shown "
         "with the number behind it, so a NO BUY names what failed rather "
         "than just withholding."
     )
     left, middle, right = st.columns([3, 1, 1])
-    typed = left.text_input("Symbol", value="", placeholder="RELIANCE",
-                            key="lookup_symbol")
+    typed = left.text_input(
+        "Search stocks, futures and options", value="",
+        placeholder="RELIANCE, RELIANCE26SEPFUT, RELIANCE26SEP1400CE",
+        key="lookup_symbol",
+        help="Type any part of a symbol. Options are held back until four "
+             "characters, because two letters match tens of thousands of "
+             "strikes and would bury the stock you were after.")
     with_intraday = middle.checkbox("Include intraday", value=False,
                                     help="Needs 5-minute bars for today, so "
                                          "it is slower and only meaningful "
@@ -1198,18 +1415,40 @@ def render_instrument_search() -> None:
     # anything but a keyboard.
     right.markdown("&nbsp;")
     pressed = right.button("Analyse", key="lookup_go")
-    query = (typed or "").strip().upper()
-    if pressed and query:
-        st.session_state["lookup_last"] = query
+    text = (typed or "").strip()
+    query = ""
+    if text:
+        with st.spinner("searching..."):
+            matches = search_instruments(text.upper(), 25)
+        if not matches:
+            st.caption(f"nothing matched {text.upper()!r} - check the "
+                       f"spelling, or type more of the symbol")
+            return
+        # One exact hit needs no picker; anything else does, and the picker
+        # is the typeahead. Labels carry expiry, strike and lot size,
+        # because a bare list of near-identical symbols cannot be chosen
+        # between.
+        labels = [row[1] for row in matches]
+        chosen_label = st.selectbox(
+            f"{len(matches)} match(es)", labels, key="lookup_pick",
+            help="Ordered stock first, then futures by expiry, then option "
+                 "strikes - the underlying is usually what you want.")
+        picked = matches[labels.index(chosen_label)]
+        # Choosing from the picker IS the commit, so the Analyse button is
+        # only needed to re-run the same choice.
+        st.session_state["lookup_last"] = picked[0]
+        query = picked[0]
+        if picked[2] in (instrument_search.KIND_FUTURE,
+                         instrument_search.KIND_OPTION):
+            render_derivative_panel(picked[0], picked[2], picked[3],
+                                    picked[4], picked[5], picked[6],
+                                    picked[7])
+            return
     query = query or st.session_state.get("lookup_last", "")
     if not query:
-        options = instrument_report.suggest("", limit=10)
-        if options:
-            st.caption(f"e.g. {', '.join(options[:8])}")
+        st.caption("e.g. RELIANCE for a stock, RELIANCE26SEPFUT for a "
+                   "future, RELIANCE26SEP1400CE for an option")
         return
-    matches = instrument_report.suggest(query, limit=8)
-    if matches and query not in matches:
-        st.caption(f"did you mean: {', '.join(matches)}")
     with st.spinner(f"analysing {query}..."):
         report = analyse_instrument(query, with_intraday)
     if not report["found"]:
@@ -1239,6 +1478,7 @@ def render_instrument_search() -> None:
         show_table(table)
         show_terms("What the horizons mean", "Why charges matter so much",
                    "Why this tool will not predict for you")
+    render_pivot_levels(report.get("pivots"), report["price"])
     for name, detail in report["detail"].items():
         label = (f"{name} - {detail['verdict']}"
                  + (f" ({detail['blocker'].split(' [')[0]})"
@@ -1287,19 +1527,38 @@ def render_scan_tab() -> None:
     render_live_feed_panel()
     capital, risk_pct, scope, want_options, as_of, run = render_scan_controls()
     if run:
+        import time
+
         label = ("Downloading bars and evaluating setups..." if as_of is None
                  else f"Replaying {as_of:%Y-%m-%d %H:%M} IST...")
+        started = time.monotonic()
         with st.spinner(label):
             ranked, bars, benchmark, now, past = run_scan(
                 capital, risk_pct, scope, as_of)
+        # Measured so the auto-refresh cannot be set faster than a scan
+        # actually takes.
+        st.session_state["scan_seconds"] = time.monotonic() - started
         st.session_state["scan"] = (ranked, bars, benchmark, now,
                                     want_options, past)
+        # The inputs are kept beside the results so a timed refresh can
+        # reproduce the same scan without the widgets being on screen.
+        st.session_state["scan_params"] = {
+            "capital": capital, "risk_pct": risk_pct, "scope": scope,
+            "want_options": want_options}
     stored = st.session_state.get("scan")
     if stored is None:
         st.info("Set your capital and risk, then hit Run intraday scan. "
                 "The longer horizons below need no scan and no live feed.")
     else:
-        render_scan_results(*stored)
+        every = render_scan_refresh_controls(replaying=bool(stored[5]),
+                                             want_options=stored[4])
+        if every:
+            # Wrapped per script run rather than decorated once, because the
+            # interval is a user choice and `run_every` is fixed at
+            # decoration time.
+            st.fragment(refresh_scan_fragment, run_every=every)()
+        else:
+            render_scan_results(*stored)
 
     st.divider()
     discovered = instruments.load_latest()
