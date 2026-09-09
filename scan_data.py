@@ -34,6 +34,9 @@ class BarSet:
     daily: dict[str, pd.DataFrame]
     requested: int
     failed: list[str]
+    # Where the intraday bars came from. Defaults to the download so any
+    # caller that does not set it cannot accidentally claim to be live.
+    source: str = "download"
 
     @property
     def covered(self) -> int:
@@ -107,8 +110,19 @@ def fetch_bars(tickers: list[str], batch_size: int = config.SCAN_BATCH_SIZE,
             fine_days, config.SCAN_REPLAY_LOOKBACK_DAYS))
         fine_days = (end - fine_start).days
 
-    intraday = _fetch(unique, end - timedelta(days=fine_days), end,
-                      config.SCAN_BAR_INTERVAL)
+    intraday = {}
+    source = "download"
+    if target is None:
+        # Live scan: prefer bars the feed has already built from ticks.
+        # Costs no network and the newest bar is seconds old rather than
+        # minutes. A replay skips this entirely - there is no live feed for
+        # a past instant.
+        intraday = _live_intraday(unique)
+        if intraday:
+            source = "live feed"
+    if not intraday:
+        intraday = _fetch(unique, end - timedelta(days=fine_days), end,
+                          config.SCAN_BAR_INTERVAL)
     daily = _fetch(unique, end - timedelta(days=coarse_days), end, "day")
     logger.info("Fetched %d/%d symbols", len(intraday), len(unique))
     failed = [t for t in unique if t not in intraday]
@@ -116,7 +130,58 @@ def fetch_bars(tickers: list[str], batch_size: int = config.SCAN_BATCH_SIZE,
         logger.warning("No intraday bars for %d symbol(s): %s",
                        len(failed), ", ".join(failed[:10]))
     return BarSet(intraday=intraday, daily=daily,
-                  requested=len(unique), failed=failed)
+                  requested=len(unique), failed=failed, source=source)
+
+
+def _live_intraday(symbols: list[str]) -> dict:
+    """Prior sessions from cache plus today from the tick feed, or {}.
+
+    Returns {} rather than a partial answer when the feed has written
+    nothing for today, so the caller downloads instead of silently scanning
+    yesterday's close as though it were now.
+    """
+    try:
+        import live_bars
+        import market_source
+    except Exception as exc:                      # optional dependency path
+        logger.info("Live bars unavailable (%s); downloading", exc)
+        return {}
+    state = live_bars.status()
+    if not state.get("present") or not state.get("bars"):
+        logger.info("No live bars written today; downloading instead")
+        return {}
+    tokens = {}
+    for symbol in symbols:
+        token = market_source.token_for(symbol)
+        if token:
+            tokens[symbol] = token
+    try:
+        combined = live_bars.combined(symbols, tokens)
+    except Exception as exc:
+        logger.warning("Live bar assembly failed (%s); downloading", exc)
+        return {}
+    live_today = live_bars.load_today(tokens)
+    if not live_today:
+        return {}
+    logger.info("Live bars: %d symbols, %d with today's session, "
+                "newest %.0fs old", len(combined), len(live_today),
+                state.get("age_seconds", float("nan")))
+    return combined
+
+
+def _carry_source(original: BarSet, intraday: dict, daily: dict,
+                  failed: "list[str] | None" = None) -> BarSet:
+    """Rebuild a BarSet without losing where its bars came from.
+
+     must be passed by any caller that changes which symbols have
+    usable bars. truncate does: a symbol whose every bar sits after the
+    cutoff has no bars left and has to be reported as failed, or a replay
+    silently shrinks its own universe.
+    """
+    return BarSet(intraday=intraday, daily=daily,
+                  requested=original.requested,
+                  failed=list(original.failed if failed is None else failed),
+                  source=original.source)
 
 
 def truncate(bars: BarSet, cutoff) -> BarSet:
@@ -151,9 +216,10 @@ def truncate(bars: BarSet, cutoff) -> BarSet:
         keep = frame.loc[[ts for ts in frame.index if ts.date() < cutoff.date()]]
         if not keep.empty:
             coarse[ticker] = keep
-    return BarSet(intraday=fine, daily=coarse, requested=bars.requested,
-                  failed=[t for t in bars.failed] +
-                         [t for t in bars.intraday if t not in fine])
+    return _carry_source(
+        bars, fine, coarse,
+        failed=[t for t in bars.failed]
+               + [t for t in bars.intraday if t not in fine])
 
 
 def benchmark_change_pct(bars: BarSet, ticker: str = config.SCAN_BENCHMARK

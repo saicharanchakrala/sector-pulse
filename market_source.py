@@ -60,6 +60,18 @@ _LEGACY_ALIASES: dict[str, str] = {
     "^CNXINFRA": "NIFTY INFRA",
     "^CNXMEDIA": "NIFTY MEDIA",
     "NIFTY_FIN_SERVICE": "NIFTY FIN SERVICE",
+    # F&O UNDERLYING names, which differ from the cash index tradingsymbol.
+    # NSE's derivatives master calls the Bank Nifty underlying BANKNIFTY
+    # while Kite's cash instrument is "NIFTY BANK", so the live feed was
+    # refusing to subscribe to every index - including the benchmark that
+    # relative strength is measured against. Verified against Kite's own
+    # index list, which carries 236 names.
+    "NIFTY": "NIFTY 50",
+    "BANKNIFTY": "NIFTY BANK",
+    "FINNIFTY": "NIFTY FIN SERVICE",
+    "MIDCPNIFTY": "MIDSEL",
+    "NIFTYNXT50": "NIFTY NEXT 50",
+    "NIFTYFPI": "NIFTY FPI 150",
 }
 
 # Interval names differ between the two APIs. Kite's are the canonical ones
