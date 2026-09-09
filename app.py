@@ -4,9 +4,15 @@ Two tabs, two unrelated systems:
 
   Positional signal  blends RSS news sentiment with sector index/ETF momentum
                      into a composite score held for weeks.
-  Intraday scan      ranks NSE F&O names on VWAP, opening range, relative
-                     volume and volatility, and emits entry, stop, target and
-                     size for the same session.
+  Scan               screens NSE F&O names across FOUR holding periods:
+                     intraday (5-minute bars, session-time gated), then
+                     short, mid and long term (daily bars, no session
+                     gate). Each prices the trade - round-trip cost and
+                     whether the plausible move covers it - and ranks the
+                     top 20. It is a cost and risk screen, NOT a forecast:
+                     measured AUC 0.5205 against 0.5165 for the same model
+                     on shuffled labels, and at the daily horizons the
+                     selection was worse than equal-weighting.
 
 They share no thresholds and no data. Educational tool - not financial advice.
 """
@@ -35,7 +41,11 @@ import options_chain
 import scan_data
 import instruments
 import option_history
+import glossary
+import horizons
+import instrument_report
 import setups
+import trade_costs
 from levels import LONG
 from models import NewsItem, ScoredNewsItem, SectorMomentum, SectorScore
 from profiles import PROFILES, MarketProfile, get_profile
@@ -222,7 +232,9 @@ def render_sidebar() -> tuple[str, float, int]:
                 "VADER model scores headline sentiment, recency-weighted so fresh "
                 "news counts more. Each sector's index or ETF momentum is measured "
                 "over 5, 21 and 63 trading days from Kite daily bars. The score "
-                "blends news sentiment and momentum using the weight slider above."
+                "blends news sentiment and momentum using the weight slider "
+                "above. It has no backtest behind it: the intraday rule, "
+                "which was measured properly, turned out to have none."
             )
         st.warning("Educational tool - not financial advice.")
     return profile_key, news_weight, max_age_hours
@@ -316,7 +328,7 @@ def render_signal_result(top: dict | None, signal_dicts: list[dict]) -> None:
         rationale = top.get("explanation")
         if rationale:
             st.markdown(f"**Why:** {rationale}")
-    st.dataframe(signal_frame(signal_dicts), width="stretch", hide_index=True)
+    show_table(signal_frame(signal_dicts))
 
 
 def load_stored_signal(profile_key: str) -> "dict | None":
@@ -556,38 +568,96 @@ _SCAN_SCOPES: dict[str, "int | None"] = {
 
 @st.cache_data(ttl=config.CACHE_TTL_SECONDS, show_spinner=False)
 def load_scan_bars(tickers: tuple[str, ...],
-                   target: "date | None" = None) -> scan_data.BarSet:
-    """Download and cache intraday plus daily bars for a ticker tuple.
+                   target: "date | None" = None,
+                   live_stamp: str = "") -> scan_data.BarSet:
+    """Assemble intraday plus daily bars for a ticker tuple.
 
-    Cached on the tickers and the replay date, never on the clock, so the
-    gates are always re-evaluated against the chosen instant from bars that
-    may be a few minutes old. That is the right split: the download is the
-    slow part, and the remaining session time is what moves the levels. The
-    date belongs in the key because a past window is a different download.
+    Cached on the tickers, the replay date, and - for a live scan - the
+    newest live bar's timestamp. That last key matters: without it a cached
+    BarSet outlives the feed's newest bar and the scan keeps re-evaluating
+    gates against whatever it first saw, which defeats the point of
+    streaming. A past window is a different download, so the date belongs
+    in the key too.
     """
     return scan_data.fetch_bars(list(tickers), target=target)
 
 
+def live_bar_stamp() -> str:
+    """The newest live bar's time, as a cache key. Empty when no feed."""
+    try:
+        import live_bars
+        state = live_bars.status()
+    except Exception:
+        return ""
+    if not state.get("present") or not state.get("bars"):
+        return ""
+    latest = state.get("latest_bar")
+    return f"{latest}|{state.get('bars')}" if latest is not None else ""
+
+
+# Highest share of 5-minute setups that has ever resolved in the target's
+# favour in this project's measurements, across every geometry tried. Any
+# required win rate above it cannot be met by a rule of this kind, so the
+# row is flagged rather than silently ranked alongside the others.
+BEST_OBSERVED_WIN_RATE = 0.58
+
+
+def show_table(frame, target=None) -> None:
+    """Render a table with a plain-English tooltip on every column.
+
+    Routed through one helper so a column cannot be explained in one table
+    and left bare in another, and so improving a wording improves it
+    everywhere. Columns with no glossary entry simply render untouched.
+    """
+    surface = target if target is not None else st
+    surface.dataframe(frame, width="stretch", hide_index=True,
+                      column_config=glossary.config_for(frame, st))
+
+
+def show_terms(*names: str) -> None:
+    """An expander explaining the concepts behind a table."""
+    wanted = [n for n in names if n in glossary.CONCEPTS]
+    if not wanted:
+        return
+    with st.expander("What these terms mean"):
+        for name in wanted:
+            st.markdown(f"**{name}**")
+            st.caption(glossary.CONCEPTS[name])
+
+
 def scan_frame(actionable: list[setups.Setup]) -> pd.DataFrame:
-    """Ranked actionable setups as a display table."""
-    return pd.DataFrame([{
-        "Symbol": s.symbol,
-        "Side": s.direction,
-        "Score": round(s.rank_score, 3),
-        "Entry": round(s.levels.entry, 2),
-        "Stop": round(s.levels.stop, 2),
-        "Target": round(s.levels.target, 2),
-        "Stop %": round(s.levels.stop_pct, 2),
-        "Target %": round(s.levels.target_pct, 2),
-        "Qty": s.levels.quantity,
-        "Risk": round(s.levels.lot_risk, 0),
-        "Cost": round(s.levels.cost_rupees, 0),
-        "Win % needed": round(s.levels.required_win_rate * 100, 1),
-        "RVOL": round(s.readings.rvol or 0.0, 2),
-        "RS vs Nifty": round(s.readings.relative_strength or 0.0, 2),
-        "OI chg %": (round(s.readings.oi_change_pct, 2)
-                     if s.readings.oi_change_pct is not None else None),
-    } for s in actionable])
+    """Actionable setups as a display table, cost columns first.
+
+    Column order is deliberate. The cost and win-rate columns are
+    arithmetic and have held up under measurement; the rank score has not,
+    so it sits last and is labelled as unvalidated rather than presented as
+    a quality ordering.
+    """
+    rows = []
+    for s in actionable:
+        needed = s.levels.required_win_rate
+        rows.append({
+            "Symbol": s.symbol,
+            "Side": s.direction,
+            "Entry": round(s.levels.entry, 2),
+            "Stop": round(s.levels.stop, 2),
+            "Target": round(s.levels.target, 2),
+            "Qty": s.levels.quantity,
+            "Risk": round(s.levels.lot_risk, 0),
+            "Cost": round(s.levels.cost_rupees, 0),
+            "Win % needed": round(needed * 100, 1),
+            "Can pay for itself?": ("no - needs more than any measured rate"
+                                    if needed > BEST_OBSERVED_WIN_RATE
+                                    else "maybe"),
+            "Stop %": round(s.levels.stop_pct, 2),
+            "Target %": round(s.levels.target_pct, 2),
+            "Volume vs normal": round(s.readings.rvol or 0.0, 2),
+            "Strength vs Nifty": round(s.readings.relative_strength or 0.0, 2),
+            "OI chg %": (round(s.readings.oi_change_pct, 2)
+                         if s.readings.oi_change_pct is not None else None),
+            "Our ranking": round(s.rank_score, 3),
+        })
+    return pd.DataFrame(rows)
 
 
 def _session_bounds() -> tuple[time, time]:
@@ -648,16 +718,24 @@ def render_scan_controls() -> tuple[float, float, str, bool, "datetime | None", 
     left, mid, right = st.columns(3)
     with left:
         capital = st.number_input(
-            "Intraday capital", min_value=1_000.0, value=config.SCAN_CAPITAL,
-            step=10_000.0,
-            help="Position size is capped by this times MIS leverage.")
+            "Money available today", min_value=1_000.0,
+            value=config.SCAN_CAPITAL, step=10_000.0,
+            help="How much you have to trade with. Used only to work out "
+                 "how many shares would fit - it is not a suggestion to "
+                 "use all of it.")
     with mid:
         risk_pct = st.number_input(
-            "Risk per trade (%)", min_value=0.1, max_value=10.0,
-            value=config.SCAN_RISK_PCT_PER_TRADE, step=0.25,
-            help="Percent of capital lost if the stop fills exactly.")
+            "Most you would lose per trade (%)", min_value=0.1,
+            max_value=10.0, value=config.SCAN_RISK_PCT_PER_TRADE, step=0.25,
+            help="If the trade goes wrong and you exit at the stop, this "
+                 "is the share of your money you lose. 1% of Rs 1,00,000 "
+                 "is Rs 1,000. It decides how many shares fit.")
     with right:
-        scope = st.selectbox("Universe", list(_SCAN_SCOPES))
+        scope = st.selectbox(
+            "Which stocks to look at", list(_SCAN_SCOPES),
+            help="The default is the ~210 large, heavily traded names that "
+                 "have futures and options. The wider choices include "
+                 "smaller stocks and take much longer.")
     as_of = render_replay_controls()
     want_options = st.checkbox(
         "Also pick an option contract for each setup",
@@ -693,7 +771,10 @@ def run_scan(capital: float, risk_pct: float, scope: str,
     # 10:00 readings.
     replaying = as_of is not None and as_of < actual_now
     other_day = now.date() != actual_now.date()
-    bars = load_scan_bars(tickers, target=now.date() if other_day else None)
+    # The live stamp forces a fresh assemble whenever the feed has written a
+    # newer bar; on a replay it is empty, so the cache behaves as before.
+    bars = load_scan_bars(tickers, target=now.date() if other_day else None,
+                          live_stamp="" if other_day else live_bar_stamp())
     if as_of is not None:
         bars = scan_data.truncate(bars, now)
     benchmark = scan_data.benchmark_change_pct(bars)
@@ -758,10 +839,50 @@ def render_scan_option_picks(actionable: list[setups.Setup]) -> None:
                 st.warning(f"No tradeable contract: {reasons[0]}")
             else:
                 side = "CALL" if setup.direction == LONG else "PUT"
-                st.success(
-                    f"BUY {contract.strike:,.0f} {side} at mid "
-                    f"{contract.mid:.2f} (bid {contract.bid:.2f} / ask "
-                    f"{contract.ask:.2f})")
+                exact = options_chain.kite_tradingsymbol(
+                    setup.symbol, expiry, contract.strike, side)
+                name = exact or (f"{setup.symbol} {expiry} "
+                                 f"{contract.strike:,.0f} {side}")
+                outlay = contract.mid * lot_size
+                st.success(f"BUY  **{name}**")
+                if exact is None:
+                    st.warning(
+                        "Could not confirm this contract in Kite's "
+                        "instrument master, so the name above is assembled "
+                        "rather than verified. Check it before acting."
+                    )
+                st.write(
+                    f"{setup.symbol} | expiry {expiry} | strike "
+                    f"{contract.strike:,.0f} | {side} | lot {lot_size:,}"
+                )
+                st.write(
+                    f"mid {contract.mid:.2f} (bid {contract.bid:.2f} / ask "
+                    f"{contract.ask:.2f}) -> **Rs {outlay:,.0f} per lot**"
+                )
+                # The cost arithmetic, which is the part of this tool that
+                # held up under measurement. Shown here rather than left
+                # for the user to work out.
+                if contract.mid > 0 and lot_size > 0:
+                    breakeven = trade_costs.options_breakeven_pct(
+                        contract.mid, 1, lot_size)
+                    recover = contract.mid * (1 + breakeven / 100.0)
+                    needed = (contract.strike + recover
+                              if side == "CALL"
+                              else contract.strike - recover)
+                    move = ((needed / spot - 1.0) * 100.0
+                            if spot else float("nan"))
+                    st.write(
+                        f"round-trip charges {breakeven:.2f}% of premium | "
+                        f"break-even at expiry needs spot "
+                        f"{needed:,.2f} ({move:+.2f}% from {spot:,.2f})"
+                    )
+                    if breakeven > 3.0:
+                        st.error(
+                            f"Charges are {breakeven:.1f}% of the premium on "
+                            f"this position. The flat per-order fee dominates "
+                            f"small premiums, and a move that large is not "
+                            f"recoverable by being right about direction."
+                        )
             for reason in reasons:
                 st.caption(f"- {reason}")
 
@@ -778,13 +899,23 @@ def render_scan_results(ranked: list[setups.Setup], bars: scan_data.BarSet,
     mid.metric("Got a direction", f"{len(actionable) + len(directional)}")
     right.metric("Cleared every gate", f"{len(actionable)}")
     nifty = (f" | Nifty {benchmark:+.2f}% today" if benchmark is not None
-             else " | Nifty change unavailable, so relative strength fails closed")
+             else " | today's Nifty move is unavailable, so the "
+                  "compare-to-the-market check refuses to pass")
     stamp = (now.strftime("%Y-%m-%d %H:%M:%S") if replaying
              else now.strftime("%H:%M:%S"))
+    origin = getattr(bars, "source", "download")
     st.caption(
         f"{'Replayed as of' if replaying else 'Scanned'} {stamp} IST{nifty} | "
-        f"{indicators.minutes_left_in_session(now)} min left in the session"
+        f"{indicators.minutes_left_in_session(now)} min left in the session | "
+        f"bars from **{origin}**"
     )
+    if not replaying and origin != "live feed":
+        st.warning(
+            "These bars were DOWNLOADED, not streamed. The newest candle can "
+            "be several minutes old, so entry and stop are computed against "
+            "a price that has already moved. Start the live feed above to "
+            "remove both the wait and the staleness."
+        )
 
     if not actionable:
         premature = [s for s in ranked if not s.readings.range_closed]
@@ -813,12 +944,17 @@ def render_scan_results(ranked: list[setups.Setup], bars: scan_data.BarSet,
             )
         else:
             st.info(
-                "No setup cleared every gate. On most days that is the "
-                "expected answer: the direction rule needs price-vs-VWAP and "
-                "the opening-range break to agree, and usually they do not."
+                "Nothing passed every check. On most days that is the "
+                "expected answer, not a fault. To get a direction at all, "
+                "the price has to be above its average price for the day "
+                "AND have broken out of the range it set in the first 15 "
+                "minutes. Usually it has done one but not the other."
             )
     else:
-        st.dataframe(scan_frame(actionable), width="stretch", hide_index=True)
+        show_table(scan_frame(actionable))
+        show_terms("How a stop and target are set",
+                   "Why charges matter so much",
+                   "What 'volume vs normal' tells you")
         # Each setup is sized to a fraction of capital on its own. Taken
         # together they are not, and nothing said so: sixteen setups on one
         # session came to 16x the assumed capital in notional.
@@ -861,21 +997,274 @@ def render_scan_results(ranked: list[setups.Setup], bars: scan_data.BarSet,
             render_scan_option_picks(actionable[:5])
 
 
+def live_feed_state() -> dict:
+    """What the live bar feed is doing, for the status panel."""
+    try:
+        import live_bars
+        import live_feed
+    except Exception as exc:
+        return {"available": False, "why": str(exc)}
+    state = dict(live_bars.status())
+    state["available"] = True
+    lock = live_feed.LOCK
+    holder = None
+    if lock.exists():
+        try:
+            holder = int(lock.read_text(encoding="utf-8").strip())
+        except Exception:
+            holder = None
+    state["pid"] = holder
+    state["running"] = bool(holder and live_feed._alive(holder))
+    return state
+
+
+def start_live_feed() -> str:
+    """Spawn the feed DETACHED so it outlives Streamlit's script reruns.
+
+    Streamlit re-executes this file on every interaction, so anything owned
+    by the script dies with the session. A detached child keeps its socket
+    and its output file; live_feed's PID lock stops a second one starting,
+    which matters because Kite allows only three sockets per API key.
+    """
+    import subprocess
+    import sys
+
+    flags = 0
+    for name in ("CREATE_NEW_PROCESS_GROUP", "DETACHED_PROCESS",
+                 "CREATE_NO_WINDOW"):
+        flags |= getattr(subprocess, name, 0)
+    try:
+        subprocess.Popen(
+            [sys.executable, "-u", "-m", "live_feed", "--flush-every", "15"],
+            cwd=str(config.PROJECT_ROOT), creationflags=flags,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL)
+    except Exception as exc:
+        return f"could not start: {exc}"
+    return ("started - it prewarms prior sessions first, which takes a few "
+            "minutes, then streams")
+
+
+def render_live_feed_panel() -> None:
+    """Feed status, freshness, and a start control."""
+    state = live_feed_state()
+    if not state.get("available"):
+        st.caption(f"Live bars unavailable: {state.get('why', 'unknown')}")
+        return
+    with st.expander("Live tick feed", expanded=not state.get("running")):
+        st.caption(
+            "A separate process streams ticks and builds 5-minute bars, so a "
+            "scan reads them instead of downloading 216 symbols at Kite's "
+            "3 requests a second. Prior sessions come from a cached window "
+            "ending yesterday; only today comes from the stream."
+        )
+        left, mid, right = st.columns(3)
+        left.metric("Feed", "running" if state.get("running") else "stopped")
+        mid.metric("Instruments", state.get("instruments", 0))
+        age = state.get("age_seconds")
+        right.metric("Newest bar",
+                     f"{age:.0f}s ago" if isinstance(age, float) and age == age
+                     else "none yet")
+        if state.get("running") and not state.get("bars"):
+            st.info(
+                "Streaming, but no completed bar yet. Bars are stamped at "
+                "the start of their five-minute bucket and only written once "
+                "the bucket closes, so the first one appears at the next "
+                "five-minute boundary."
+            )
+        if state.get("partial"):
+            st.caption(
+                f"{state['partial']} bar(s) marked partial - the feed joined "
+                f"part-way through their bucket, so their volume is measured "
+                f"from an unknown baseline and the scan skips them."
+            )
+        if not state.get("running"):
+            if st.button("Start live feed"):
+                st.info(start_live_feed())
+            st.code(".venv\\Scripts\\python -m live_feed", language="text")
+        else:
+            st.caption(f"PID {state.get('pid')} - stop it from the terminal "
+                       f"that owns it, or with taskkill.")
+
+
+@st.cache_data(ttl=config.CACHE_TTL_SECONDS, show_spinner=False)
+def load_horizon_picks(symbols: tuple[str, ...], top: int) -> dict:
+    """Ranked assessments per daily horizon, cached on the universe.
+
+    Cached because the inputs are daily bars from the consolidated store -
+    they change once a session, not once a minute, so re-running the sweep
+    on every rerun would burn two seconds for an identical answer.
+    """
+    return horizons.assess_universe(list(symbols), top=top)
+
+
+def render_horizon_tables(symbols: list, top: int = 20) -> None:
+    """Short, mid and long horizon tables, each filled as it completes.
+
+    Placeholders are written per horizon rather than after all three, so
+    the first table is readable while the rest are still being scored.
+    """
+    st.subheader("Longer horizons")
+    st.caption(
+        "Assessed from the consolidated daily store, with NO session-time "
+        "gate - whether minutes remain today is irrelevant to a position "
+        "held for weeks. Intraday above keeps its own gates."
+    )
+    st.warning(horizons.HONESTY)
+    with st.expander("The exact figures, if you want them"):
+        st.caption(horizons.HONESTY_DETAIL)
+    slots = {}
+    for name in ("short", "mid", "long"):
+        sessions = horizons.HORIZONS[name]["sessions"]
+        st.markdown(f"**{name.title()} term** - about {sessions} sessions, "
+                    f"round trip {horizons.HORIZONS[name]['cost_pct']:.3f}%")
+        slots[name] = st.empty()
+        slots[name].info("scoring...")
+    picks = load_horizon_picks(tuple(symbols), top)
+    if not picks:
+        for slot in slots.values():
+            slot.error(
+                "No consolidated daily bars. Build the store first: "
+                "`.venv\\Scripts\\python -m bar_store`"
+            )
+        return
+    for name, slot in slots.items():
+        rows = picks.get(name) or []
+        if not rows:
+            slot.info("nothing assessable at this horizon")
+            continue
+        frame = horizons.to_frame(rows)
+        show_table(frame, target=slot)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def analyse_instrument(symbol: str, with_intraday: bool) -> dict:
+    """One instrument's report, as a plain dict so Streamlit can cache it.
+
+    Cached briefly rather than not at all: retyping the same symbol should
+    not refetch, but a 60-second ceiling keeps an intraday verdict from
+    going stale on screen.
+    """
+    report = instrument_report.analyse(symbol, include_intraday=with_intraday)
+    return {
+        "found": report.found, "symbol": report.symbol,
+        "note": report.note, "price": report.price, "in_fo": report.in_fo,
+        "lot_size": report.lot_size, "buys": report.buys,
+        "as_of": report.as_of,
+        "table": instrument_report.summary_frame(report),
+        "detail": {name: {"verdict": v.verdict, "blocker": v.blocker,
+                          "reasons": v.reasons}
+                   for name, v in report.verdicts.items()},
+    }
+
+
+def render_instrument_search() -> None:
+    """Search one instrument and show its verdict at every horizon."""
+    st.subheader("Look up one instrument")
+    st.caption(
+        "Any NSE symbol, in or out of the F&O universe. Every gate is shown "
+        "with the number behind it, so a NO BUY names what failed rather "
+        "than just withholding."
+    )
+    left, middle, right = st.columns([3, 1, 1])
+    typed = left.text_input("Symbol", value="", placeholder="RELIANCE",
+                            key="lookup_symbol")
+    with_intraday = middle.checkbox("Include intraday", value=False,
+                                    help="Needs 5-minute bars for today, so "
+                                         "it is slower and only meaningful "
+                                         "during or just after a session.")
+    # An explicit button as well as Enter. A text_input alone commits only
+    # on Enter or blur, which is easy to miss and impossible to drive from
+    # anything but a keyboard.
+    right.markdown("&nbsp;")
+    pressed = right.button("Analyse", key="lookup_go")
+    query = (typed or "").strip().upper()
+    if pressed and query:
+        st.session_state["lookup_last"] = query
+    query = query or st.session_state.get("lookup_last", "")
+    if not query:
+        options = instrument_report.suggest("", limit=10)
+        if options:
+            st.caption(f"e.g. {', '.join(options[:8])}")
+        return
+    matches = instrument_report.suggest(query, limit=8)
+    if matches and query not in matches:
+        st.caption(f"did you mean: {', '.join(matches)}")
+    with st.spinner(f"analysing {query}..."):
+        report = analyse_instrument(query, with_intraday)
+    if not report["found"]:
+        st.error(f"**{report['symbol']}** - {report['note']}")
+        return
+
+    header = f"**{report['symbol']}**  {report['price']:,.2f}"
+    header += (f"  |  F&O, lot {report['lot_size']:,}" if report["in_fo"]
+               else "  |  cash only, no derivatives")
+    if report["as_of"] is not None:
+        header += f"  |  latest daily bar {report['as_of']:%Y-%m-%d}"
+    st.markdown(header)
+
+    buys = report["buys"]
+    if buys:
+        st.success(f"BUY at: {', '.join(buys)}")
+    else:
+        st.warning("NO BUY at any horizon")
+    st.caption(
+        "A BUY means every gate passed and the plausible move covers the "
+        "round trip at least 3x. It is not a forecast - four horizons were "
+        "measured on this data and none showed predictive skill, so read it "
+        "as 'nothing measurable rules this out'."
+    )
+    table = report["table"]
+    if table is not None and not table.empty:
+        show_table(table)
+        show_terms("What the horizons mean", "Why charges matter so much",
+                   "Why this tool will not predict for you")
+    for name, detail in report["detail"].items():
+        label = (f"{name} - {detail['verdict']}"
+                 + (f" ({detail['blocker'].split(' [')[0]})"
+                    if detail["blocker"] else ""))
+        with st.expander(label):
+            for reason in detail["reasons"]:
+                st.caption(f"- {reason}")
+
+
 def render_scan_tab() -> None:
     """Intraday scanner tab: controls, then the last scan's results."""
     st.caption(
-        "A separate system from the positional signal. It holds for hours, not "
-        "weeks, so it has its own data, thresholds and cost model - no "
-        "threshold is shared between the two."
+        "A separate system from the positional signal. It holds for hours, "
+        "not weeks, so it has its own data, thresholds and cost model - no "
+        "threshold is shared between the two. Read it as a screen that "
+        "prices trades and rules out the ones that cannot pay, not as a "
+        "ranked list of opportunities."
     )
-    st.warning(
-        "Measured, and it showed no directional edge. Across 56,825 signals "
-        "on 210 names over 248 sessions, this rule finished level with a coin "
-        "flip taken at the same instants: best excess 0.0015 R per trade "
-        "before costs, -0.034 R after them. Treat the output as a structured "
-        "way to read the tape, not as an expectation of profit. The levels "
-        "are arithmetic from today's range and volatility, not a forecast."
+    st.error(
+        "**This does not tell you which way a price will go.** We checked: "
+        "we ran the same method over 760,458 past moments, and it picked "
+        "winners no better than the identical method fed deliberately "
+        "scrambled answers. None of the 12 stop-and-target combinations we "
+        "tried made money on data it had not seen. So please do not read "
+        "the list below as a forecast."
     )
+    st.info(
+        "**What it is genuinely good for.** The money columns are just "
+        "arithmetic, and those hold up: what a trade costs you in fees, how "
+        "often it would have to work to break even, and which setups cannot "
+        "pay for themselves however right you are about direction. Used to "
+        "say no to trades, this saves money. Used to pick them, it does not."
+    )
+    with st.expander("The exact figures, if you want them"):
+        st.caption(
+            "Gradient-boosted model, 32 features, 760,458 samples, purged "
+            "walk-forward with an embargo. Ranking accuracy (AUC) 0.5205 "
+            "against 0.5165 for the same model on shuffled labels, where "
+            "0.50 is a coin flip. Best geometry net -0.009 R per trade; "
+            "exact permutation p 0.091 over 10 shuffles, whose floor is "
+            "0.091, so it cannot show significance at all. 0 of 12 "
+            "geometries profitable."
+        )
+    render_instrument_search()
+    st.divider()
+    render_live_feed_panel()
     capital, risk_pct, scope, want_options, as_of, run = render_scan_controls()
     if run:
         label = ("Downloading bars and evaluating setups..." if as_of is None
@@ -887,9 +1276,17 @@ def render_scan_tab() -> None:
                                     want_options, past)
     stored = st.session_state.get("scan")
     if stored is None:
-        st.info("Set your capital and risk, then hit Run intraday scan.")
+        st.info("Set your capital and risk, then hit Run intraday scan. "
+                "The longer horizons below need no scan and no live feed.")
+    else:
+        render_scan_results(*stored)
+
+    st.divider()
+    discovered = instruments.load_latest()
+    if discovered is None:
+        st.info("Sync the instruments to assess the longer horizons.")
         return
-    render_scan_results(*stored)
+    render_horizon_tables(sorted({i.symbol for i in discovered.fo_stocks}))
 
 
 def render_positional_tab(profile_key: str, news_weight: float,
@@ -937,7 +1334,7 @@ def render_positional_tab(profile_key: str, news_weight: float,
     render_signal_section(items, momentum, profile)
 
     st.subheader("Full ranking")
-    st.dataframe(build_ranking_frame(scores), width="stretch", hide_index=True)
+    show_table(build_ranking_frame(scores))
 
     render_sector_expanders(scores)
     render_ai_section(scores)
@@ -950,7 +1347,9 @@ profile_key, news_weight, max_age_hours = render_sidebar()
 st.title("📈 Sector Pulse")
 
 tab_positional, tab_intraday, tab_sync = st.tabs(
-    ["Positional signal (end of day)", "Intraday scan", "Instrument sync"])
+    ["Positional signal (end of day)",
+     "Scan: intraday / short / mid / long",
+     "Instrument sync"])
 
 with tab_positional:
     render_positional_tab(profile_key, news_weight, max_age_hours)

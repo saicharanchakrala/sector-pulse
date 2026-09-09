@@ -43,6 +43,39 @@ _HEADERS = {
 }
 
 
+def kite_tradingsymbol(underlying: str, expiry: str, strike: float,
+                       side: str) -> "str | None":
+    """The exact Kite tradingsymbol for one contract, or None if unlisted.
+
+    Resolved from the instrument master, not assembled from a naming rule.
+    Kite spells monthly and weekly expiries differently, so a constructed
+    symbol can look right and not exist - and a symbol that does not exist
+    is exactly what must not reach a user about to place an order.
+
+    `expiry` is NSE's spelling from the chain (for example 29-Sep-2026);
+    it is parsed rather than compared as text.
+    """
+    import pandas as pd
+
+    import kite_instruments as ki
+
+    try:
+        wanted_expiry = pd.to_datetime(expiry, dayfirst=True).date()
+    except Exception:
+        return None
+    wanted_type = "CE" if str(side).upper().startswith("C") else "PE"
+    try:
+        rows = ki.nse_options(ki.fetch_master(), underlying)
+    except Exception:
+        return None
+    for contract in rows:
+        if (contract.instrument_type == wanted_type
+                and contract.expiry == wanted_expiry
+                and abs(contract.strike - float(strike)) < 0.01):
+            return contract.tradingsymbol
+    return None
+
+
 @dataclass(frozen=True)
 class Contract:
     """One strike and side of the chain, as NSE reports it."""
