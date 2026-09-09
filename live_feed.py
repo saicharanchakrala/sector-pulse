@@ -246,9 +246,19 @@ def main(argv=None) -> int:
         logger.error("stream ended: %s", exc)
     finally:
         stop.set()
+        # The bar still forming is a real bar for the part of the bucket it
+        # covers, and at 15:30 it is the session's last. Closing it before
+        # the final flush is the only way it reaches the file.
+        closed = builder.close_open_bars()
         written = builder.flush()
         release_lock()
-        print(f"flushed {written} bars on exit")
+        refused = builder.refused()
+        note = ""
+        if any(refused.values()):
+            note = (f", refused {refused['outside_session']} out-of-session "
+                    f"and {refused['out_of_order']} out-of-order ticks")
+        print(f"flushed {written} bars on exit "
+              f"(closed {closed} still forming){note}")
     return 0
 
 

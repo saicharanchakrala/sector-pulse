@@ -63,6 +63,31 @@ def bucket_start(when: datetime) -> datetime:
     return floored - timedelta(minutes=floored.minute % (BAR_SECONDS // 60))
 
 
+def in_session(stamp: datetime) -> bool:
+    """Whether a bucket start falls inside NSE equity TRADING HOURS.
+
+    Bounds come from config so the feed and the scanner cannot disagree
+    about when the market is open. A bucket STARTING at the close would
+    cover post-close time, so the last valid one starts strictly before it.
+
+    Weekends are excluded; trading HOLIDAYS are not, because nothing in
+    this project holds an exchange holiday calendar. That is tolerable
+    here - the feed receives no ticks on a closed day, so there is nothing
+    to admit - but it means this answers "within trading hours" and not
+    "the market was open".
+    """
+    local = stamp.astimezone(IST)
+    if local.weekday() >= 5:
+        return False
+    open_hour, open_minute = config.SCAN_SESSION_OPEN
+    close_hour, close_minute = config.SCAN_SESSION_CLOSE
+    start = local.replace(hour=open_hour, minute=open_minute, second=0,
+                          microsecond=0)
+    end = local.replace(hour=close_hour, minute=close_minute, second=0,
+                        microsecond=0)
+    return start <= local < end
+
+
 def store_path(when: "date | None" = None) -> Path:
     """Where one session's live bars live."""
     day = when or datetime.now(IST).date()
@@ -84,6 +109,18 @@ class BarBuilder:
         # token -> cumulative volume at the close of its last finished bar
         self._volume_mark: dict[int, int] = {}
         self._seen_from: dict[int, datetime] = {}
+        # Whether the currently OPEN bar has seen a tick that actually
+        # carried a volume field. Index packets never do and an LTP-sized
+        # packet does not either, so a bar can see hundreds of ticks and no
+        # volume - which is not the same thing as no trading.
+        self._saw_volume: dict[int, bool] = {}
+        # token -> start of its last COMPLETED bar. Kept separately from
+        # _open because close_open_bars empties that, and without it a
+        # replayed tick could reopen a bucket already written out.
+        self._closed_at: dict[int, datetime] = {}
+        self._refused_late = 0
+        self._refused_stale = 0
+        self._refused_naive = 0
 
     def add(self, ticks: list) -> None:
         """Fold a batch of ticks into their buckets."""
@@ -95,39 +132,103 @@ class BarBuilder:
         stamp = tick.exchange_timestamp or tick.received_at
         if stamp is None or tick.last_price <= 0:
             return
+        if stamp.tzinfo is None:
+            # astimezone() on a naive datetime assumes the PROCESS
+            # timezone, so on a UTC-configured host every stamp would land
+            # outside the session gate below and the feed would write
+            # nothing at all. Refused explicitly rather than guessed.
+            self._refused_naive += 1
+            return
         token = tick.instrument_token
         start = bucket_start(stamp)
+        if not in_session(start):
+            # Kite keeps sending after the close. The resulting buckets
+            # carried a frozen price and no volume, and fed ATR, the
+            # opening range and relative volume as though they were real.
+            self._refused_late += 1
+            return
         self._seen_from.setdefault(token, start)
         current = self._open.get(token)
+        closed = self._closed_at.get(token)
+        if current is None and closed is not None and start <= closed:
+            # The bucket was already completed and written. Reopening it
+            # would emit the same five minutes twice.
+            self._refused_stale += 1
+            return
+        if current is not None and start < current["start"]:
+            # An OLDER bucket than the open one, which a reconnect replay
+            # produces. Rolling back to it closed the newer bar early and
+            # rewound the volume baseline, so it is refused instead.
+            self._refused_stale += 1
+            return
         if current is not None and current["start"] != start:
             self._finish(token, current)
             current = None
         if current is None:
             current = {"start": start, "open": tick.last_price,
                        "high": tick.last_price, "low": tick.last_price,
-                       "close": tick.last_price, "cum_volume": tick.volume,
+                       "close": tick.last_price,
+                       "cum_volume": self._volume_mark.get(token),
                        "ticks": 0}
             self._open[token] = current
+            self._saw_volume[token] = False
         current["high"] = max(current["high"], tick.last_price)
         current["low"] = min(current["low"], tick.last_price)
         current["close"] = tick.last_price
         # Latest cumulative reading wins; the delta is taken at close.
-        if tick.volume:
-            current["cum_volume"] = tick.volume
+        # `is not None` rather than truthiness, because the old test could
+        # not tell a genuine cumulative of 0 - no trade yet today - from a
+        # packet that carries no volume field at all.
+        reading = getattr(tick, "volume", None)
+        if reading is not None:
+            previous = current["cum_volume"]
+            # Cumulative volume only rises. A lower reading is a replayed
+            # or corrupt packet, and letting it through would rewind the
+            # baseline and inflate the following bar.
+            if previous is None or reading >= previous:
+                current["cum_volume"] = reading
+                self._saw_volume[token] = True
         current["ticks"] += 1
 
-    def _finish(self, token: int, bar: dict) -> None:
-        """Close one bar, converting cumulative volume into this bar's own."""
+    def _finish(self, token: int, bar: dict,
+                truncated: bool = False) -> None:
+        """Close one bar, converting cumulative volume into this bar's own.
+
+        `truncated` marks a bar closed before its bucket ended, which only
+        close_open_bars can cause. Such a bar covers a fraction of its
+        period, so it is flagged exactly as the forming-bar snapshot
+        already flags it - otherwise a Ctrl-C 30 seconds into a bucket
+        wrote a 30-second bar recorded as a finished five-minute one.
+        """
         mark = self._volume_mark.get(token)
-        if mark is None:
-            # No baseline: the feed joined part-way through, so the volume
-            # of THIS bar is unknowable. Recorded as NaN rather than as the
-            # whole day's volume, which would read as a huge spike.
+        cumulative = bar["cum_volume"]
+        saw = self._saw_volume.get(token, False)
+        if mark is None or cumulative is None or not saw:
+            # Unknowable rather than zero, by three routes: the feed joined
+            # part-way through so there is no baseline; the bar saw no tick
+            # carrying volume at all, which is permanent for an index; or
+            # both. Reporting the whole day's volume here - which the old
+            # code did on the bar AFTER this one, having reset the mark to
+            # zero - is the spike this module exists to prevent.
             volume = float("nan")
         else:
-            volume = max(0.0, float(bar["cum_volume"] - mark))
-        self._volume_mark[token] = bar["cum_volume"]
-        partial = self._seen_from.get(token) == bar["start"] and mark is None
+            volume = max(0.0, float(cumulative - mark))
+        # Advance the baseline only on a reading actually observed.
+        if cumulative is not None and saw:
+            self._volume_mark[token] = cumulative
+        self._saw_volume[token] = False
+        # `partial` means the bar did not cover its whole bucket - the feed
+        # joined mid-way through it. It deliberately does NOT mean "volume
+        # unknown": that is already said by Volume being NaN, and an index
+        # carries no volume field at all, so folding the two together
+        # flagged every index bar partial and load_today(drop_partial=True)
+        # then dropped the entire benchmark the relative-strength gate
+        # needs. The OHLC of a volume-less bar is perfectly good.
+        partial = ((self._seen_from.get(token) == bar["start"]
+                    and mark is None) or truncated)
+        # Remember where this token's last completed bar sat, so a replay
+        # arriving after _open was cleared cannot reopen it.
+        self._closed_at[token] = bar["start"]
         self._done.append({
             "instrument_token": token, "Date": bar["start"],
             "Open": bar["open"], "High": bar["high"], "Low": bar["low"],
@@ -146,18 +247,50 @@ class BarBuilder:
             if include_forming:
                 for token, bar in self._open.items():
                     mark = self._volume_mark.get(token)
+                    cumulative = bar["cum_volume"]
+                    known = (mark is not None and cumulative is not None
+                             and self._saw_volume.get(token, False))
                     rows.append({
                         "instrument_token": token, "Date": bar["start"],
                         "Open": bar["open"], "High": bar["high"],
                         "Low": bar["low"], "Close": bar["close"],
-                        "Volume": (float("nan") if mark is None else
-                                   max(0.0, float(bar["cum_volume"] - mark))),
+                        "Volume": (max(0.0, float(cumulative - mark)) if known
+                                   else float("nan")),
                         "ticks": bar["ticks"], "partial": True,
                     })
         if not rows:
             return pd.DataFrame(columns=["instrument_token", "Date"] + COLUMNS
                                 + ["ticks", "partial"])
         return pd.DataFrame(rows)
+
+    def close_open_bars(self, now: "datetime | None" = None) -> int:
+        """Finish every open bar. Without this the last one is lost.
+
+        _finish runs only when a LATER tick arrives, so the final bucket of
+        a session stays in _open until the process exits - and flush()
+        writes completed bars only.
+
+        A bar whose bucket is still the CURRENT one is closed early and is
+        flagged partial, because it covers only part of its period. At
+        15:30 nothing is current, so the session's last bar is closed
+        complete, which is the case this exists for.
+        """
+        with self._lock:
+            # `now` is injectable so the truncation rule can be tested
+            # without depending on the wall clock being mid-session.
+            current = bucket_start(now or datetime.now(IST))
+            pending = list(self._open.items())
+            for token, bar in pending:
+                self._finish(token, bar, truncated=bar["start"] >= current)
+            self._open.clear()
+        return len(pending)
+
+    def refused(self) -> dict:
+        """Ticks turned away, so a caller can report rather than hide them."""
+        with self._lock:
+            return {"outside_session": self._refused_late,
+                    "out_of_order": self._refused_stale,
+                    "naive_timestamp": self._refused_naive}
 
     def flush(self, when: "date | None" = None) -> int:
         """Write completed bars to parquet, atomically. Returns rows written.
