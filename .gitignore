@@ -51,3 +51,5 @@ live_bars/
 
 # Local agent scratch: launch config is kept, worktrees are not.
 .claude/worktrees/
+# Machine-local tool permissions, not a project setting.
+.claude/settings.local.json
