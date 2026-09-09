@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 
 import config
@@ -229,23 +230,55 @@ def true_range_by_session(frame: pd.DataFrame) -> "pd.Series | None":
     1.0 intraday range and a 20-rupee gap, ATR read 2.21 three bars into the
     session against a true 1.0, because Wilder smoothing decays a shock only
     as (13/14)^k. That doubled every stop and target in the first hour, and
-    no gate could catch it because both scale from the same ATR.
+    no gate could catch it because both gates scale from the same ATR.
+
+    One numpy pass rather than a loop per session. The earlier version
+    iterated the index to find the days and again per day to slice it, then
+    built a dropna, a shift, a three-column concat and a row-wise max for
+    each session - 44.5ms per symbol, about 9.6s across the F&O universe.
+    The session boundary is now a boolean mask, which is where the
+    gap-exclusion actually happens: the first bar of each session takes
+    high-low only, exactly as a per-session concat did. Verified equal to
+    the previous implementation on real cached frames before replacing it.
     """
     if frame is None or frame.empty:
         return None
-    try:
-        days = sorted({ts.date() for ts in frame.index})
-    except AttributeError:
+    index = frame.index
+    if not isinstance(index, pd.DatetimeIndex):
         return None
-    parts = []
+    if any(name not in frame.columns for name in _REQUIRED):
+        return None
+    usable = frame.dropna(subset=list(_REQUIRED))
+    if len(usable) < 2:
+        return None
+    high = usable["High"].to_numpy(dtype=float)
+    low = usable["Low"].to_numpy(dtype=float)
+    close = usable["Close"].to_numpy(dtype=float)
+    days = usable.index.date
+    # True where a bar opens a new session, so its predecessor's close
+    # belongs to a different day and must not enter the range.
+    opens_session = np.empty(len(days), dtype=bool)
+    opens_session[0] = True
+    opens_session[1:] = days[1:] != days[:-1]
+
+    span = high - low
+    prior = np.empty_like(close)
+    prior[0] = np.nan
+    prior[1:] = close[:-1]
+    with np.errstate(invalid="ignore"):
+        ranges = np.maximum(span, np.maximum(np.abs(high - prior),
+                                             np.abs(low - prior)))
+    ranges[opens_session] = span[opens_session]
+
+    # A session of one bar contributed nothing before, because true_range
+    # required two rows. Preserved so the ATR sample size is unchanged.
+    counts = {}
     for day in days:
-        rows = frame.loc[[ts for ts in frame.index if ts.date() == day]]
-        within = true_range(rows)
-        if within is not None and not within.empty:
-            parts.append(within)
-    if not parts:
+        counts[day] = counts.get(day, 0) + 1
+    keep = np.array([counts[day] >= 2 for day in days], dtype=bool)
+    if not keep.any():
         return None
-    return pd.concat(parts)
+    return pd.Series(ranges[keep], index=usable.index[keep])
 
 
 def atr(bars: pd.DataFrame, period: int = config.SCAN_ATR_BARS
@@ -259,8 +292,12 @@ def atr(bars: pd.DataFrame, period: int = config.SCAN_ATR_BARS
     ranges = true_range_by_session(bars)
     if ranges is None or period <= 0 or len(ranges) < period:
         return None
-    value = float(ranges.iloc[:period].mean())
-    for span in ranges.iloc[period:]:
+    # Wilder smoothing is sequential and cannot be vectorised, but walking
+    # a numpy array is far cheaper than iterating a Series, which builds a
+    # scalar object per element.
+    values = ranges.to_numpy(dtype=float)
+    value = float(values[:period].mean())
+    for span in values[period:]:
         value = (value * (period - 1) + float(span)) / period
     return _finite(value)
 
@@ -275,19 +312,19 @@ def cumulative_volume_by_time(frame: pd.DataFrame
     """
     if frame is None or frame.empty or "Volume" not in frame.columns:
         return {}
-    out: dict[date, "pd.Series | None"] = {}
-    try:
-        days = sorted({ts.date() for ts in frame.index})
-    except AttributeError:
+    index = frame.index
+    if not isinstance(index, pd.DatetimeIndex):
         return {}
-    for day in days:
-        rows = frame.loc[[ts for ts in frame.index if ts.date() == day]]
+    out: dict[date, "pd.Series | None"] = {}
+    # One vectorised grouping, and index.time rather than a comprehension.
+    # Profiled at 2.25s of an 8.64s scan across forty symbols before this.
+    for day, rows in frame.groupby(index.date, sort=True):
         volumes = rows["Volume"].fillna(0.0)
         if volumes.empty:
             out[day] = None
             continue
         series = volumes.cumsum()
-        series.index = [ts.time() for ts in rows.index]
+        series.index = rows.index.time
         out[day] = series
     return out
 
