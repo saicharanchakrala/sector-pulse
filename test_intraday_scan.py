@@ -1135,3 +1135,194 @@ def test_measure_returns_none_without_a_usable_session() -> None:
     empty = pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
     assert setups.measure("T", "T.NS", empty, None, None,
                           datetime(2026, 9, 8, 13, 0, tzinfo=IST)) is None
+
+
+# --- when the intraday scan may re-run itself -----------------------------
+#
+# The auto-refresh is a real re-scan, not a repaint, so these rules decide
+# whether a timer is worth its cost. Every one of them returns a REASON
+# too: a toggle the user switched on that then quietly does nothing is
+# worse than having no toggle.
+
+def _refresh(**over):
+    """auto_refresh_interval with a healthy live session as the baseline."""
+    kwargs = dict(enabled=True, requested=60, replaying=False,
+                  want_options=False, in_trading_hours=True,
+                  feed_running=True, feed_age=120.0, last_scan_seconds=0.0)
+    kwargs.update(over)
+    return scan_data.auto_refresh_interval(**kwargs)
+
+
+def test_a_healthy_live_session_refreshes_at_the_requested_interval() -> None:
+    interval, note = _refresh()
+    assert interval == 60
+    assert note == ""
+
+
+def test_the_toggle_being_off_is_silent() -> None:
+    # Off by choice needs no explanation; every other refusal does.
+    interval, note = _refresh(enabled=False)
+    assert interval is None and note == ""
+
+
+def test_a_replay_is_never_refreshed() -> None:
+    interval, note = _refresh(replaying=True)
+    assert interval is None
+    assert "past" in note
+
+
+def test_option_contracts_block_the_timer() -> None:
+    # One NSE chain request per setup, repeated forever, is rude to a third
+    # party rather than merely slow.
+    interval, note = _refresh(want_options=True)
+    assert interval is None
+    assert "NSE" in note
+
+
+def test_nothing_refreshes_outside_trading_hours() -> None:
+    interval, note = _refresh(in_trading_hours=False)
+    assert interval is None
+    assert "closed" in note
+
+
+def test_a_stopped_feed_blocks_the_timer() -> None:
+    # Without the feed each refresh re-downloads 216 symbols at 3 a second.
+    interval, note = _refresh(feed_running=False)
+    assert interval is None
+    assert "not running" in note
+
+
+def test_a_stale_feed_blocks_the_timer() -> None:
+    interval, note = _refresh(feed_age=config.SCAN_LIVE_MAX_AGE_SECONDS + 1)
+    assert interval is None
+    assert "too old" in note
+
+
+def test_an_unknowable_feed_age_blocks_the_timer() -> None:
+    interval, note = _refresh(feed_age=float("nan"))
+    assert interval is None
+    assert "too old" in note
+
+
+def test_a_feed_at_exactly_the_age_limit_still_refreshes() -> None:
+    # The limit is what a HEALTHY feed peaks at, so the boundary must pass
+    # or the timer stops for the same reason the live path used to.
+    interval, _ = _refresh(feed_age=float(config.SCAN_LIVE_MAX_AGE_SECONDS))
+    assert interval == 60
+
+
+def test_the_interval_is_raised_above_the_measured_scan_time() -> None:
+    # A 30s timer over a 22s scan leaves the page permanently mid-scan,
+    # with reruns queueing behind each other.
+    interval, note = _refresh(requested=30, last_scan_seconds=22.0)
+    assert interval == 44
+    assert "raised to 44s" in note
+
+
+def test_a_fast_scan_does_not_raise_the_interval() -> None:
+    interval, note = _refresh(requested=60, last_scan_seconds=5.0)
+    assert interval == 60
+    assert note == ""
+
+
+# --- the pivot ladder ----------------------------------------------------
+#
+# Placement only. The ladder enters no gate and no score, so these tests
+# are about the arithmetic being the standard construction and about the
+# stop preferring a real level only when it sits inside the volatility
+# window - the constraint that a previous attempt at structural stops
+# violated, making every clean breakout unactionable.
+
+def test_the_pivot_ladder_is_the_standard_construction() -> None:
+    # H 100, L 90, C 98 -> P 96, and each level by the textbook formula.
+    lad = indicators.pivot_ladder(100.0, 90.0, 98.0)
+    assert lad is not None
+    assert lad.pivot == pytest.approx(96.0)
+    assert lad.r1 == pytest.approx(102.0)     # 2P - L
+    assert lad.s1 == pytest.approx(92.0)      # 2P - H
+    assert lad.r2 == pytest.approx(106.0)     # P + (H - L)
+    assert lad.s2 == pytest.approx(86.0)      # P - (H - L)
+    assert lad.r3 == pytest.approx(112.0)     # H + 2(P - L)
+    assert lad.s3 == pytest.approx(82.0)      # L - 2(H - P)
+
+
+def test_the_levels_are_ordered_outward_from_the_pivot() -> None:
+    lad = indicators.pivot_ladder(100.0, 90.0, 98.0)
+    assert lad.s3 < lad.s2 < lad.s1 < lad.pivot < lad.r1 < lad.r2 < lad.r3
+
+
+def test_unusable_previous_sessions_give_no_ladder() -> None:
+    # A ladder from a zero low puts S3 at a negative price, which would
+    # then be the nearest "level" beneath everything.
+    assert indicators.pivot_ladder(0.0, 0.0, 0.0) is None
+    assert indicators.pivot_ladder(100.0, 90.0, 0.0) is None
+    assert indicators.pivot_ladder(90.0, 100.0, 95.0) is None   # high < low
+    assert indicators.pivot_ladder(None, 90.0, 95.0) is None
+
+
+def test_below_and_above_walk_the_whole_ladder_not_just_one_side() -> None:
+    # After a strong move up, R1 and even R2 sit BELOW the price and are
+    # then the nearest real structure beneath it. Treating only S1-S3 as
+    # support would reach past them to something far away.
+    lad = indicators.pivot_ladder(100.0, 90.0, 98.0)
+    assert lad.below(104.0)[0] == pytest.approx(102.0)   # R1, not S1
+    assert lad.below(99.0)[0] == pytest.approx(96.0)     # the pivot itself
+    assert lad.above(99.0)[0] == pytest.approx(102.0)
+    # Nearest first, in both directions.
+    assert list(lad.below(104.0)) == sorted(lad.below(104.0), reverse=True)
+    assert list(lad.above(80.0)) == sorted(lad.above(80.0))
+
+
+def test_a_price_outside_the_ladder_has_nothing_on_one_side() -> None:
+    lad = indicators.pivot_ladder(100.0, 90.0, 98.0)
+    assert lad.above(999.0) == ()
+    assert lad.below(1.0) == ()
+
+
+def test_the_ladder_is_not_used_for_stop_placement() -> None:
+    # A DECISION, recorded as a test. Placing stops on pivots was built
+    # and then measured on 79,725 candidate stops across 249 dates.
+    # Paired within the same session - holding distance, date, symbol and
+    # the session's own path fixed - a stop on a pivot was hit +0.445 pp
+    # MORE often than one at the same distance elsewhere, CI
+    # [-1.30, +2.22], sign test p 0.37 on 145 discordant sessions. An
+    # unpaired version read -2.19 pp and looked significant; that was
+    # selection. Since a pivot stop is always tighter than the volatility
+    # stop it replaces, shipping it would have raised the stop-hit rate
+    # for nothing. This test fails if anyone wires it back in.
+    import inspect
+
+    assert "pivots" not in inspect.signature(
+        levels_mod.build_levels).parameters
+    assert "pivots" not in inspect.signature(
+        levels_mod._structural_levels).parameters
+
+
+def test_a_pivot_in_the_window_does_not_move_the_stop() -> None:
+    # The pivot here lands 1.2 below the entry, inside the structural
+    # window, so it WOULD have been chosen. It must not be.
+    lad = indicators.pivot_ladder(101.0, 97.0, 98.4)      # pivot at 98.80
+    assert lad is not None and abs(lad.pivot - 98.80) < 1e-9
+    trade = levels_mod.build_levels("LONG", entry=100.0, atr_per_bar=0.6,
+                                    bars_left=20)
+    assert trade is not None
+    assert trade.stop_source == "volatility"
+    assert trade.stop != pytest.approx(98.80)
+
+
+def test_intraday_structure_is_still_preferred_over_volatility() -> None:
+    # The pre-existing structural stop must be untouched by all this. Its
+    # own rationale is NOT what the pivot measurement tested, so it stays
+    # exactly as it was.
+    trade = levels_mod.build_levels("LONG", entry=100.0, atr_per_bar=0.6,
+                                    bars_left=20, opening_low=98.75)
+    assert trade is not None
+    assert trade.stop_source == "opening-range low"
+    assert trade.stop == pytest.approx(98.75)
+
+
+def test_the_ladder_reaches_readings_for_display() -> None:
+    # Display is the one thing it IS for, so it has to survive the trip
+    # into Readings rather than being computed and dropped.
+    fields = setups.Readings.__dataclass_fields__
+    assert "pivots" in fields

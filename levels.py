@@ -129,6 +129,19 @@ def _structural_levels(direction: str, opening_low: "float | None",
     Returns all of them rather than just the first. Returning only the
     opening range meant that when it sat on the wrong side of the entry the
     session low was never tried, so the fallback could not fire.
+
+    THE PIVOT LADDER IS DELIBERATELY ABSENT, and this is a measurement
+    rather than an oversight. Adding S1-S3/R1-R3 here was built, and then
+    tested on 79,725 candidate stops over 249 dates: paired within the
+    same session, a stop sitting on a pivot was hit +0.445 pp MORE often
+    than one at the same distance that was not, CI [-1.30, +2.22], sign
+    test p 0.37 on 145 discordant sessions. An unpaired version of the
+    same test read -2.19 pp and looked significant; that was selection,
+    because sessions with a pivot inside the usable window are not like
+    sessions without one. Since a pivot stop is always TIGHTER than the
+    volatility stop it would replace, shipping it would have raised the
+    stop-hit rate for a benefit that is not there. indicators.pivot_ladder
+    is kept for DISPLAY only.
     """
     if direction == LONG:
         pairs = ((opening_low, "opening-range low"), (day_low, "session low"))

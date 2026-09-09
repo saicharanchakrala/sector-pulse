@@ -201,6 +201,96 @@ def central_pivot_range(prev_high: float, prev_low: float,
     return CentralPivotRange(pivot=pivot, top=max(tc, bc), bottom=min(tc, bc))
 
 
+@dataclass(frozen=True)
+class PivotLadder:
+    """Previous-session floor pivots: the pivot plus three levels each way.
+
+    The standard construction, the one every Indian broker's screen shows:
+
+        pivot = (H + L + C) / 3
+        R1 = 2P - L          S1 = 2P - H
+        R2 = P + (H - L)     S2 = P - (H - L)
+        R3 = H + 2(P - L)    S3 = L - 2(H - P)
+
+    Computed from the PREVIOUS session only, so every level is fixed before
+    the open and cannot move during the day.
+
+    FOR DISPLAY, NOT FOR PLACEMENT. Using these as stops was built and
+    then measured on 79,725 candidate stops across 249 dates: paired
+    within the same session, a stop sitting on a pivot was hit +0.445 pp
+    MORE often than one at the same distance elsewhere, CI [-1.30, +2.22],
+    sign test p 0.37. See levels._structural_levels for the full figures
+    and why an unpaired version of the test misleadingly read -2.19 pp.
+    So these levels are shown because they are worth seeing and cost
+    nothing, not because they predict where price turns.
+    """
+
+    pivot: float
+    r1: float
+    r2: float
+    r3: float
+    s1: float
+    s2: float
+    s3: float
+
+    @property
+    def supports(self) -> tuple:
+        """S1, S2, S3 - nearest first."""
+        return (self.s1, self.s2, self.s3)
+
+    @property
+    def resistances(self) -> tuple:
+        """R1, R2, R3 - nearest first."""
+        return (self.r1, self.r2, self.r3)
+
+    def below(self, price: float) -> tuple:
+        """Every level under `price`, nearest first.
+
+        Deliberately not just the supports: after a strong move up, R1 and
+        even R2 sit BELOW the current price and are then the nearest real
+        structure beneath it. Treating only S1-S3 as support would reach
+        past them for a level much further away.
+        """
+        levels = sorted((v for v in self._all if v < price), reverse=True)
+        return tuple(levels)
+
+    def above(self, price: float) -> tuple:
+        """Every level over `price`, nearest first."""
+        return tuple(sorted(v for v in self._all if v > price))
+
+    @property
+    def _all(self) -> tuple:
+        return (self.s3, self.s2, self.s1, self.pivot,
+                self.r1, self.r2, self.r3)
+
+
+def pivot_ladder(prev_high: float, prev_low: float,
+                 prev_close: float) -> "PivotLadder | None":
+    """The pivot ladder from one previous session's high, low and close.
+
+    None rather than a partial answer on unusable input, matching
+    central_pivot_range: a ladder built from a zero low would put S3 at a
+    negative price and quietly become the nearest "level" beneath
+    everything.
+    """
+    for value in (prev_high, prev_low, prev_close):
+        if value is None or _finite(value) is None or value <= 0.0:
+            return None
+    if prev_high < prev_low:
+        return None
+    span = prev_high - prev_low
+    pivot = (prev_high + prev_low + prev_close) / 3.0
+    return PivotLadder(
+        pivot=pivot,
+        r1=2.0 * pivot - prev_low,
+        r2=pivot + span,
+        r3=prev_high + 2.0 * (pivot - prev_low),
+        s1=2.0 * pivot - prev_high,
+        s2=pivot - span,
+        s3=prev_low - 2.0 * (prev_high - pivot),
+    )
+
+
 def true_range(bars: pd.DataFrame) -> "pd.Series | None":
     """Wilder true range per bar: the widest of the three standard spans.
 

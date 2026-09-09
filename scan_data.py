@@ -142,6 +142,48 @@ def fetch_bars(tickers: list[str], batch_size: int = config.SCAN_BATCH_SIZE,
                   live_symbols=streamed, live_age_seconds=age)
 
 
+def auto_refresh_interval(*, enabled: bool, requested: int,
+                          replaying: bool, want_options: bool,
+                          in_trading_hours: bool, feed_running: bool,
+                          feed_age: float,
+                          last_scan_seconds: float = 0.0) -> tuple:
+    """(seconds to re-scan at, note) for the intraday scan's auto-refresh.
+
+    `None` for the interval means do not refresh, and `note` says why. Both
+    are returned together because a toggle the user switched on that then
+    quietly does nothing is worse than having no toggle: the reason has to
+    reach the screen.
+
+    Pure - every input is passed in - so the rules can be tested without a
+    browser, a feed or a clock.
+    """
+    if not enabled:
+        return None, ""
+    if replaying:
+        return None, ("a replay is a fixed instant in the past, so there is "
+                      "nothing for a timer to refresh")
+    if want_options:
+        return None, ("picking option contracts costs one NSE chain request "
+                      "per setup, and a timer would repeat that indefinitely")
+    if not in_trading_hours:
+        return None, ("the market is closed, so no refresh can change a bar")
+    if not feed_running:
+        return None, ("the live feed is not running, so each refresh would "
+                      "re-download every symbol at 3 requests a second")
+    if not (feed_age == feed_age) or feed_age > config.SCAN_LIVE_MAX_AGE_SECONDS:
+        return None, ("the newest live bar is too old - the feed looks "
+                      "stopped, so a refresh would fall back to downloading")
+    # Never re-scan faster than a scan takes to finish, or the reruns queue
+    # up behind each other and the page is permanently mid-scan. Doubling
+    # the measured time leaves the CPU idle at least half the interval.
+    floor = int(last_scan_seconds * 2) if last_scan_seconds else 0
+    if floor > requested:
+        return floor, (f"raised to {floor}s: the last scan took "
+                       f"{last_scan_seconds:.0f}s, and refreshing faster "
+                       f"than that would leave it permanently re-scanning")
+    return requested, ""
+
+
 def _live_intraday(symbols: list[str]) -> tuple:
     """(frames, symbols that streamed, age of newest bar) or ({}, 0, nan).
 
