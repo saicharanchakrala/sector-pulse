@@ -522,8 +522,12 @@ def sync_instruments(with_chains: bool) -> dict:
     return result
 
 
-def render_sync_tab() -> None:
-    """Cache status plus the sync button."""
+def render_sync_popover() -> None:
+    """Cache status and the sync control, in a header popover.
+
+    A popover rather than a tab: this is pressed once a day and does not
+    earn permanent space next to the two things the page is actually for.
+    """
     st.caption(
         "Everything the scanner trades is discovered from NSE, never "
         "hardcoded. This syncs that universe into the local cache so a scan "
@@ -547,7 +551,7 @@ def render_sync_tab() -> None:
     if st.button("Sync instruments now", type="primary"):
         result = sync_instruments(with_chains)
         st.session_state["last_sync"] = result
-        st.success("Cache updated. The scan tab will use this snapshot.")
+        st.success("Cache updated. The scan will use this snapshot.")
         st.rerun()
     last = st.session_state.get("last_sync")
     if last:
@@ -1539,36 +1543,30 @@ def render_option_cost_arithmetic(lot_size: int) -> None:
             )
 
 
-# The first entry in the match picker. A sentinel rather than a default
-# selection, so that typing does not analyse whatever ranks first.
-PICK_PROMPT = "- pick an instrument -"
-
-
 def render_instrument_search() -> None:
-    """Search one instrument and show its verdict at every horizon."""
-    st.subheader("Look up one instrument")
-    st.caption(
-        "Any NSE stock, future or option contract. Every gate is shown "
-        "with the number behind it, so a NO BUY names what failed rather "
-        "than just withholding."
-    )
-    left, middle, right = st.columns([3, 1, 1])
+    """Search any instrument and show its verdict at every horizon.
+
+    Rendered ABOVE the tabs. It answers "what about this one stock",
+    which is neither an intraday scan nor an end-of-day sector signal, so
+    it does not belong inside either tab.
+    """
+    left, middle, right = st.columns([4, 1, 1], vertical_alignment="bottom")
     typed = left.text_input(
-        "Search stocks, futures and options", value="",
-        placeholder="RELIANCE, RELIANCE26SEPFUT, RELIANCE26SEP1400CE",
+        "Look up any stock, future or option",
+        value="", placeholder="RELIANCE, RELIANCE26SEPFUT, RELIANCE26SEP1400CE",
         key="lookup_symbol",
         help="Type any part of a symbol. Options are held back until four "
              "characters, because two letters match tens of thousands of "
              "strikes and would bury the stock you were after.")
-    with_intraday = middle.checkbox("Include intraday", value=False,
+    with_intraday = middle.checkbox("Intraday too", value=False,
                                     help="Needs 5-minute bars for today, so "
                                          "it is slower and only meaningful "
                                          "during or just after a session.")
     # An explicit button as well as Enter. A text_input alone commits only
     # on Enter or blur, which is easy to miss and impossible to drive from
     # anything but a keyboard.
-    right.markdown("&nbsp;")
-    pressed = right.button("Analyse", key="lookup_go")
+    pressed = right.button("Analyse", key="lookup_go",
+                           width="stretch")
     text = (typed or "").strip()
     query, picked = "", None
     if text:
@@ -1597,18 +1595,26 @@ def render_instrument_search() -> None:
             # An unambiguous hit needs no picker.
             picked = matches[0]
         else:
-            # A sentinel first, so that TYPING does not analyse whatever
-            # happens to rank first. Without it, "R" silently analysed the
-            # top match on every keystroke and clearing the box brought it
-            # back through lookup_last.
-            labels = [PICK_PROMPT] + [row[1] for row in matches]
-            chosen = st.selectbox(
-                f"{len(matches)} match(es)", labels, key="lookup_pick",
+            # PILLS rather than a selectbox. Streamlit draws a selectbox in
+            # a muted grey that reads as disabled, and it took a full row
+            # for what is a short list of choices. Pills are chips, and
+            # nothing being selected is the natural "not chosen yet" state
+            # so no sentinel option is needed - which also means typing
+            # cannot silently analyse whatever ranks first.
+            shown = matches[:12]
+            chosen = st.pills(
+                f"{len(matches)} match(es) - pick one",
+                [row[0] for row in shown], selection_mode="single",
+                key="lookup_pick",
                 help="Ordered stock first, then futures by expiry, then "
                      "option strikes - the underlying is usually what you "
                      "want.")
-            if chosen != PICK_PROMPT:
-                picked = matches[labels.index(chosen) - 1]
+            if len(matches) > len(shown):
+                st.caption(f"showing the closest {len(shown)} of "
+                           f"{len(matches)} - type more to narrow it")
+            if chosen:
+                picked = next(r for r in shown if r[0] == chosen)
+                st.caption(picked[1])
     if picked is not None:
         st.session_state["lookup_last"] = picked[0]
         query = picked[0]
@@ -1676,29 +1682,30 @@ def render_instrument_search() -> None:
 
 def render_scan_tab() -> None:
     """Intraday scanner tab: controls, then the last scan's results."""
-    st.caption(
-        "A separate system from the positional signal. It holds for hours, "
-        "not weeks, so it has its own data, thresholds and cost model - no "
-        "threshold is shared between the two. Read it as a screen that "
-        "prices trades and rules out the ones that cannot pay, not as a "
-        "ranked list of opportunities."
-    )
-    st.error(
-        "**This does not tell you which way a price will go.** We checked: "
-        "we ran the same method over 760,458 past moments, and it picked "
-        "winners no better than the identical method fed deliberately "
-        "scrambled answers. None of the 12 stop-and-target combinations we "
-        "tried made money on data it had not seen. So please do not read "
-        "the list below as a forecast."
-    )
-    st.info(
-        "**What it is genuinely good for.** The money columns are just "
-        "arithmetic, and those hold up: what a trade costs you in fees, how "
-        "often it would have to work to break even, and which setups cannot "
-        "pay for themselves however right you are about direction. Used to "
-        "say no to trades, this saves money. Used to pick them, it does not."
-    )
-    with st.expander("The exact figures, if you want them"):
+    # ONE line of the honesty text stays visible; the rest moved into the
+    # expander below. Three stacked warning blocks before any data meant
+    # the page opened with nothing on it but caveats, and a warning nobody
+    # reads is worse than a shorter one they do.
+    st.warning(
+        "**Not a forecast.** Tested over 760,458 past moments and it picked "
+        "winners no better than the same method fed scrambled answers. The "
+        "cost columns are arithmetic and do hold up - use this to rule "
+        "trades OUT.",
+        icon=":material/science:")
+    with st.expander("What was measured, and what this is good for"):
+        st.markdown(
+            "**What it is genuinely good for.** The money columns are just "
+            "arithmetic, and those hold up: what a trade costs you in fees, "
+            "how often it would have to work to break even, and which "
+            "setups cannot pay for themselves however right you are about "
+            "direction. Used to say no to trades, this saves money. Used to "
+            "pick them, it does not."
+        )
+        st.caption(
+            "A separate system from the positional signal: it holds for "
+            "hours, not weeks, so it has its own data, thresholds and cost "
+            "model, and no threshold is shared between the two."
+        )
         st.caption(
             "Gradient-boosted model, 32 features, 760,458 samples, purged "
             "walk-forward with an embargo. Ranking accuracy (AUC) 0.5205 "
@@ -1708,8 +1715,6 @@ def render_scan_tab() -> None:
             "0.091, so it cannot show significance at all. 0 of 12 "
             "geometries profitable."
         )
-    render_instrument_search()
-    st.divider()
     render_live_feed_panel()
     capital, risk_pct, scope, want_options, as_of, run = render_scan_controls()
     # AUTO-RUN THE FIRST SCAN when the session is live and the feed is
@@ -1840,21 +1845,31 @@ def render_positional_tab(profile_key: str, news_weight: float,
 
 profile_key, news_weight, max_age_hours = render_sidebar()
 
-st.title("📈 Sector Pulse")
+# The header carries the one control that used to own a whole tab. A
+# popover keeps the cache status and the sync button one click away
+# without giving a once-a-day action permanent space.
+_title, _sync = st.columns([5, 1], vertical_alignment="center")
+_title.title("📈 Sector Pulse")
+with _sync.popover("Instrument sync", width="stretch"):
+    render_sync_popover()
 
-tab_positional, tab_intraday, tab_sync = st.tabs(
-    ["Positional signal (end of day)",
-     "Scan: intraday / short / mid / long",
-     "Instrument sync"])
+# Above the tabs on purpose: "what about this one stock" is neither an
+# intraday scan nor an end-of-day sector signal, so it does not belong
+# inside either of them.
+render_instrument_search()
+st.divider()
 
-with tab_positional:
-    render_positional_tab(profile_key, news_weight, max_age_hours)
+tab_intraday, tab_positional = st.tabs(
+    ["Scan: intraday / short / mid / long",
+     "Positional signal (end of day)"])
 
+# The scan leads. It is the tab with live data behind it, and the one the
+# search above most often sends people to.
 with tab_intraday:
     render_scan_tab()
 
-with tab_sync:
-    render_sync_tab()
+with tab_positional:
+    render_positional_tab(profile_key, news_weight, max_age_hours)
 
 st.caption(
     "Educational tool only. Data comes from free public sources and may be delayed "
