@@ -18,6 +18,33 @@ from __future__ import annotations
 
 # --- what the columns mean ------------------------------------------------
 COLUMNS = {
+    # --- the Positions tab. Deliberately its own names: every number in
+    # that table is one the USER recorded, so the scan's wording - "sell
+    # here if it goes against you", "set at twice the distance to the
+    # stop" - is both advice and false there.
+    "Held": "Whether you are long or short this position, as you recorded "
+            "it.",
+    "State": "What is true about the position right now: whether price has "
+             "passed your stop or reached your exit, whether it is nearing "
+             "the exit, and whether the scan still points your way. A "
+             "statement about where price is, never a suggestion.",
+    "Your fill": "The price you told this app you actually got in at. "
+                 "Correct it with Edit levels if it is wrong - every "
+                 "percentage in the row is measured from it.",
+    "Price now": "The last live price this check could get. Blank means no "
+                 "price came back, which is not the same as nothing having "
+                 "changed.",
+    "Move %": "How far price has moved IN YOUR FAVOUR since your fill: "
+              "positive means up for a long and down for a short.",
+    "Your stop": "The stop you recorded. This app only tells you when "
+                 "price passes it; it places no orders and gives no "
+                 "instruction about what to do.",
+    "Your exit": "The exit you recorded, and the level the NEARING TARGET "
+                 "warning is measured against.",
+    "Shares": "The quantity you recorded, used only to turn a percentage "
+              "into rupees. Optional.",
+    "Why you took it": "Your own note, or which table the position came "
+                       "from.",
     "Symbol": "The stock's ticker on the NSE.",
     "Stock": "The stock's ticker on the NSE.",
     "Side": "Whether the setup is to buy (LONG) or to sell short (SHORT). "

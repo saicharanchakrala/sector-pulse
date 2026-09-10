@@ -5,7 +5,7 @@ Two tabs, two unrelated systems:
   Positional signal  blends RSS news sentiment with sector index/ETF momentum
                      into a composite score held for weeks.
   Scan               screens NSE F&O names across FOUR holding periods:
-                     intraday (5-minute bars, session-time gated), then
+                     intraday (3-minute bars, session-time gated), then
                      short, mid and long term (daily bars, no session
                      gate). Each prices the trade - round-trip cost and
                      whether the plausible move covers it - and ranks the
@@ -27,6 +27,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from streamlit.components.v1 import html as component_html
 
 import analyzer
 import claude_insights
@@ -48,6 +49,7 @@ import horizons
 import instrument_report
 import instrument_search
 import setups
+import sound
 import trade_costs
 from levels import LONG
 from models import NewsItem, ScoredNewsItem, SectorMomentum, SectorScore
@@ -656,6 +658,52 @@ def show_table(frame, target=None) -> None:
                       column_config=glossary.config_for(frame, st))
 
 
+def watch_table(frame, key: str, target=None, symbol: "str | None" = None,
+                entry: "float | None" = None, note: str = "") -> None:
+    """A table whose rows can be sent to Positions, with tooltips.
+
+    THE INTERACTION, and why it is not hover. A button that appears on the
+    row under the mouse needs a per-row control; Streamlit 1.58 has no
+    ButtonColumn and the dataframe is a canvas the page cannot draw into.
+    So the row's own selection checkbox is the affordance: click it and the
+    action appears directly below, prefilled from that row.
+
+    `symbol` and `entry` are for tables whose rows do not carry them - the
+    lookup shows one row per HORIZON for a single instrument, so both come
+    from the report around the table.
+
+    A row with no side or no levels gets no button and says why. That is a
+    real answer for a NO SETUP row, and better than a button that would
+    add a position nothing can be checked against.
+    """
+    surface = target if target is not None else st
+    picked = surface.dataframe(
+        frame, width="stretch", hide_index=True,
+        column_config=glossary.config_for(frame, st),
+        on_select="rerun", selection_mode="single-row", key=key)
+    rows = list(getattr(picked, "selection", {}).get("rows", []))
+    if not rows:
+        surface.caption(
+            "Tick a row to add it to Positions - the levels arrive "
+            "prefilled and editable.")
+        return
+    index = rows[0]
+    if index >= len(frame):
+        return
+    held = position_watch.position_from_row(
+        frame.iloc[index], symbol=symbol, entry=entry, note=note)
+    if held is None:
+        surface.caption(
+            "That row has no side and levels to watch. Rows showing a "
+            "direction with a stop and an exit can be added.")
+        return
+    if surface.button(f"Add {held.symbol} {held.side} to Positions",
+                      key=f"{key}_add", type="primary",
+                      icon=":material/visibility:"):
+        open_watch_draft(held.symbol, held.side, held.entry, held.stop,
+                         held.target, held.quantity, held.note)
+
+
 def show_terms(*names: str) -> None:
     """An expander explaining the concepts behind a table."""
     wanted = [n for n in names if n in glossary.CONCEPTS]
@@ -1148,29 +1196,11 @@ def render_scan_results(ranked: list[setups.Setup], bars: scan_data.BarSet,
             )
     else:
         frame = scan_frame(actionable)
-        # SELECTABLE, so a row can go straight to the watch. Every number
-        # the watch needs is already in the row; retyping it into a form
-        # was tedious and a chance to fumble a digit into a watch that
-        # then reports nonsense.
-        picked = st.dataframe(
-            frame, width="stretch", hide_index=True,
-            column_config=glossary.config_for(frame, st),
-            on_select="rerun", selection_mode="multi-row", key="scan_pick")
-        rows = list(getattr(picked, "selection", {}).get("rows", []))
-        if rows:
-            chosen = [actionable[i] for i in rows if i < len(actionable)]
-            if chosen and st.button(
-                    f"Watch {len(chosen)} selected: "
-                    + ", ".join(f"{c.symbol} {c.direction}" for c in chosen),
-                    type="primary", key="watch_selected"):
-                added = watch_setups(chosen)
-                st.success(
-                    f"Watching {added}. The entry used is the last traded "
-                    f"price when the scan ran - correct it to your real "
-                    f"fill in the watch panel at the top.")
-                st.rerun()
-        else:
-            st.caption("Tick a row to add it to the position watch.")
+        # Selectable, like every other table in the app: the row already
+        # holds every number the watch needs, and retyping them into a
+        # form was tedious and a chance to fumble a digit into a watch
+        # that then reports nonsense.
+        watch_table(frame, "scan_pick", note="from the intraday scan")
         show_terms("How a stop and target are set",
                    "Why charges matter so much",
                    "What 'volume vs normal' tells you")
@@ -1302,10 +1332,12 @@ def render_live_feed_panel() -> None:
         return
     with st.expander("Live tick feed", expanded=not state.get("running")):
         st.caption(
-            "A separate process streams ticks and builds 5-minute bars, so a "
-            "scan reads them instead of downloading 216 symbols at Kite's "
-            "3 requests a second. Prior sessions come from a cached window "
-            "ending yesterday; only today comes from the stream."
+            f"A separate process streams ticks and builds "
+            f"{config.SCAN_BAR_INTERVAL} bars - the same size the historical "
+            f"fetch asks for, or the two halves of a session would not join "
+            f"- so a scan reads them instead of downloading every symbol at "
+            f"Kite's 3 requests a second. Prior sessions come from a cached "
+            f"window ending yesterday; only today comes from the stream."
         )
         left, mid, right = st.columns(3)
         left.metric("Feed", "running" if state.get("running") else "stopped")
@@ -1431,7 +1463,11 @@ def render_horizon_tables(symbols: list, top: int = 20) -> None:
             slot.info("nothing assessable at this horizon")
             continue
         frame = horizons.to_frame(rows)
-        show_table(frame, target=slot)
+        # .container() rather than the bare placeholder: the action button
+        # renders below the table and st.empty holds one element.
+        watch_table(frame, f"horizon_pick_{name}",
+                    target=slot.container(),
+                    note=f"from the {name} horizon table")
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -1471,47 +1507,6 @@ def search_instruments(text: str, limit: int = 25) -> list:
     return [(m.symbol, m.label, m.kind, m.underlying,
              m.expiry, m.strike, m.right, m.lot_size)
             for m in instrument_search.search(text, limit=limit)]
-
-
-def render_watch_buttons(report: dict) -> None:
-    """One Watch button per horizon that has usable levels.
-
-    The lookup already shows a stop and an exit per horizon, so watching
-    one is a click rather than five typed fields. BUY and NO BUY both get
-    a button on purpose: people take positions the gates would refuse, and
-    a watch on one of those is MORE useful than a watch on a clean setup -
-    it is the case where an invalidation is most likely to arrive.
-    """
-    rows = report.get("table")
-    if rows is None or rows.empty:
-        return
-    usable = [r for _, r in rows.iterrows()
-              if r.get("Stop loss at") and r.get("Exit price")
-              and r.get("Horizon") != "intraday"]
-    if not usable:
-        return
-    st.caption("Watch a horizon to be told when its own gates stop "
-               "supporting it:")
-    columns = st.columns(max(1, len(usable)))
-    for column, row in zip(columns, usable):
-        horizon = row["Horizon"]
-        if column.button(f"Watch {horizon}", key=f"watchh_{report['symbol']}_{horizon}",
-                         width="stretch"):
-            side = (row.get("View") or position_watch.LONG).strip().upper()
-            held = position_watch.Position(
-                symbol=report["symbol"], side=side,
-                entry=float(report["price"]),
-                stop=float(row["Stop loss at"]),
-                target=float(row["Exit price"]),
-                note=f"from the {horizon} horizon")
-            if not held.is_valid:
-                st.warning(
-                    f"The {horizon} levels do not bracket the price the way "
-                    f"a {side} needs - nothing was added.")
-            else:
-                position_watch.add(held)
-                st.success(f"Watching {held.symbol} {side} ({horizon}).")
-                st.rerun()
 
 
 def render_pivot_levels(levels: "dict | None", price: float) -> None:
@@ -1627,10 +1622,14 @@ def render_contract_assessment(symbol: str, kind: str,
                                 f"{report['price']:,.2f}"
                                 + ("  (live)" if report.get("live_anchored")
                                    else "  (last close)"))
-                    show_table(table)
+                    watch_table(table, f"under_pick_{underlying}",
+                                symbol=underlying,
+                                entry=report.get("price"),
+                                note=f"{underlying}, via an option lookup")
                     st.caption(
                         f"Every level above is a level on {underlying} "
-                        f"itself. None of them is a level on this option.")
+                        f"itself. None of them is a level on this option, "
+                        f"and adding one watches {underlying}.")
         return
     match = instrument_search.find(symbol)
     if match is None:
@@ -1664,7 +1663,10 @@ def render_contract_assessment(symbol: str, kind: str,
             "Move vs fees": detail["covers"],
             "Blocked by": detail["blocker"],
         })
-    show_table(pd.DataFrame(rows))
+    priced = [d["price"] for d in verdicts.values() if d.get("price")]
+    watch_table(pd.DataFrame(rows), f"contract_pick_{symbol}",
+                symbol=symbol, entry=(priced[0] if priced else None),
+                note=f"{symbol} futures")
     st.caption(
         f"Readings from **{underlying}**'s daily history - a contract's own "
         f"history is weeks long and breaks across rolls. Levels from **this "
@@ -1695,6 +1697,10 @@ def contract_verdicts(symbol: str) -> dict:
         a = verdict.assessment
         out[name] = {
             "verdict": verdict.verdict, "view": a.direction,
+            # The contract's own price, carried so a row from this table
+            # can be watched: the table shows a stop and an exit but no
+            # price, and a watch with no entry is unwatchable.
+            "price": round(a.price, 2),
             "stop": round(a.stop_price, 2), "exit": round(a.target_price, 2),
             "cost": a.cost_pct, "covers": f"{a.cost_multiple:.0f}x",
             "blocker": (verdict.blocker.split(" [")[0]
@@ -1821,102 +1827,398 @@ def scanner_view(symbol: str) -> tuple:
     return None, None, ""
 
 
-def watch_setups(setups_to_watch: list) -> str:
-    """Add each setup to the watch using its own levels. Returns a summary.
+def watch_statuses(positions: list) -> tuple:
+    """(ranked statuses, note) for everything being watched, priced live.
 
-    The entry is the setup's last traded price, which is NOT the user's
-    fill - the watch panel exposes it for correction rather than treating
-    it as exact.
+    The scanner's own view comes from the scan already in session state
+    rather than a fresh scan: this runs every few seconds and must stay
+    cheap, and a 60-second-old scan is the same scan on screen.
     """
-    names = []
-    for setup in setups_to_watch:
-        if setup.levels is None:
-            continue
-        position_watch.add(position_watch.Position(
-            symbol=setup.symbol, side=setup.direction,
-            entry=round(setup.levels.entry, 2),
-            stop=round(setup.levels.stop, 2),
-            target=round(setup.levels.target, 2),
-            quantity=int(setup.levels.quantity or 0),
-            note="from the intraday scan"))
-        names.append(f"{setup.symbol} {setup.direction}")
-    return ", ".join(names) if names else "nothing"
+    note = ""
+    live = {}
+    if positions:
+        live = horizons.live_prices_for([p.symbol for p in positions])
+        # DERIVED FROM THE RESULT, not from an exception: live_prices_for
+        # catches everything and returns {}, so a try/except here could
+        # never fire and a dead feed showed no warning at all - every
+        # position simply read NO LIVE PRICE, which is neither an alert
+        # nor a warning. Silence in the alerting system is the one failure
+        # this whole tab exists to remove.
+        if not live:
+            note = ("**No live prices came back, so nothing below has been "
+                    "checked.** That is not the same as nothing being "
+                    "wrong. The market may be closed; during a session it "
+                    "means the Kite session has expired or the feed is "
+                    "down, and the watch cannot alert you until it is back.")
+    out = []
+    for held in positions:
+        direction, actionable, blocker = scanner_view(held.symbol)
+        out.append(position_watch.assess(
+            held, live_price=live.get(held.symbol),
+            current_direction=direction, actionable=actionable,
+            blocker=blocker))
+    return position_watch.rank(out), note
 
 
-def render_position_watch() -> None:
-    """Positions you hold, checked against the scanner's own gates.
+# --- adding one, from a row or from the lookup ---------------------------
 
-    Renders nothing when the list is empty, so it costs no space until it
-    is being used. When it is, it goes first - the HDFCLIFE loss happened
-    because the invalidation was on the page but nowhere near where
-    someone holding the position would look.
+def open_watch_draft(symbol: str, side: str, entry: float, stop: float,
+                     target: float, quantity: int = 0, note: str = "") -> None:
+    """Stash prefilled levels and rerun the whole app so the modal opens.
+
+    scope="app" rather than the default: the scan table lives inside an
+    auto-refreshing fragment, and a dialog opened from inside a fragment
+    is a corner of Streamlit not worth betting an alert on. Rerunning the
+    app puts the dialog call at the top level where it plainly works.
+    """
+    # THE WIDGETS MUST BE CLEARED FIRST. number_input, text_input and
+    # selectbox take their identity from the KEY alone in 1.58, so `value=`
+    # is only an initial default: once draft_entry holds state, a second
+    # open of the modal shows the FIRST row's numbers and quietly ignores
+    # the prefill. Selecting row B and pressing its button would then add
+    # row A. Popping the keys makes each open a fresh form.
+    for stale in ("draft_symbol", "draft_side", "draft_qty", "draft_entry",
+                  "draft_stop", "draft_target", "draft_note"):
+        st.session_state.pop(stale, None)
+    st.session_state["watch_draft"] = {
+        "symbol": symbol, "side": side, "entry": float(entry),
+        "stop": float(stop), "target": float(target),
+        "quantity": int(quantity or 0), "note": note,
+    }
+    # An app-scope rerun, so the dialog is called from the top level. A
+    # dialog opened from inside the auto-refreshing scan fragment is a
+    # corner of Streamlit not worth betting an alert on.
+    st.rerun(scope="app")
+
+
+def forget_watch_draft() -> None:
+    """Drop the prefilled draft. Called when the modal is dismissed.
+
+    Without this, Escape or the X closed the dialog with no rerun, the
+    draft survived in session state, and the modal reappeared on the next
+    full rerun - with the previous row's numbers still in its widgets.
+    """
+    st.session_state.pop("watch_draft", None)
+
+
+@st.dialog("Add to Positions", on_dismiss=forget_watch_draft)
+def watch_dialog() -> None:
+    """Confirm or correct the suggested levels, then watch them.
+
+    Everything is prefilled from the row that opened it, and everything is
+    editable, because the row cannot know one crucial number: what you
+    actually filled at. Its entry is the last traded price when the scan
+    ran.
+    """
+    draft = st.session_state.get("watch_draft") or {}
+    sides = [position_watch.LONG, position_watch.SHORT]
+    st.caption(
+        "Prefilled from the row. Correct anything that does not match what "
+        "you actually did - the fill price especially, since the row's "
+        "entry is the last traded price when the scan ran, not your fill."
+    )
+    one, two, three = st.columns([2, 1, 1])
+    symbol = one.text_input("Symbol", value=draft.get("symbol", ""),
+                            key="draft_symbol")
+    side = two.selectbox(
+        "Side", sides, key="draft_side",
+        index=sides.index(draft["side"]) if draft.get("side") in sides else 0)
+    quantity = three.number_input(
+        "Quantity", min_value=0, step=1, key="draft_qty",
+        value=int(draft.get("quantity", 0)),
+        help="Optional - only used to turn a percentage into rupees.")
+    four, five, six = st.columns(3)
+    entry = four.number_input("Filled at", min_value=0.0, step=0.05,
+                              format="%.2f", key="draft_entry",
+                              value=float(draft.get("entry", 0.0)))
+    stop = five.number_input("Stop", min_value=0.0, step=0.05,
+                             format="%.2f", key="draft_stop",
+                             value=float(draft.get("stop", 0.0)))
+    target = six.number_input("Exit / target", min_value=0.0, step=0.05,
+                              format="%.2f", key="draft_target",
+                              value=float(draft.get("target", 0.0)))
+    note = st.text_input("Note", value=draft.get("note", ""),
+                         key="draft_note",
+                         placeholder="why you took it, in your own words")
+    add, cancel = st.columns(2)
+    if add.button("Watch it", type="primary", width="stretch"):
+        held = position_watch.Position(
+            symbol=symbol, side=side, entry=float(entry), stop=float(stop),
+            target=float(target), quantity=int(quantity), note=note)
+        if not held.symbol:
+            st.warning("A symbol is needed.")
+        elif not held.is_valid:
+            st.error(
+                f"Those levels cannot describe a {held.side}. For a "
+                f"{position_watch.LONG} the stop must sit below the entry "
+                f"and the target above it; for a {position_watch.SHORT} the "
+                f"other way round. Nothing was added.")
+        else:
+            position_watch.add(held)
+            st.session_state.pop("watch_draft", None)
+            st.rerun()
+    if cancel.button("Cancel", width="stretch"):
+        st.session_state.pop("watch_draft", None)
+        st.rerun()
+
+
+# --- the alert ------------------------------------------------------------
+
+def speech_html(phrases: list, speak_now: bool = True) -> str:
+    """A component iframe that speaks the alert, and can be asked again.
+
+    The replay button is not a nicety. Chrome refuses
+    speechSynthesis.speak() in a document that has never been clicked, and
+    this iframe is rebuilt on the rerun that carries the alert, so the
+    first attempt may be dropped with no error anywhere. Clicking the
+    button both gives that document its activation and says the sentence.
+    """
+    # "</" escaped: json.dumps does not, and a symbol containing it would
+    # close the script block. Self-inflicted only, and one line to prevent.
+    lines = json.dumps([p for p in phrases if p]).replace("</", "<\\/")
+    return f"""
+<div style="font:13px system-ui,-apple-system,sans-serif;color:#555;
+            display:flex;align-items:center;gap:.6rem">
+  <button id="again" style="font:13px system-ui;padding:.3rem .7rem;
+          border:1px solid #bbb;border-radius:.4rem;background:#fff;
+          cursor:pointer">&#128266; Say it again</button>
+  <span id="said"></span>
+</div>
+<script>
+const lines = {lines};
+document.getElementById("said").textContent = lines.join("  ");
+function say() {{
+  if (!("speechSynthesis" in window)) return;
+  window.speechSynthesis.cancel();
+  for (const line of lines) {{
+    const u = new SpeechSynthesisUtterance(line);
+    u.rate = 0.95;
+    window.speechSynthesis.speak(u);
+  }}
+}}
+document.getElementById("again").addEventListener("click", say);
+if ({'true' if speak_now else 'false'}) say();
+</script>
+"""
+
+
+def announce(statuses: list) -> bool:
+    """Chime and speak any alert not already announced. True if it fired.
+
+    The dedupe rule lives in position_watch.alerts_to_announce, tested
+    there: one alert per position and STATE, and the key forgotten as soon
+    as the state clears so a recurrence is not swallowed.
+    """
+    said = st.session_state.get("announced", set())
+    fresh, said = position_watch.alerts_to_announce(statuses, said)
+    st.session_state["announced"] = said
+    if not fresh:
+        return False
+    # A NONCE PER ALERT, and not for decoration. st.audio derives the
+    # element id from a hash of the audio content and the frontend refuses
+    # to autoplay an id it has already seen, so with identical bytes the
+    # first stop of a session sounded and every one after it was silent.
+    nonce = int(st.session_state.get("alert_nonce", 0)) + 1
+    st.session_state["alert_nonce"] = nonce
+    for status in fresh:
+        st.toast(f"{status.position.symbol} {status.position.side} - "
+                 f"{status.state}", icon=":material/campaign:")
+    # One chime for the batch, chosen by the worst state in it: four
+    # overlapping tones is noise, and alerts_to_announce returns them
+    # worst first.
+    chime = sound.chime_for(fresh[0].state, nonce)
+    if chime:
+        st.audio(chime, format="audio/wav", autoplay=True)
+    phrases = [s.spoken for s in fresh]
+    component_html(speech_html(phrases), height=40)
+    # Kept, because both channels can be suppressed by the browser and
+    # this panel is redrawn every twenty seconds - the alert itself would
+    # scroll into history within one tick, taking its replay button with
+    # it.
+    st.session_state["standing_alert"] = {
+        "phrases": phrases,
+        "worst": fresh[0].state,
+        "at": datetime.now(IST_ZONE).strftime("%H:%M:%S"),
+    }
+    return True
+
+
+def render_standing_alert() -> None:
+    """The last alert, until it is acknowledged.
+
+    Neither channel is guaranteed to arrive: Chrome can suppress the
+    utterance, and a page nobody has clicked can suppress the chime too.
+    So the sentence stays on screen with a button that says it again -
+    which the alert itself cannot do, since the fragment redraws over it.
+    """
+    standing = st.session_state.get("standing_alert")
+    if not standing:
+        return
+    left, right = st.columns([4, 1], vertical_alignment="center")
+    left.warning(f"**{standing['at']}** - {' '.join(standing['phrases'])}",
+                 icon=":material/notifications_active:")
+    with right:
+        if st.button("Acknowledge", key="ack_alert", width="stretch"):
+            st.session_state.pop("standing_alert", None)
+            st.rerun()
+    component_html(speech_html(standing["phrases"], speak_now=False),
+                   height=40)
+
+
+# --- the tab --------------------------------------------------------------
+
+def watch_frame(statuses: list) -> pd.DataFrame:
+    """Watched positions as one table, worst first.
+
+    The column names deliberately differ from the scan's, and so do their
+    tooltips. The scan's are written about the scanner's own proposals -
+    "Sell here if it goes against you", which is advice this project does
+    not give, and "Set at twice the distance to the stop", which is false
+    of a number the user typed. Same table shape, different meaning, so
+    different names and their own entries in the glossary.
+    """
+    rows = []
+    for status in statuses:
+        held = status.position
+        rows.append({
+            "Symbol": held.symbol,
+            "Held": held.side,
+            "State": status.state,
+            # `x == x` rather than truthiness: NaN is truthy and 0.0 is
+            # not, so `if status.price` had it exactly backwards.
+            "Your fill": round(held.entry, 2),
+            "Price now": (round(status.price, 2)
+                          if status.price == status.price else None),
+            "Move %": (round(status.move_pct, 2)
+                       if status.move_pct == status.move_pct else None),
+            "Your stop": round(held.stop, 2),
+            "Your exit": round(held.target, 2),
+            "Shares": held.quantity or None,
+            "Why you took it": held.note,
+        })
+    return pd.DataFrame(rows)
+
+
+def render_watched_position(status) -> None:
+    """One position: its state, the checks behind it, and its two edits."""
+    held = status.position
+    title = (f"**{held.symbol} {held.side}** from {held.entry:,.2f} - "
+             f"{status.state}")
+    body = f"{title}\n\n{status.headline}. {status.detail}"
+    if status.state == position_watch.STOP_BREACHED:
+        st.error(body, icon=":material/warning:")
+    elif status.state == position_watch.TARGET_REACHED:
+        st.success(body, icon=":material/flag:")
+    elif status.state == position_watch.NEAR_TARGET:
+        st.success(body, icon=":material/trending_up:")
+    elif status.needs_attention:
+        st.warning(body, icon=":material/change_circle:")
+    else:
+        st.info(body)
+    for line in status.lines:
+        st.caption(f"- {line}")
+    edit, drop, _ = st.columns([1, 1, 3])
+    if edit.button("Edit levels", key=f"edit_{held.symbol}_{held.side}",
+                   width="stretch"):
+        open_watch_draft(held.symbol, held.side, held.entry, held.stop,
+                         held.target, held.quantity, held.note)
+    if drop.button("Stop watching", key=f"unwatch_{held.symbol}_{held.side}",
+                   width="stretch"):
+        position_watch.remove(held.symbol, held.side)
+        st.rerun()
+
+
+def positions_panel(speak: bool) -> None:
+    """The re-priced half of the tab, re-run on its own timer.
+
+    Everything that must stay CURRENT lives in here and nothing else
+    does. The manual form used to be here too and re-rendered under the
+    user's fingers every twenty seconds.
     """
     positions = position_watch.load()
-    with st.expander(f"Positions I am watching ({len(positions)})",
-                     expanded=bool(positions)):
-        st.caption(
-            "The scanner is stateless - it describes every symbol now and "
-            "forgets. This is the one place that knows what you already "
-            "did. It reports where price sits against your own levels and "
-            "whether the gates still agree; it never tells you what to do."
+    if not positions:
+        st.session_state["watch_attention"] = False
+        st.info(
+            "Nothing is being watched. Tick a row in any table - the "
+            "intraday scan, the short, mid or long horizon tables, or an "
+            "instrument you looked up - and press the button that appears. "
+            "The levels arrive prefilled and editable."
         )
-        if positions:
-            live = {}
-            try:
-                live = horizons.live_prices_for([p.symbol for p in positions])
-            except Exception as exc:
-                st.caption(f"no live prices ({exc})")
-            statuses = []
-            for held in positions:
-                direction, actionable, blocker = scanner_view(held.symbol)
-                statuses.append(position_watch.assess(
-                    held, live_price=live.get(held.symbol),
-                    current_direction=direction, actionable=actionable,
-                    blocker=blocker))
-            for status in position_watch.rank(statuses):
-                held = status.position
-                title = (f"**{held.symbol} {held.side}** from "
-                         f"{held.entry:,.2f} - {status.state}")
-                if status.state == position_watch.STOP_BREACHED:
-                    st.error(f"{title}\n\n{status.headline}. "
-                             f"{status.detail}", icon=":material/warning:")
-                elif status.state == position_watch.TARGET_REACHED:
-                    st.success(f"{title}\n\n{status.headline}. "
-                               f"{status.detail}", icon=":material/flag:")
-                elif status.needs_attention:
-                    st.warning(f"{title}\n\n{status.headline}. "
-                               f"{status.detail}",
-                               icon=":material/change_circle:")
-                else:
-                    st.info(f"{title}\n\n{status.headline}. "
-                            f"{status.detail}")
-                for line in status.lines:
-                    st.caption(f"- {line}")
-                # The fill price is the one thing a table row cannot know,
-                # so it is correctable here rather than assumed exact.
-                edit, drop = st.columns([3, 1], vertical_alignment="bottom")
-                filled = edit.number_input(
-                    f"Your actual fill for {held.symbol}",
-                    min_value=0.0, value=float(held.entry), step=0.05,
-                    format="%.2f",
-                    key=f"fill_{held.symbol}_{held.side}")
-                if abs(float(filled) - held.entry) > 1e-9:
-                    held.entry = float(filled)
-                    position_watch.add(held)
-                    st.rerun()
-                if drop.button("Stop watching",
-                               key=f"unwatch_{held.symbol}_{held.side}",
-                               width="stretch"):
-                    position_watch.remove(held.symbol, held.side)
-                    st.rerun()
-            st.divider()
-        with st.expander("Add one by hand"):
-            st.caption(
-                "Only needed when there is no row to select - a position "
-                "taken before this session, say. Otherwise pick rows in "
-                "the scan table, or use Watch on a horizon in the lookup."
-            )
-            render_watch_form()
+        return
+    statuses, note = watch_statuses(positions)
+    trading = live_bars_in_hours()
+    # A feed that cannot price anything IS something needing attention,
+    # during a session. Outside one it is just the market being shut.
+    st.session_state["watch_attention"] = (
+        any(s.needs_attention for s in statuses) or bool(note and trading))
+    if note:
+        (st.warning if trading else st.info)(note)
+    if not (speak and announce(statuses)):
+        render_standing_alert()
+    show_table(watch_frame(statuses))
+    st.caption(
+        "Every number in that table is YOURS - the fill, the stop and the "
+        "exit you recorded. Nothing in it is a suggestion."
+    )
+    for status in statuses:
+        render_watched_position(status)
+    stamp = datetime.now(IST_ZONE).strftime("%H:%M:%S")
+    st.caption(
+        f"Checked at {stamp} IST"
+        + (f", again in {config.POSITION_WATCH_REFRESH_SECONDS}s."
+           if trading else
+           ". The market is closed, so this is the last traded state."))
+
+
+def render_positions_tab() -> None:
+    """Positions you hold, checked against the scanner's own gates.
+
+    The scanner is stateless: it describes every symbol now and forgets.
+    This is the one place that knows what you already did, which is the
+    gap that cost real money on HDFCLIFE - the invalidation was on the
+    page and nowhere near where someone holding the position would look.
+    """
+    st.caption(
+        "What you already hold, re-priced against your own stop and exit "
+        "and against the gates that produced it. It reports; it never says "
+        "exit, hold or add - that is a decision about your money."
+    )
+    left, right = st.columns([1, 2], vertical_alignment="center")
+    speak = left.toggle(
+        "Announce out loud", value=True, key="watch_speak",
+        help="A chime plus a spoken sentence when a stop or target is hit, "
+             "a target is neared, or the scan flips against you. Each alert "
+             "sounds once, not on every refresh.")
+    if right.button("Test the sound", key="watch_sound_test"):
+        # Its own nonce, for the same reason a real alert has one: the
+        # frontend will not autoplay an audio id it has already seen, so a
+        # second press was silent while the sentence still claimed the
+        # sound worked. It also stops a test burning the id that a real
+        # TARGET REACHED would need later in the session.
+        nonce = int(st.session_state.get("alert_nonce", 0)) + 1
+        st.session_state["alert_nonce"] = nonce
+        st.audio(sound.chime_for(position_watch.TARGET_REACHED, nonce),
+                 format="audio/wav", autoplay=True)
+        component_html(speech_html(
+            ["Sector Pulse. This is what a target reached sounds like."]),
+            height=40)
+    # UNCONDITIONAL, and that is the fix for the worst bug review found.
+    # This used to pass run_every=None unless the market was open AND
+    # something was already watched - both evaluated on a full app run.
+    # Fragment ticks never cause a full run, so a page opened at 09:00, or
+    # before the first position was added, got no timer for the rest of
+    # the session and never alerted at all. Whether the market is open is
+    # now decided INSIDE the fragment, on every tick, where it can change.
+    st.fragment(lambda: positions_panel(speak),
+                run_every=config.POSITION_WATCH_REFRESH_SECONDS)()
+    # Outside the fragment on purpose: a form that re-renders itself every
+    # twenty seconds is a form you cannot finish filling in.
+    with st.expander("Add one by hand"):
+        st.caption(
+            "Only needed when there is no row to work from - a position "
+            "taken before this session, say."
+        )
+        render_watch_form()
 
 
 def render_watch_form() -> None:
@@ -2097,8 +2399,12 @@ def render_instrument_search() -> None:
     )
     table = report["table"]
     if table is not None and not table.empty:
-        show_table(table)
-        render_watch_buttons(report)
+        # One row per horizon, so the symbol and the price come from the
+        # report rather than from the row. The intraday row has no daily
+        # levels and is refused with a reason, which is the honest answer.
+        watch_table(table, f"lookup_pick_{report['symbol']}",
+                    symbol=report["symbol"], entry=report.get("price"),
+                    note="from the instrument lookup")
         show_terms("What the horizons mean", "Why charges matter so much",
                    "Why this tool will not predict for you")
     render_pivot_levels(report.get("pivots"), report["price"])
@@ -2288,20 +2594,29 @@ _title.title("📈 Sector Pulse")
 with _sync.popover("Instrument sync", width="stretch"):
     render_sync_popover()
 
-# FIRST, above even the lookup. The HDFCLIFE loss happened because the
-# invalidation was on the page and nowhere near where someone holding the
-# position would look.
-render_position_watch()
-
 # Above the tabs on purpose: "what about this one stock" is neither an
 # intraday scan nor an end-of-day sector signal, so it does not belong
 # inside either of them.
 render_instrument_search()
 st.divider()
 
-tab_intraday, tab_positional = st.tabs(
+# Opened here, at the top level, rather than from inside the scan
+# fragment that sets the draft - see open_watch_draft.
+if st.session_state.get("watch_draft"):
+    watch_dialog()
+
+# The count comes from the watch file, which is exact. The warning mark
+# comes from the last completed check AND ONLY UPDATES ON A FULL APP RUN -
+# the watch re-checks itself in a fragment, and fragment ticks do not
+# re-render tab labels. So it can lag by a long time. The chime, the
+# toast and the standing alert inside the tab are the alerts; this is a
+# signpost for when you next interact with the page.
+_held = position_watch.load()
+_mark = "⚠️ " if st.session_state.get("watch_attention") else ""
+tab_intraday, tab_positional, tab_positions = st.tabs(
     ["Scan: intraday / short / mid / long",
-     "Positional signal (end of day)"])
+     "Positional signal (end of day)",
+     f"{_mark}Positions ({len(_held)})"])
 
 # The scan leads. It is the tab with live data behind it, and the one the
 # search above most often sends people to.
@@ -2310,6 +2625,12 @@ with tab_intraday:
 
 with tab_positional:
     render_positional_tab(profile_key, news_weight, max_age_hours)
+
+# Streamlit renders every tab's children whether or not it is on top, so
+# the watch keeps re-pricing and keeps alerting while you are looking at
+# the scan. That is the whole point of it.
+with tab_positions:
+    render_positions_tab()
 
 st.caption(
     "Educational tool only. Data comes from free public sources and may be delayed "

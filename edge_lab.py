@@ -60,7 +60,16 @@ LONG = "LONG"
 SHORT = "SHORT"
 
 CACHE_DIR = config.PROJECT_ROOT / "bar_cache"
-BARS_PER_ORB = max(1, config.SCAN_OPENING_RANGE_MINUTES // 5)
+# The bar size this harness measures on. Separate from the live scanner's
+# config.SCAN_BAR_INTERVAL on purpose - the harness exists to compare bar
+# sizes, so it cannot inherit the one currently in production - but the
+# opening-range bar count MUST be derived from whichever size a run uses.
+# It was `// 5` against a 5m default: a 3m run would then have taken its
+# opening range over 3 bars, which is 9 minutes against the 5m arm's 15,
+# and any comparison between the two would have been measuring the range
+# length as much as the bar size.
+LAB_BAR_MINUTES = 5
+BARS_PER_ORB = max(1, config.SCAN_OPENING_RANGE_MINUTES // LAB_BAR_MINUTES)
 # Prior sessions in the relative-volume baseline. Matches the live
 # scanner's 20-day window; also bounds the per-session precompute, which is
 # what keeps the harness linear in sessions rather than quadratic.
@@ -220,7 +229,7 @@ def _span_days(period: str, default: int = 60) -> int:
 
 
 def load_bars(symbols: list[str], period: str = "60d",
-              interval: str = "5m", refresh: bool = False
+              interval: str = f"{LAB_BAR_MINUTES}m", refresh: bool = False
               ) -> dict[str, pd.DataFrame]:
     """Fetch and cache OHLCV frames, one parquet file per symbol.
 

@@ -156,6 +156,130 @@ def test_the_worst_position_sorts_first() -> None:
     assert order == ["B", "C", "A"]
 
 
+def test_the_assessed_price_is_carried_on_the_status() -> None:
+    # The table shows the verdict and the price side by side; taking the
+    # price from a second fetch could show a number the state contradicts.
+    held = pw.Position(**HDFCLIFE)
+    assert pw.assess(held, live_price=509.0).price == pytest.approx(509.0)
+    stopped = pw.assess(held, live_price=520.15)
+    assert stopped.price == pytest.approx(520.15)
+    # No price means no price, not zero.
+    blind = pw.assess(held, live_price=None)
+    assert blind.price != blind.price
+
+
+# --- what gets announced, and how often ----------------------------------
+
+def _status(symbol, price, side=pw.SHORT):
+    return pw.assess(pw.Position(symbol=symbol, side=side, entry=511.20,
+                                 stop=516.00, target=501.60),
+                     live_price=price)
+
+
+def test_only_the_states_worth_interrupting_for_are_announced() -> None:
+    quiet = pw.assess(pw.Position(**HDFCLIFE), live_price=509.0,
+                      current_direction=pw.SHORT, actionable=True)
+    unsupported = pw.assess(pw.Position(**HDFCLIFE), live_price=509.0,
+                            current_direction=pw.SHORT, actionable=False)
+    blind = pw.assess(pw.Position(**HDFCLIFE), live_price=None)
+    fresh, said = pw.alerts_to_announce([quiet, unsupported, blind], set())
+    assert fresh == [] and said == set()
+
+
+def test_a_persisting_breach_is_announced_once() -> None:
+    fresh, said = pw.alerts_to_announce([_status("HDFCLIFE", 520.15)], set())
+    assert [s.state for s in fresh] == [pw.STOP_BREACHED]
+    # Still breached, a different price, twenty seconds later.
+    again, said = pw.alerts_to_announce([_status("HDFCLIFE", 523.40)], said)
+    assert again == [], "the same breach was announced twice"
+
+
+def test_a_state_that_clears_and_returns_is_announced_again() -> None:
+    # Announce the breach, widen the stop, watch price take out the new
+    # one. Remembering keys forever made that second breach SILENT, which
+    # is worse than announcing it twice.
+    fresh, said = pw.alerts_to_announce([_status("HDFCLIFE", 520.15)], set())
+    assert [s.state for s in fresh] == [pw.STOP_BREACHED]
+    widened = pw.assess(pw.Position(symbol="HDFCLIFE", side=pw.SHORT,
+                                    entry=511.20, stop=525.00, target=501.60),
+                        live_price=520.15)
+    assert widened.state != pw.STOP_BREACHED
+    _, said = pw.alerts_to_announce([widened], said)
+    assert said == set(), "the cleared state was still remembered"
+    breached_again = pw.assess(pw.Position(symbol="HDFCLIFE", side=pw.SHORT,
+                                           entry=511.20, stop=525.00,
+                                           target=501.60),
+                               live_price=526.00)
+    fresh, _ = pw.alerts_to_announce([breached_again], said)
+    assert [s.state for s in fresh] == [pw.STOP_BREACHED]
+
+
+def test_a_removed_position_does_not_stay_suppressed() -> None:
+    fresh, said = pw.alerts_to_announce([_status("HDFCLIFE", 520.15)], set())
+    assert fresh
+    _, said = pw.alerts_to_announce([], said)     # stopped watching it
+    assert said == set()
+    fresh, _ = pw.alerts_to_announce([_status("HDFCLIFE", 520.15)], said)
+    assert fresh, "re-adding the position left it silent"
+
+
+def test_a_genuinely_new_state_is_announced_again() -> None:
+    fresh, said = pw.alerts_to_announce([_status("HDFCLIFE", 503.50)], set())
+    assert [s.state for s in fresh] == [pw.NEAR_TARGET]
+    fresh, _ = pw.alerts_to_announce([_status("HDFCLIFE", 501.00)], said)
+    assert [s.state for s in fresh] == [pw.TARGET_REACHED]
+
+
+def test_a_batch_of_alerts_comes_worst_first() -> None:
+    # The caller plays one sound for the batch, so the head of the list
+    # decides which one.
+    batch = [_status("A", 501.00), _status("B", 520.15),
+             _status("C", 503.50)]
+    fresh, _ = pw.alerts_to_announce(batch, set())
+    assert [s.state for s in fresh] == [pw.STOP_BREACHED, pw.TARGET_REACHED,
+                                        pw.NEAR_TARGET]
+
+
+def test_a_reversal_outranks_being_nearly_at_target() -> None:
+    # THE BUG THIS PINS. Nearing the target returned before the scanner
+    # check and outranked it, so a position four fifths of the way to
+    # target whose scan had flipped reported NEARING TARGET and the flip
+    # appeared nowhere at all - not the state, not the headline, not the
+    # lines. Which is the HDFCLIFE failure, inside the module written to
+    # prevent it.
+    held = pw.Position(**HDFCLIFE)
+    status = pw.assess(held, live_price=503.50, current_direction=pw.LONG)
+    assert status.state == pw.FLIPPED
+    assert "LONG" in status.headline
+    # And the near-target progress is not lost, it is demoted to a line.
+    assert any("of the way from entry to target" in line
+               for line in status.lines)
+    # Without the flip it is still NEARING TARGET.
+    assert pw.assess(held, live_price=503.50,
+                     current_direction=pw.SHORT).state == pw.NEAR_TARGET
+
+
+def test_a_failed_gate_does_not_hide_a_near_target() -> None:
+    # The other side of the same ordering: a merely unsupported setup is
+    # less urgent than being about to reach the target.
+    held = pw.Position(**HDFCLIFE)
+    status = pw.assess(held, live_price=503.50, current_direction=pw.SHORT,
+                       actionable=False, blocker="relative strength [FAIL]")
+    assert status.state == pw.NEAR_TARGET
+
+
+def test_every_announced_state_has_something_to_say() -> None:
+    # An announced state with an empty sentence would chime and then sit
+    # there in silence.
+    for status in (_status("A", 520.15), _status("B", 501.00),
+                   _status("C", 503.50),
+                   pw.assess(pw.Position(**HDFCLIFE), live_price=512.0,
+                             current_direction=pw.LONG)):
+        assert status.should_announce
+        assert status.spoken.startswith(status.position.symbol)
+        assert len(status.spoken) > len(status.position.symbol) + 3
+
+
 # --- persistence ---------------------------------------------------------
 
 def test_positions_survive_a_round_trip(tmp_path) -> None:
@@ -180,6 +304,29 @@ def test_adding_replaces_the_same_symbol_and_side(tmp_path) -> None:
     pw.add(pw.Position(symbol="HDFCLIFE", side=pw.LONG, entry=520.0,
                        stop=515.0, target=530.0), path)
     assert len(pw.load(path)) == 2
+
+
+def test_the_previous_list_is_kept_beside_the_store(tmp_path) -> None:
+    # This file is the only record of what you hold. One generation of
+    # history turns a wipe into a file rename.
+    path = tmp_path / "watch.json"
+    pw.add(pw.Position(**HDFCLIFE), path)
+    pw.add(pw.Position(symbol="RELIANCE", side=pw.LONG, entry=1274.5,
+                       stop=1251.5, target=1320.5), path)
+    previous = path.with_suffix(".prev.json")
+    assert previous.exists()
+    assert [p.symbol for p in pw.load(previous)] == ["HDFCLIFE"]
+    assert len(pw.load(path)) == 2
+
+
+def test_removing_something_not_there_does_not_rewrite_the_file(
+        tmp_path) -> None:
+    path = tmp_path / "watch.json"
+    pw.add(pw.Position(**HDFCLIFE), path)
+    stamp = path.stat().st_mtime_ns
+    left = pw.remove("NOTHELD", "LONG", path)
+    assert [p.symbol for p in left] == ["HDFCLIFE"]
+    assert path.stat().st_mtime_ns == stamp, "the file was rewritten anyway"
 
 
 def test_removing_leaves_the_others(tmp_path) -> None:
@@ -222,3 +369,82 @@ def test_unknown_keys_in_the_file_do_not_break_loading(tmp_path) -> None:
          "target": 110.0, "some_future_field": 42},
     ]), encoding="utf-8")
     assert [p.symbol for p in pw.load(path)] == ["X"]
+
+
+# --- turning a table row into a position ---------------------------------
+
+def _row(**cells):
+    import pandas as pd
+    return pd.Series(cells)
+
+
+def test_a_scan_row_becomes_the_position_it_describes() -> None:
+    held = pw.position_from_row(_row(**{
+        "Symbol": "HDFCLIFE", "Side": "SHORT", "Entry price": 511.20,
+        "Stop loss at": 516.00, "Exit price": 501.60, "Qty": 500}))
+    assert held is not None
+    assert (held.symbol, held.side) == ("HDFCLIFE", pw.SHORT)
+    assert held.entry == pytest.approx(511.20)
+    assert held.stop == pytest.approx(516.00)
+    assert held.target == pytest.approx(501.60)
+    assert held.quantity == 500
+    assert held.is_valid
+
+
+def test_a_horizon_row_uses_its_own_column_names() -> None:
+    # The horizon tables say View and Price where the scan says Side and
+    # Entry price. Both must work, or the action appears on one table only.
+    held = pw.position_from_row(_row(**{
+        "Symbol": "RELIANCE", "View": "LONG", "Price": 1274.50,
+        "Stop loss at": 1251.48, "Exit price": 1320.54}))
+    assert held is not None and held.side == pw.LONG
+    assert held.entry == pytest.approx(1274.50)
+    assert held.quantity == 0
+
+
+def test_the_lookup_supplies_the_symbol_and_price_the_row_lacks() -> None:
+    # One row per horizon for a single instrument, so neither the symbol
+    # nor the price is in the row itself.
+    held = pw.position_from_row(
+        _row(**{"Horizon": "short", "View": "LONG", "Verdict": "NO BUY",
+                "Stop loss at": 95.0, "Exit price": 110.0}),
+        symbol="tcs", entry=100.0, note="from the short horizon")
+    assert held is not None
+    assert held.symbol == "TCS"                  # upper-cased like any other
+    assert held.entry == pytest.approx(100.0)
+    assert held.note == "from the short horizon"
+
+
+def test_a_row_with_nothing_to_watch_is_refused() -> None:
+    # No levels, no side, or a side that is not one. Each would produce a
+    # watch that reports nonsense from its first tick.
+    assert pw.position_from_row(_row(**{
+        "Symbol": "X", "Side": "NO SETUP", "Entry price": 100.0,
+        "Stop loss at": 95.0, "Exit price": 110.0})) is None
+    assert pw.position_from_row(_row(**{
+        "Symbol": "X", "Side": "LONG", "Entry price": 100.0})) is None
+    assert pw.position_from_row(_row(**{
+        "Side": "LONG", "Entry price": 100.0, "Stop loss at": 95.0,
+        "Exit price": 110.0})) is None
+    assert pw.position_from_row(_row(**{
+        "Symbol": "X", "Side": "LONG", "Stop loss at": 95.0,
+        "Exit price": 110.0})) is None
+
+
+def test_blank_and_nan_cells_count_as_absent() -> None:
+    import numpy as np
+    assert pw.position_from_row(_row(**{
+        "Symbol": "X", "Side": "LONG", "Entry price": 100.0,
+        "Stop loss at": np.nan, "Exit price": 110.0})) is None
+    assert pw.position_from_row(_row(**{
+        "Symbol": "X", "Side": "", "Entry price": 100.0,
+        "Stop loss at": 95.0, "Exit price": 110.0})) is None
+
+
+def test_impossible_levels_come_back_for_the_caller_to_object_to() -> None:
+    # Refusing here would leave the UI with nothing to explain. The row is
+    # returned and Position.is_valid says what is wrong with it.
+    held = pw.position_from_row(_row(**{
+        "Symbol": "X", "Side": "LONG", "Entry price": 100.0,
+        "Stop loss at": 110.0, "Exit price": 120.0}))
+    assert held is not None and not held.is_valid

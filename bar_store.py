@@ -258,10 +258,18 @@ def main(argv=None) -> int:
     import argparse
     import time
 
+    # Imported here rather than at module scope: bar_store is read by
+    # everything and has deliberately depended on nothing but pandas.
+    import config
+
     parser = argparse.ArgumentParser(
         description="Fold per-symbol bar files into one file per interval")
-    parser.add_argument("--intervals", default="day,5minute",
-                        help="comma-separated intervals (default: day,5minute)")
+    # The intraday default follows config rather than naming a size: the
+    # short horizon reads whichever interval the feed fetches, so this
+    # rebuild has to fold that same one or that store never gets built.
+    default = f"day,{config.HORIZON_SHORT_INTERVAL}"
+    parser.add_argument("--intervals", default=default,
+                        help=f"comma-separated intervals (default: {default})")
     args = parser.parse_args(argv)
     for interval in [i.strip() for i in args.intervals.split(",") if i.strip()]:
         started = time.time()

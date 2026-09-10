@@ -9,7 +9,7 @@ opportunities" when it actually meant "too late for MY horizon only".
 
 So each horizon now gets its own inputs, its own gates and its own clock:
 
-    intraday   entry to today's close      5-minute bars, session-time gated
+    intraday   entry to today's close      intraday bars, session-gated
     short      about 10 sessions           daily bars, no session gate
     mid        about 63 sessions           daily bars, no session gate
     long       about 252 sessions          daily bars, no session gate
@@ -200,6 +200,88 @@ def _annualised_volatility(closes: np.ndarray) -> float:
     return float(np.std(returns) * np.sqrt(252) * 100.0)
 
 
+# The longest lookback, in sessions, for which intraday bars are a better
+# volatility estimate than daily ones. Written once: it decides both which
+# horizons ask for the intraday store and which ones use it.
+FINE_LOOKBACK_MAX = 20
+# How much of the assessed universe the intraday store must cover, and how
+# current it must be, before it is used at all. Below either, the whole run
+# uses the daily estimate - see the note in assess_daily.
+FINE_MIN_COVERAGE = 0.9
+FINE_MAX_STALE_DAYS = 7
+
+
+def realised_volatility(fine: pd.DataFrame, sessions: int) -> float:
+    """Annualised volatility from intraday bars, in percent, or NaN.
+
+    WHY THIS BEATS THE DAILY ESTIMATE AT THE SHORT HORIZON. Ten daily
+    returns cannot support a volatility estimate, which is why the daily
+    path silently widened its window to sixty sessions - so the "plausible
+    move" for a two-week hold was borrowed from two months of data. Ten
+    sessions of intraday bars is roughly 1,250 returns at the configured
+    three minutes, over the window actually being assessed.
+
+    THE OVERNIGHT GAP IS INCLUDED, and leaving it out would have been the
+    trap. Realised variance from intraday returns alone misses every
+    close-to-open move, and for Indian equities those are a real share of
+    total variance - so the estimate would come out low, the plausible
+    move with it, and the cost-multiple gate would let through setups
+    whose move cannot actually cover the round trip. Each session's
+    variance is therefore the sum of squared in-session returns PLUS the
+    squared overnight return, which is the standard construction.
+    """
+    if fine is None or "Close" not in fine.columns or fine.empty:
+        return float("nan")
+    closes = fine["Close"].dropna()
+    closes = closes[np.isfinite(closes) & (closes > 0)]
+    if len(closes) < 20:
+        return float("nan")
+    try:
+        days = closes.index.date
+    except AttributeError:
+        return float("nan")
+    ordered = sorted(set(days))
+    window = ordered[-sessions:] if sessions > 0 else ordered
+    # Seeded from the session BEFORE the window, so the first session in it
+    # gets an overnight term like every other. Seeding from inside the
+    # window left one session in ten missing its gap - a downward bias, in
+    # the estimator whose whole argument is that the gap must be counted.
+    previous_close = None
+    if window:
+        earlier = closes[days < window[0]]
+        if not earlier.empty:
+            previous_close = float(earlier.iloc[-1])
+    variances = []
+    for day in window:
+        block = closes[days == day]
+        if len(block) < 5:
+            # Too few bars to say anything about the session's own path,
+            # but its close still anchors the next session's gap.
+            previous_close = float(block.iloc[-1])
+            continue
+        values = block.to_numpy(dtype=float)
+        inside = np.diff(np.log(values))
+        variance = float(np.sum(inside ** 2))
+        if previous_close and previous_close > 0:
+            gap = float(np.log(values[0] / previous_close))
+            variance += gap ** 2
+        previous_close = float(values[-1])
+        # Finite, NOT positive. A session that genuinely did not move -
+        # a halt, an illiquid name, a frozen feed - has variance zero, and
+        # that is a measurement rather than a gap in the data. Dropping
+        # such sessions averaged only the moving ones and biased the whole
+        # estimate upward: five flat sessions among five volatile ones came
+        # out at 29.68% where counting them gives about 21%.
+        if np.isfinite(variance):
+            variances.append(variance)
+    if len(variances) < 3:
+        # Three sessions is the floor for an average worth annualising by
+        # 252. Below it the caller falls back to the daily estimate.
+        return float("nan")
+    daily_variance = float(np.mean(variances))
+    return float(np.sqrt(daily_variance * 252.0) * 100.0)
+
+
 def _benchmark_move(dates, benchmark, lookback: int) -> float:
     """Benchmark return over the SAME DATES the stock's trend was measured.
 
@@ -238,7 +320,8 @@ def _benchmark_move(dates, benchmark, lookback: int) -> float:
 def assess_daily(symbol: str, frame: pd.DataFrame, horizon: str,
                  benchmark: "pd.DataFrame | None",
                  live_price: "float | None" = None,
-                 cost_pct: "float | None" = None) -> "Assessment | None":
+                 cost_pct: "float | None" = None,
+                 fine: "pd.DataFrame | None" = None) -> "Assessment | None":
     """One symbol at one daily horizon, from cached daily bars.
 
     No session-time gate: whether 40 minutes remain today is irrelevant to
@@ -246,6 +329,11 @@ def assess_daily(symbol: str, frame: pd.DataFrame, horizon: str,
 
     `live_price` re-anchors the readings that answer "where is it NOW" -
     the price, the stop, the exit, the drawdown and the range position.
+
+    `fine` is that symbol's intraday bars, used for volatility at the
+    short horizons only (lookback <= FINE_LOOKBACK_MAX) and ignored
+    elsewhere. Pass None to use the daily estimate. The caller passes it
+    for every symbol in a run or for none - see _usable_fine.
     Without it those come from the newest daily close, which during a
     session is yesterday's: measured at 1.10% away on RELIANCE, enough to
     turn a 2:1 stop-and-target into 6.7:1 for anyone acting on it.
@@ -287,7 +375,19 @@ def assess_daily(symbol: str, frame: pd.DataFrame, horizon: str,
     trend = (price / base - 1.0) * 100.0
     if not np.isfinite(trend):
         return None
-    volatility = _annualised_volatility(closes[-max(lookback, 60):])
+    # The short horizon prefers realised volatility from intraday bars,
+    # because ten daily returns cannot support an estimate and the daily
+    # path has to borrow sixty sessions to get one. Falls back to the
+    # daily figure when no intraday bars were supplied - and the CALLER
+    # decides that for the whole run rather than per symbol, because these
+    # two estimators do not share a level and mixing them inside one
+    # cross-sectional rank would let data availability move a symbol's
+    # position and flip its cost gate.
+    volatility = float("nan")
+    if fine is not None and lookback <= FINE_LOOKBACK_MAX:
+        volatility = realised_volatility(fine, lookback)
+    if volatility != volatility:
+        volatility = _annualised_volatility(closes[-max(lookback, 60):])
     trailing = closes[-lookback:]
     high, low = float(trailing.max()), float(trailing.min())
     span = max(high - low, 1e-9)
@@ -337,7 +437,8 @@ def assess_daily(symbol: str, frame: pd.DataFrame, horizon: str,
 
 
 # Daily-horizon gates. Deliberately fewer and blunter than the intraday
-# set: a position held for weeks is not helped by a five-minute reading,
+# set: a position held for weeks is not helped by a breakout reading taken
+# over three minutes,
 # and inventing gates to look thorough would be nine ways of saying the
 # same thing. Each returns (passed, line) so the report can show the number
 # behind every verdict rather than just its outcome.
@@ -484,6 +585,85 @@ def live_prices_for(symbols: list) -> dict:
         return {}
 
 
+def _measurable_sessions(frame) -> int:
+    """Sessions in `frame` that realised_volatility can actually use.
+
+    Its own preconditions, not a proxy for them: a session needs at least
+    five bars to say anything about its own path, and the estimator wants
+    three such sessions before it will annualise an average.
+    """
+    if frame is None or frame.empty or "Close" not in frame.columns:
+        return 0
+    try:
+        days = frame["Close"].dropna().index.date
+    except AttributeError:
+        return 0
+    counts = {}
+    for day in days:
+        counts[day] = counts.get(day, 0) + 1
+    return sum(1 for n in counts.values() if n >= 5)
+
+
+def _usable_fine(fine: dict, symbols: list) -> dict:
+    """The intraday store if it can be used for the whole run, else {}.
+
+    ALL OR NOTHING, and that is the point. Realised volatility and the
+    60-session daily estimate do not share a level, so handing one to the
+    symbols that happen to have intraday bars and the other to the rest
+    puts two different measurements in the same rank(pct=True) column and
+    the same cost-multiple gate. A symbol's position - and whether its
+    setup passes - would then depend on whether its bars had been cached.
+
+    COVERAGE MEANS MEASURABLE, not merely present. Measured on the real
+    3-minute store the day it was first built: 121 symbols held 14
+    sessions and RELIANCE held exactly one, written by a single
+    backfill_today. A one-session frame is not empty, so counting frames
+    would have called it covered - and then the estimator returns NaN for
+    it and that symbol alone falls back to the daily figure, which is the
+    mixing this function exists to stop.
+
+    What remains is bounded rather than eliminated: up to
+    (1 - FINE_MIN_COVERAGE) of the population can still fall back
+    individually. Dropping those symbols from the tables altogether would
+    be worse than a slightly noisier volatility rank for a tenth of them.
+
+    Two other ways to be unusable: too little of the universe covered at
+    all, or a store that has stopped being topped up. The second is easy
+    to reach by accident, since the intraday store is fed by whatever
+    interval the live feed fetches, and that follows config.
+    """
+    if not fine or not symbols:
+        return {}
+    usable = {s: fine[s] for s in symbols
+              if _measurable_sessions(fine.get(s)) >= 3}
+    if len(usable) < FINE_MIN_COVERAGE * len(symbols):
+        logger.info("Intraday bars can be measured for only %d/%d symbols, "
+                    "so the short horizon uses the daily volatility "
+                    "estimate for all of them rather than two estimators "
+                    "in one ranking.", len(usable), len(symbols))
+        return {}
+    fine = usable
+    latest = None
+    for frame in fine.values():
+        if frame is None or frame.empty:
+            continue
+        try:
+            stamp = frame.index[-1].date()
+        except Exception:
+            continue
+        latest = stamp if latest is None or stamp > latest else latest
+    if latest is None:
+        return {}
+    behind = (date.today() - latest).days
+    if behind > FINE_MAX_STALE_DAYS:
+        logger.warning("The %s store's newest bar is %d days old, so the "
+                       "short horizon uses the daily volatility estimate. "
+                       "Is the feed still fetching that interval?",
+                       config.HORIZON_SHORT_INTERVAL, behind)
+        return {}
+    return fine
+
+
 def assess_universe(symbols: list, horizons: "list | None" = None,
                     benchmark_symbol: str = "NIFTY 50",
                     top: int = 20, progress=None,
@@ -510,6 +690,21 @@ def assess_universe(symbols: list, horizons: "list | None" = None,
         logger.warning("No consolidated daily bars; run bar_store first")
         return {}
     benchmark = frames.get(benchmark_symbol)
+    # Intraday bars for the short horizons only - mid and long never
+    # consult them - and loaded once rather than per symbol. Bounded by
+    # date: realised_volatility reads ten sessions and the store holds
+    # years of them.
+    fine = {}
+    if any(_lookback_for(h) <= FINE_LOOKBACK_MAX for h in wanted):
+        try:
+            fine = bar_store.load(
+                config.HORIZON_SHORT_INTERVAL, symbols=list(symbols),
+                start=date.today() - timedelta(days=FINE_MAX_STALE_DAYS + 30))
+        except Exception as exc:
+            logger.warning("No %s bars, so the short horizon uses the daily "
+                           "volatility estimate: %s",
+                           config.HORIZON_SHORT_INTERVAL, exc)
+        fine = _usable_fine(fine, symbols)
     out = {}
     for horizon in wanted:
         results = []
@@ -521,7 +716,8 @@ def assess_universe(symbols: list, horizons: "list | None" = None,
             try:
                 assessment = assess_daily(
                     symbol, frame, horizon, benchmark,
-                    live_price=(live or {}).get(symbol))
+                    live_price=(live or {}).get(symbol),
+                    fine=fine.get(symbol))
             except Exception as exc:
                 logger.warning("%s at %s: %s", symbol, horizon, exc)
                 continue

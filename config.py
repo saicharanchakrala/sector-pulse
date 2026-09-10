@@ -104,8 +104,42 @@ NEWS_ARCHIVE_DIR = PROJECT_ROOT / "news_archive"
 # The positional signal holds for weeks; this one holds for hours. Different
 # data, different costs, different failure mode - so it gets its own gates
 # and never shares a threshold with the EOD path.
-SCAN_BAR_INTERVAL = "5m"          # intraday bar size (Kite: "5minute")
-# Ten trading SESSIONS of 5-minute bars, which market_source.calendar_days
+# INTRADAY bar size. Moved from 5m to 3m by choice rather than by
+# measurement: over 13 sessions and 2,219 setups the 3-minute path was
+# +2.29pp on hit rate with a 95% interval of [-0.60, +4.81], so better on
+# 9 of 13 days but not significant. What IS established is that it sees
+# the same move earlier - first in 91 of 141 paired sessions, median 2
+# minutes - for an entry improvement of about 0.03%. A real edge, small.
+#
+# The seconds are derived here rather than declared twice: live_bars used
+# to hold its own 300, and a feed bucketing at five minutes while the
+# scanner asked for three would have produced bars nothing could read.
+# Two spellings exist on purpose and are NOT interchangeable: this
+# project's own short form here, and Kite's long form ("3minute") which
+# market_source.kite_interval translates to and which bar_store names its
+# files after.
+SCAN_BAR_INTERVAL = "3m"          # intraday bar size (Kite: "3minute")
+SCAN_BAR_SECONDS = {"1m": 60, "3m": 180, "5m": 300, "15m": 900,
+                    "30m": 1800, "60m": 3600}.get(SCAN_BAR_INTERVAL, 300)
+
+# The bar size the SHORT horizon estimates volatility from. Ten daily
+# returns is far too few for a volatility estimate, which is why the old
+# code silently borrowed sixty sessions instead - so the plausible move for
+# a two-week hold came from two months of data. Ten sessions of intraday
+# bars is about 1,250 returns at three minutes (750 at five) over the
+# window actually being assessed.
+#
+# DERIVED FROM THE SCAN BAR SIZE, not chosen independently, and that is a
+# supply constraint rather than a preference. This store is filled by the
+# per-symbol cache that live_bars.prewarm writes, and prewarm fetches
+# SCAN_BAR_INTERVAL. Naming any other size here would point the short
+# horizon at a store nothing tops up: it would work for a while on
+# whatever is already cached, then quietly go stale. Kite spells one
+# minute "minute" rather than "1minute", hence the special case.
+_SHORT_MINUTES = SCAN_BAR_SECONDS // 60
+HORIZON_SHORT_INTERVAL = ("minute" if _SHORT_MINUTES == 1
+                          else f"{_SHORT_MINUTES}minute")
+# Ten trading SESSIONS of intraday bars, which market_source.calendar_days
 # turns into about seventeen calendar days. That is the intraday working set
 # - enough prior sessions for a relative-volume median and a gap-free ATR,
 # without dragging a month of bars through every scan. The median baseline
@@ -121,7 +155,13 @@ SCAN_BATCH_SIZE = 40
 SCAN_BENCHMARK = "NIFTY 50"       # relative-strength benchmark, as Kite names it
 
 SCAN_OPENING_RANGE_MINUTES = 15   # opening range = first N minutes of the session
-SCAN_ATR_BARS = 14                # ATR period on 5m bars, for intraday stops
+# ATR period in BARS, so its window in minutes follows the bar size: 14
+# bars is 42 minutes at 3m where it was 70 at 5m. Left at the conventional
+# 14 rather than re-widened to hold the old span, because the 3-minute
+# measurement that justified the switch was run with this same 14 - and
+# its slightly tighter stops (about 5% on the median) are part of what was
+# measured, not an accident to be undone afterwards.
+SCAN_ATR_BARS = 14                # ATR period, in bars, for intraday stops
 # One horizon governs everything: an intraday trade is held to the close, so
 # the plausible remaining move is sigma = bar ATR * sqrt(bars left) and both
 # the stop and the target are fractions of that same sigma. Sizing the stop
@@ -161,16 +201,19 @@ SCAN_MIN_PRICE = 20.0             # sub-20 names move in ticks too coarse to man
 SCAN_MIN_MINUTES_LEFT = 45        # no entry without time for the target to work
 SCAN_COST_MULTIPLE = 3.0          # target must clear round-trip cost this many times
 # How old the newest live bar may be before the feed counts as dead.
-# The arithmetic, which an earlier version of this comment got wrong by a
-# whole bar: age is measured from the bar's START stamp, and a bar closes
-# only when a tick from the NEXT bucket arrives. So the bar starting at S
-# closes at S+300, reaches the file by S+300+flush, and remains the newest
-# bar in it until its successor lands at S+600+flush. With the default
-# --flush-every of 20s the peak age of a perfectly healthy feed is
-# therefore 620s, not 340s. A 600s limit refused the live path for the
-# first 20s of every bucket - about 7% of the session - and fell back to
-# the 216-symbol download this whole path exists to avoid.
-SCAN_LIVE_MAX_AGE_SECONDS = 900
+# THE ARITHMETIC, in terms of the bar size rather than in numbers that
+# were only ever true at one of them - an earlier version of this comment
+# was out by a whole bar, and the constant that replaced it was then out
+# by two when the bar size changed. Age is measured from the bar's START
+# stamp, and a bar closes only when a tick from the NEXT bucket arrives.
+# So the bar starting at S closes at S + one bar, reaches the file by
+# S + one bar + flush, and stays the newest bar there until its successor
+# lands at S + two bars + flush. With the default --flush-every of 20s the
+# peak age of a perfectly healthy feed is two bars plus 20s: 620s at
+# 5-minute bars, 380s at 3-minute ones. Anything meaningfully above that
+# is not headroom, it is a window in which a dead feed still passes -
+# which is why this is derived and not typed.
+SCAN_LIVE_MAX_AGE_SECONDS = 2 * SCAN_BAR_SECONDS + 60
 # How often the intraday scan may re-run itself while the feed is live, and
 # the choices offered. A refresh is a full re-scan, so the floor is well
 # above the measured scan time rather than as low as the UI could allow.
@@ -182,6 +225,12 @@ FEED_UNIVERSE_SIZE = 1000
 
 SCAN_AUTO_REFRESH_SECONDS = 60
 SCAN_AUTO_REFRESH_CHOICES = (30, 60, 120, 300)
+
+# How often the position watch re-prices what you already hold. Faster than
+# the scan on purpose: the scan is looking for something to do and can wait
+# a minute, whereas the watch is guarding money already at risk. Only
+# applied during trading hours - outside them nothing can move.
+POSITION_WATCH_REFRESH_SECONDS = 20
 # Below this share of requested symbols actually streaming, the live path is
 # not meaningfully live and the scan says so rather than claiming it is.
 SCAN_LIVE_MIN_COVERAGE = 0.5

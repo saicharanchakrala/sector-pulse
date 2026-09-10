@@ -54,6 +54,9 @@ live_bars/
 # holdings.csv - never committed.
 watched_positions.json
 watched_positions.tmp
+watched_positions.prev.json
+# Chime WAVs written by `python -m sound --save`: generated, never source.
+chimes_preview/
 
 .claude/worktrees/
 # Machine-local tool permissions, not a project setting.

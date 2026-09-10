@@ -395,3 +395,255 @@ def test_use_live_false_never_quotes(monkeypatch) -> None:
     report = instrument_report.analyse("FAKE", include_intraday=False,
                                        use_live=False)
     assert report.found and report.live_anchored is False
+
+
+# --- realised volatility for the short horizon ---------------------------
+#
+# The daily path cannot estimate volatility from ten returns, so it
+# silently widened its window to sixty sessions - meaning the plausible
+# move for a two-week hold was borrowed from two months of data. Ten
+# sessions of intraday bars is roughly 1,250 returns at three minutes,
+# over the window actually being assessed.
+
+def intraday(prices_by_day: dict) -> pd.DataFrame:
+    """An intraday frame from {date-string: [closes]}.
+
+    Bars are spaced at the configured size, so these tests follow the
+    project's bar size instead of pinning the one it happened to use when
+    they were written. The estimator sums squared returns per session and
+    does not read the spacing, so the figures do not move with it.
+    """
+    import config
+
+    step = pd.Timedelta(seconds=config.SCAN_BAR_SECONDS)
+    stamps, closes = [], []
+    for day, series in prices_by_day.items():
+        base = pd.Timestamp(f"{day} 09:15", tz=IST)
+        for i, price in enumerate(series):
+            stamps.append(base + step * i)
+            closes.append(price)
+    frame = pd.DataFrame({"Close": closes}, index=pd.DatetimeIndex(stamps))
+    for column in ("Open", "High", "Low"):
+        frame[column] = frame["Close"]
+    frame["Volume"] = 1e5
+    return frame
+
+
+def test_realised_volatility_is_annualised_and_positive() -> None:
+    rng = np.random.default_rng(7)
+    days = {f"2026-09-{d:02d}": list(100.0 * np.cumprod(
+        1 + rng.normal(0, 0.001, 75))) for d in range(1, 11)}
+    got = horizons.realised_volatility(intraday(days), 10)
+    assert np.isfinite(got)
+    # sqrt(74 * 1e-6 * 252) is 13.7% from the in-session path alone; the
+    # gaps this generator leaves between days take the measured figure to
+    # about 21%. The band is wide because the point of this test is
+    # "annualised and finite", not the value.
+    assert 5.0 < got < 80.0, got
+
+
+def test_the_overnight_gap_raises_the_estimate() -> None:
+    # THE TRAP THIS AVOIDS. Intraday returns alone miss every close-to-open
+    # move. Left out, the estimate comes in low, the plausible move with
+    # it, and the cost-multiple gate lets through setups whose move cannot
+    # cover the round trip.
+    # The control arm must have NO gap at all, or this compares a big gap
+    # with a small one instead of with none. Each day therefore opens
+    # exactly where the last one closed: the old version restarted every
+    # day at 100.0 after closing at 100.74, a -0.74% gap every night.
+    calm, level = {}, 100.0
+    for d in range(1, 11):
+        calm[f"2026-09-{d:02d}"] = [level + i * 0.01 for i in range(75)]
+        level = level + 0.74
+    gappy, level = {}, 100.0
+    for d in range(1, 11):
+        gappy[f"2026-09-{d:02d}"] = [level + i * 0.01 for i in range(75)]
+        level = (level + 0.74) * 1.02
+    quiet = horizons.realised_volatility(intraday(calm), 10)
+    jumpy = horizons.realised_volatility(intraday(gappy), 10)
+    assert jumpy > quiet * 2, (quiet, jumpy)
+    # And the gap term must be the whole difference: identical in-session
+    # paths, so anything else would mean the sessions were not comparable.
+    assert quiet == pytest.approx(
+        horizons.realised_volatility(intraday(calm), 10))
+
+
+def test_too_little_intraday_history_returns_nan_not_a_guess() -> None:
+    assert horizons.realised_volatility(None, 10) != horizons.realised_volatility(None, 10)
+    thin = intraday({"2026-09-01": [100.0, 100.1, 100.2]})
+    assert np.isnan(horizons.realised_volatility(thin, 10))
+    assert np.isnan(horizons.realised_volatility(pd.DataFrame(), 10))
+
+
+def test_the_short_horizon_uses_intraday_bars_when_given_them() -> None:
+    lookback = horizons._lookback_for("short")
+    daily_frame = daily([100.0 + i * 0.2 for i in range(lookback + 20)])
+    rng = np.random.default_rng(3)
+    # Deliberately far more volatile intraday than the smooth daily path,
+    # so the two estimates cannot be confused.
+    days = {f"2026-09-{d:02d}": list(100.0 * np.cumprod(
+        1 + rng.normal(0, 0.004, 75))) for d in range(1, 13)}
+    without = horizons.assess_daily("X", daily_frame, "short", None)
+    with_fine = horizons.assess_daily("X", daily_frame, "short", None,
+                                      fine=intraday(days))
+    assert without is not None and with_fine is not None
+    assert with_fine.volatility != pytest.approx(without.volatility)
+    assert with_fine.volatility > without.volatility
+
+
+def test_the_long_horizon_ignores_intraday_bars() -> None:
+    # A 252-session view has plenty of daily returns and no business
+    # resting on ten sessions of ticks.
+    lookback = horizons._lookback_for("long")
+    daily_frame = daily([100.0 + i * 0.2 for i in range(lookback + 20)])
+    days = {f"2026-09-{d:02d}": [100.0 + i * 0.5 for i in range(75)]
+            for d in range(1, 13)}
+    plain = horizons.assess_daily("X", daily_frame, "long", None)
+    fed = horizons.assess_daily("X", daily_frame, "long", None,
+                                fine=intraday(days))
+    assert plain is not None and fed is not None
+    assert fed.volatility == pytest.approx(plain.volatility)
+
+
+def test_a_flat_session_counts_as_zero_rather_than_vanishing() -> None:
+    # A halt, an illiquid name or a frozen feed produces a session with no
+    # variance. Dropping it averaged only the sessions that moved, which
+    # biased the estimate UP - in the estimator whose own docstring warns
+    # against biasing the plausible move.
+    moving = {f"2026-09-{d:02d}": [100.0 + i * 0.05 for i in range(75)]
+              for d in range(1, 6)}
+    flat = {f"2026-09-{d:02d}": [100.0] * 75 for d in range(6, 11)}
+    both = dict(moving)
+    both.update(flat)
+    busy = horizons.realised_volatility(intraday(moving), 5)
+    mixed = horizons.realised_volatility(intraday(both), 10)
+    assert np.isfinite(mixed)
+    # Ten sessions, five of them still: the average variance must be about
+    # half the five-session figure, so the volatility about 1/sqrt(2) of it.
+    assert mixed < busy, (mixed, busy)
+    assert mixed == pytest.approx(busy / np.sqrt(2), rel=0.35)
+    # All flat is zero volatility, which is a measurement and not a gap.
+    assert horizons.realised_volatility(intraday(flat), 5) == pytest.approx(0.0)
+
+
+def test_the_first_session_in_the_window_gets_its_gap_too() -> None:
+    # previous_close used to be seeded from inside the window, so one
+    # session in ten had no overnight term - a systematic understatement.
+    days, level = {}, 100.0
+    for d in range(1, 13):
+        days[f"2026-09-{d:02d}"] = [level + i * 0.01 for i in range(75)]
+        level = (level + 0.74) * 1.03      # a 3% gap every night
+    frame = intraday(days)
+    # Ask for a window that starts well inside the frame, so a prior
+    # session exists to seed from.
+    windowed = horizons.realised_volatility(frame, 5)
+    # The same five sessions with nothing before them: the first one then
+    # has no gap available, so the estimate must come out LOWER.
+    cut = frame[frame.index >= pd.Timestamp("2026-09-08 00:00", tz=IST)]
+    orphaned = horizons.realised_volatility(cut, 5)
+    assert windowed > orphaned, (windowed, orphaned)
+
+
+def test_fewer_than_three_usable_sessions_is_nan_not_an_average() -> None:
+    two = {f"2026-09-{d:02d}": [100.0 + i * 0.02 for i in range(75)]
+           for d in range(1, 3)}
+    assert np.isnan(horizons.realised_volatility(intraday(two), 10))
+    # Sessions with too few bars do not count towards the three, but their
+    # close still anchors the next gap.
+    thin = {f"2026-09-{d:02d}": [100.0, 100.1] for d in range(1, 9)}
+    assert np.isnan(horizons.realised_volatility(intraday(thin), 10))
+
+
+# --- one estimator per run, never two in one ranking ---------------------
+
+def test_the_intraday_store_is_used_only_if_it_covers_the_universe() -> None:
+    # Realised volatility and the 60-session daily estimate do not share a
+    # level, so mixing them inside one rank(pct=True) column would let
+    # data availability move a symbol's position and flip its cost gate.
+    days = {f"2026-09-{d:02d}": [100.0 + i * 0.05 for i in range(75)]
+            for d in range(1, 11)}
+    frame = intraday(days)
+    full = {f"S{i}": frame for i in range(10)}
+    symbols = [f"S{i}" for i in range(10)]
+    # A filtered copy rather than the same dict: unmeasurable symbols are
+    # dropped, so identity is not the thing to assert.
+    assert set(horizons._usable_fine(full, symbols)) == set(symbols)
+    partial = {f"S{i}": frame for i in range(5)}
+    assert horizons._usable_fine(partial, symbols) == {}
+    assert horizons._usable_fine({}, symbols) == {}
+    assert horizons._usable_fine(full, []) == {}
+
+
+def test_a_symbol_with_one_session_does_not_count_as_covered() -> None:
+    # The real case, from the day the 3-minute store was first built: 121
+    # symbols with 14 sessions and one with a single session written by a
+    # backfill. Not empty, so counting frames called it covered - and then
+    # the estimator returns NaN for it and that symbol alone falls back to
+    # the daily figure, inside the same cross-sectional rank.
+    full = intraday({f"2026-09-{d:02d}": [100.0 + i * 0.05 for i in range(75)]
+                     for d in range(1, 11)})
+    one_day = intraday({"2026-09-10": [100.0 + i * 0.05 for i in range(75)]})
+    assert horizons._measurable_sessions(full) == 10
+    assert horizons._measurable_sessions(one_day) == 1
+    assert np.isnan(horizons.realised_volatility(one_day, 10))
+    symbols = [f"S{i}" for i in range(10)]
+    store = {s: full for s in symbols}
+    store["S9"] = one_day
+    # One in ten unmeasurable is inside the tolerance, and that symbol is
+    # dropped from the store rather than left to fall back silently.
+    kept = horizons._usable_fine(store, symbols)
+    assert set(kept) == set(symbols[:9])
+    # Two in ten is not.
+    store["S8"] = one_day
+    assert horizons._usable_fine(store, symbols) == {}
+
+
+def test_sessions_too_thin_to_measure_do_not_count() -> None:
+    thin = intraday({f"2026-09-{d:02d}": [100.0, 100.1, 100.2]
+                     for d in range(1, 11)})
+    assert horizons._measurable_sessions(thin) == 0
+    assert horizons._usable_fine({"S0": thin}, ["S0"]) == {}
+    assert horizons._measurable_sessions(None) == 0
+    assert horizons._measurable_sessions(pd.DataFrame()) == 0
+
+
+def test_a_stale_intraday_store_is_refused_rather_than_quoted() -> None:
+    # Easy to reach by accident: the store is fed by whatever interval the
+    # live feed fetches, and that follows config. If the feed moves and
+    # this store stops being topped up, its volatility is from another
+    # month and must not be ranked against today's daily estimates.
+    old = {f"2026-01-{d:02d}": [100.0 + i * 0.05 for i in range(75)]
+           for d in range(1, 11)}
+    frame = intraday(old)
+    symbols = ["S0", "S1"]
+    assert horizons._usable_fine({s: frame for s in symbols}, symbols) == {}
+
+
+def test_the_bar_size_is_declared_once_and_fetched_at_that_size() -> None:
+    # live_bars used to hold its own 300, and after that was fixed the
+    # FETCH still asked for five minutes - so combined() spliced 5-minute
+    # prior sessions onto 3-minute live bars. Both halves are asserted
+    # against config rather than against a literal, so this test keeps
+    # meaning something after the next size change.
+    import inspect
+
+    import config
+    import live_bars
+    import market_source
+
+    assert live_bars.BAR_SECONDS == config.SCAN_BAR_SECONDS
+    kite = market_source.kite_interval(config.SCAN_BAR_INTERVAL)
+    assert kite.startswith(str(config.SCAN_BAR_SECONDS // 60))
+    # Nothing in the live path may carry its own interval literal.
+    for function in (live_bars.prewarm, live_bars.backfill_today):
+        default = inspect.signature(function).parameters["interval"].default
+        assert default is None, (function.__name__, default)
+    source = inspect.getsource(live_bars.prewarm) + inspect.getsource(
+        live_bars.backfill_today)
+    assert source.count("config.SCAN_BAR_INTERVAL") == 2
+    # And the store the SHORT horizon reads must be the one the feed
+    # fills. Naming a size nothing fetches leaves that store to go stale:
+    # it works on whatever is already cached, then quietly stops being
+    # current, and the volatility behind every short-horizon plausible
+    # move comes from another month.
+    assert config.HORIZON_SHORT_INTERVAL == kite

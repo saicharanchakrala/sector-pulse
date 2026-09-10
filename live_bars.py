@@ -1,4 +1,4 @@
-"""Five-minute bars built from the live tick stream, so a scan needs no download.
+"""Intraday bars from the live tick stream, so a scan needs no download.
 
 THE PROBLEM THIS SOLVES. Hitting "Run intraday scan" currently fetches
 intraday bars for 216 symbols from Kite's historical endpoint, paced at its
@@ -13,9 +13,10 @@ THE SHAPE OF THE FIX. A scan needs two different things:
     These never change during the day, so they are fetched once against a
     window ending YESTERDAY and cached. A stable window means a cache hit
     all day and no network on any scan.
-  * TODAY, which is what the stream supplies. Ticks are bucketed into
-    five-minute bars in memory and flushed to parquet so another process -
-    Streamlit - can read them instantly.
+  * TODAY, which is what the stream supplies. Ticks are bucketed in
+    memory at config.SCAN_BAR_INTERVAL - the same size the historical
+    fetch above asks for, or the two halves of a session would not join -
+    and flushed to parquet so another process can read them instantly.
 
 VOLUME IS A DELTA, NOT A SUM. Kite's tick carries `volume` as the
 CUMULATIVE volume traded so far today, not the size of that trade. Summing
@@ -24,8 +25,8 @@ would send relative volume through the roof and make every quiet name look
 like a breakout. Each bar's volume is therefore the difference between the
 cumulative figure at its own close and at the previous bar's close.
 
-PARTIAL BARS ARE MARKED, NOT HIDDEN. If the feed starts at 11:07 then the
-11:05 bucket never saw its first two minutes, and its volume is measured
+PARTIAL BARS ARE MARKED, NOT HIDDEN. A feed starting part-way through a
+bucket never saw that bucket's first minutes, and its volume is measured
 from an unknown baseline. Such bars are flagged rather than silently served,
 because a partial bar looks exactly like a quiet one.
 """
@@ -47,16 +48,22 @@ logger = logging.getLogger(__name__)
 IST = ZoneInfo("Asia/Kolkata")
 ROOT = Path(__file__).resolve().parent
 STORE = ROOT / "live_bars"
-BAR_SECONDS = 300
+# From config, so the feed and the scanner cannot disagree about the
+# bucket size. A feed bucketing at 300 while scan_data asked Kite for
+# 3-minute candles would have written bars nothing downstream could use.
+BAR_SECONDS = config.SCAN_BAR_SECONDS
 COLUMNS = ["Open", "High", "Low", "Close", "Volume"]
 
 
 def bucket_start(when: datetime) -> datetime:
-    """The five-minute bucket a timestamp belongs to, floored, in IST.
+    """The bucket a timestamp belongs to, floored, in IST.
 
     Bars are stamped at their START, matching Kite's historical candles, so
-    a bar labelled 10:00 covers 10:00 to 10:05. Every downstream guard in
-    this project assumes that convention.
+    at three-minute bars one labelled 10:00 covers 10:00 to 10:03. Every
+    downstream guard in this project assumes that convention.
+
+    Anchored on the hour rather than on the session open, which is what
+    makes 10:00 a bucket boundary at every size this project offers.
     """
     local = when.astimezone(IST)
     floored = local.replace(second=0, microsecond=0)
@@ -95,7 +102,7 @@ def store_path(when: "date | None" = None) -> Path:
 
 
 class BarBuilder:
-    """Aggregates ticks into five-minute bars, one set per instrument.
+    """Aggregates ticks into bars of BAR_SECONDS, one set per instrument.
 
     Thread-safe because the stream runs in an asyncio loop inside a
     background thread while flushes and snapshots come from elsewhere.
@@ -160,7 +167,7 @@ class BarBuilder:
         closed = self._closed_at.get(token)
         if current is None and closed is not None and start <= closed:
             # The bucket was already completed and written. Reopening it
-            # would emit the same five minutes twice.
+            # would emit the same period twice.
             self._refused_stale += 1
             return
         if current is not None and start < current["start"]:
@@ -206,7 +213,7 @@ class BarBuilder:
         close_open_bars can cause. Such a bar covers a fraction of its
         period, so it is flagged exactly as the forming-bar snapshot
         already flags it - otherwise a Ctrl-C 30 seconds into a bucket
-        wrote a 30-second bar recorded as a finished five-minute one.
+        wrote a 30-second bar recorded as a finished full-length one.
         """
         mark = self._volume_mark.get(token)
         cumulative = bar["cum_volume"]
@@ -390,9 +397,19 @@ def history_window(days: int = 12) -> tuple:
     return yesterday - timedelta(days=max(1, days)), yesterday
 
 
-def prewarm(symbols: list, days: int = 12, interval: str = "5minute") -> dict:
-    """Fetch and cache prior-session bars once. Returns what was obtained."""
+def prewarm(symbols: list, days: int = 12,
+            interval: "str | None" = None) -> dict:
+    """Fetch and cache prior-session bars once. Returns what was obtained.
+
+    The interval comes from config rather than a literal. It used to
+    default to "5minute" while the stream bucketed at whatever
+    SCAN_BAR_SECONDS said, so combined() spliced 5-minute prior sessions
+    onto 3-minute live bars and every reading taken across that join -
+    ATR, VWAP, relative volume, the opening range - was computed over two
+    bar sizes at once.
+    """
     import market_source
+    interval = interval or market_source.kite_interval(config.SCAN_BAR_INTERVAL)
     start, end = history_window(days)
     try:
         return market_source.bars(symbols, start, end, interval=interval)
@@ -401,7 +418,7 @@ def prewarm(symbols: list, days: int = 12, interval: str = "5minute") -> dict:
         return {}
 
 
-def backfill_today(symbols: list, interval: str = "5minute") -> dict:
+def backfill_today(symbols: list, interval: "str | None" = None) -> dict:
     """Today's session bars from Kite, for the part the feed missed.
 
     A feed started at 15:06 has no 09:15 bar, and the opening range is the
@@ -414,6 +431,7 @@ def backfill_today(symbols: list, interval: str = "5minute") -> dict:
     stream carries the session forward and this is never needed again.
     """
     import market_source
+    interval = interval or market_source.kite_interval(config.SCAN_BAR_INTERVAL)
     today = datetime.now(IST).date()
     try:
         return market_source.bars(symbols, today, today, interval=interval,
