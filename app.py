@@ -1205,14 +1205,46 @@ def render_live_feed_panel() -> None:
 
 
 @st.cache_data(ttl=config.CACHE_TTL_SECONDS, show_spinner=False)
-def load_horizon_picks(symbols: tuple[str, ...], top: int) -> dict:
+def load_horizon_picks(symbols: tuple[str, ...], top: int,
+                       bucket: int = 0, anchor_live: bool = False) -> dict:
     """Ranked assessments per daily horizon, cached on the universe.
 
-    Cached because the inputs are daily bars from the consolidated store -
-    they change once a session, not once a minute, so re-running the sweep
-    on every rerun would burn two seconds for an identical answer.
+    `bucket` is the clock floored to HORIZON_ANCHOR_SECONDS and exists
+    solely to be part of the cache key. The history behind these tables
+    changes once a session, but the PRICE they are anchored on changes all
+    day, so caching on (symbols, top) alone would have served the first
+    minute's levels until the TTL expired. A bucket in the key re-runs the
+    sweep exactly as often as the anchor can move.
     """
-    return horizons.assess_universe(list(symbols), top=top)
+    live = horizons.live_prices_for(list(symbols)) if anchor_live else {}
+    picks = horizons.assess_universe(list(symbols), top=top, live=live)
+    return {"picks": picks, "live_count": len(live)}
+
+
+HORIZON_ANCHOR_SECONDS = 60
+
+
+def horizon_anchor() -> tuple:
+    """(should we anchor on live prices, cache bucket, why).
+
+    Live only during trading hours and only with a usable session. Outside
+    both, the last daily close is not a degraded anchor - it is the
+    correct one, because it is where the instrument actually last traded.
+    """
+    import time
+
+    bucket = int(time.time() // HORIZON_ANCHOR_SECONDS)
+    if not live_bars_in_hours():
+        return False, 0, ("market closed, so these are anchored on the last "
+                          "daily close - which is where they last traded")
+    try:
+        import market_source
+        if not market_source.session_available():
+            return False, 0, ("no Kite session, so these are anchored on the "
+                              "last daily close and may be a day stale")
+    except Exception:
+        return False, 0, "no market source, so anchored on the last close"
+    return True, bucket, ""
 
 
 def render_horizon_tables(symbols: list, top: int = 20) -> None:
@@ -1237,7 +1269,23 @@ def render_horizon_tables(symbols: list, top: int = 20) -> None:
                     f"round trip {horizons.HORIZONS[name]['cost_pct']:.3f}%")
         slots[name] = st.empty()
         slots[name].info("scoring...")
-    picks = load_horizon_picks(tuple(symbols), top)
+    anchor_live, bucket, why = horizon_anchor()
+    result = load_horizon_picks(tuple(symbols), top, bucket, anchor_live)
+    picks = result.get("picks") or {}
+    if anchor_live and result.get("live_count"):
+        st.caption(
+            f"Prices, stops and exits are anchored on the LIVE price for "
+            f"{result['live_count']:,} symbols, refreshed about every "
+            f"{HORIZON_ANCHOR_SECONDS}s. The trend and volatility columns "
+            f"still come from completed daily bars, which is why the "
+            f"ordering barely moves during a session."
+        )
+    else:
+        st.caption(
+            f"{why or 'Anchored on the last daily close.'} Stops and exits "
+            f"are computed from that price, so during a session they can sit "
+            f"a full day's move away from where the stock is now."
+        )
     if not picks:
         for slot in slots.values():
             slot.error(

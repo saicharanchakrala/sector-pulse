@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 
 import horizons
 
@@ -222,3 +223,101 @@ def test_a_benchmark_that_stops_early_is_refused_not_carried_forward() -> None:
     # No usable benchmark, so relative falls back to the raw trend rather
     # than to a number computed against a stale index close.
     assert got.relative == got.trend
+
+
+# --- the live price anchor ------------------------------------------------
+#
+# Measured on RELIANCE at 09:36 on 2026-09-10: the daily store's newest
+# close was 1288.70 while the live price was 1274.50. Every level came off
+# that stale anchor, so the table offered a 2:1 stop and target that became
+# 6.7:1 for anyone placing it at the live price - risk 0.71% where 1.81%
+# was intended. The required-win-rate arithmetic assumes 2:1, so it was
+# quoting a figure for a trade nobody could place.
+
+def test_a_live_price_re_anchors_the_levels() -> None:
+    lookback = horizons._lookback_for("short")
+    frame = daily([100.0 + i * 0.2 for i in range(lookback + 20)])
+    close_anchored = horizons.assess_daily("S", frame, "short", None)
+    live_anchored = horizons.assess_daily("S", frame, "short", None,
+                                          live_price=90.0)
+    assert close_anchored is not None and live_anchored is not None
+    assert live_anchored.price == pytest.approx(90.0)
+    assert live_anchored.stop_price != close_anchored.stop_price
+    assert live_anchored.target_price != close_anchored.target_price
+
+
+def test_the_live_anchor_keeps_reward_to_risk_at_two_to_one() -> None:
+    # The whole point. A stale anchor silently changed this ratio, and the
+    # cost arithmetic depends on it being 2:1.
+    lookback = horizons._lookback_for("short")
+    frame = daily([100.0 + i * 0.2 for i in range(lookback + 20)])
+    for price in (80.0, 95.0, 110.0, 130.0):
+        a = horizons.assess_daily("S", frame, "short", None, live_price=price)
+        assert a is not None
+        risk = abs(a.price - a.stop_price)
+        reward = abs(a.target_price - a.price)
+        assert reward / risk == pytest.approx(2.0), price
+
+
+def test_trend_and_relative_do_NOT_move_with_the_live_price() -> None:
+    # Deliberate. `relative` subtracts the benchmark's move over the same
+    # span, so advancing this stock's end point while the index stays on
+    # its last close would manufacture excess return from a timing
+    # mismatch. Both sides move together or neither does.
+    lookback = horizons._lookback_for("short")
+    n = lookback + 20
+    stock = daily([100.0 * (1.01 ** i) for i in range(n)])
+    bench = daily([100.0 * (1.005 ** i) for i in range(n)])
+    plain = horizons.assess_daily("S", stock, "short", bench)
+    live = horizons.assess_daily("S", stock, "short", bench, live_price=50.0)
+    assert plain is not None and live is not None
+    assert live.trend == pytest.approx(plain.trend)
+    assert live.relative == pytest.approx(plain.relative)
+    # And volatility is a property of the window, not of one tick.
+    assert live.volatility == pytest.approx(plain.volatility)
+    assert live.expected_move == pytest.approx(plain.expected_move)
+
+
+def test_a_live_price_above_the_trailing_range_is_clamped() -> None:
+    # A live price CAN sit outside the trailing range where the last close
+    # could not. Uncapped, a new high read as a range position of 1.04 and
+    # a "below recent peak" of +3.8%, both nonsense.
+    lookback = horizons._lookback_for("short")
+    frame = daily([100.0 + i * 0.2 for i in range(lookback + 20)])
+    a = horizons.assess_daily("S", frame, "short", None, live_price=500.0)
+    assert a is not None
+    assert a.position_in_range == pytest.approx(1.0)
+    assert a.drawdown == pytest.approx(0.0)
+
+
+def test_a_live_price_below_the_trailing_range_is_clamped() -> None:
+    lookback = horizons._lookback_for("short")
+    frame = daily([100.0 + i * 0.2 for i in range(lookback + 20)])
+    a = horizons.assess_daily("S", frame, "short", None, live_price=1.0)
+    assert a is not None
+    assert a.position_in_range == pytest.approx(0.0)
+    assert a.drawdown < 0.0
+
+
+def test_an_unusable_live_price_falls_back_to_the_close() -> None:
+    # A missing quote must degrade to the stale anchor, not to zero.
+    lookback = horizons._lookback_for("short")
+    frame = daily([100.0 + i * 0.2 for i in range(lookback + 20)])
+    base = horizons.assess_daily("S", frame, "short", None)
+    for bad in (0.0, -5.0, float("nan"), float("inf")):
+        a = horizons.assess_daily("S", frame, "short", None, live_price=bad)
+        assert a is not None, bad
+        assert a.price == pytest.approx(base.price), bad
+
+
+def test_live_prices_for_returns_empty_rather_than_raising(monkeypatch) -> None:
+    # With no session the horizons must still render, anchored on the last
+    # close, rather than the whole tab failing.
+    import market_source
+
+    def boom(symbols, session=None):
+        raise market_source.NoSession("no session")
+
+    monkeypatch.setattr(market_source, "last_prices", boom)
+    assert horizons.live_prices_for(["RELIANCE"]) == {}
+    assert horizons.live_prices_for([]) == {}

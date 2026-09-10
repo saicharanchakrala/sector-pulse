@@ -216,11 +216,24 @@ def _benchmark_move(dates, benchmark, lookback: int) -> float:
 
 
 def assess_daily(symbol: str, frame: pd.DataFrame, horizon: str,
-                 benchmark: "pd.DataFrame | None") -> "Assessment | None":
+                 benchmark: "pd.DataFrame | None",
+                 live_price: "float | None" = None) -> "Assessment | None":
     """One symbol at one daily horizon, from cached daily bars.
 
     No session-time gate: whether 40 minutes remain today is irrelevant to
     a position meant to be held for ten sessions or a year.
+
+    `live_price` re-anchors the readings that answer "where is it NOW" -
+    the price, the stop, the exit, the drawdown and the range position.
+    Without it those come from the newest daily close, which during a
+    session is yesterday's: measured at 1.10% away on RELIANCE, enough to
+    turn a 2:1 stop-and-target into 6.7:1 for anyone acting on it.
+
+    `trend` and `relative` deliberately stay on completed bars even when a
+    live price is given. `relative` subtracts the benchmark's move over the
+    same span, so advancing this stock's end point while leaving the index
+    on its last close would invent excess return from a timing mismatch.
+    Volatility is a property of the window and does not move on one tick.
     """
     if frame is None or "Close" not in frame.columns:
         return None
@@ -238,6 +251,11 @@ def assess_daily(symbol: str, frame: pd.DataFrame, horizon: str,
     price = float(closes[-1])
     if price <= 0:
         return None
+    # The anchor for everything positional. `trend` keeps using the close
+    # below, so the benchmark comparison stays span-for-span honest.
+    anchor = price
+    if live_price is not None and np.isfinite(live_price) and live_price > 0:
+        anchor = float(live_price)
     window = closes[-(lookback + 1):]
     # The FIRST close of the window is a divisor, and only the last was
     # being checked. A zero start gives an infinite trend and a negative
@@ -276,11 +294,16 @@ def assess_daily(symbol: str, frame: pd.DataFrame, horizon: str,
         f"round trip costs {cost:.3f}%, which the plausible move covers "
         f"{multiple:.1f}x [{'PASS' if multiple >= 3.0 else 'FAIL'}]",
     ]
+    # Clamped, because a live price CAN sit outside the trailing range
+    # while the last close could not. Uncapped, a new high read as a range
+    # position of 1.04 and a "below recent peak" of +3.8%.
+    drawdown = (min(0.0, (anchor / high - 1.0) * 100.0) if high > 0
+                else float("nan"))
+    position = min(1.0, max(0.0, (anchor - low) / span))
     return Assessment(
-        symbol=symbol, horizon=horizon, price=price, direction=direction,
+        symbol=symbol, horizon=horizon, price=anchor, direction=direction,
         trend=trend, relative=relative, volatility=volatility,
-        drawdown=(price / high - 1.0) * 100.0 if high > 0 else float("nan"),
-        position_in_range=(price - low) / span,
+        drawdown=drawdown, position_in_range=position,
         expected_move=expected, cost_pct=cost, cost_multiple=multiple,
         reasons=reasons,
         blocked="" if multiple >= 3.0 else "expected move too small for costs")
@@ -414,13 +437,38 @@ def rank(assessments: list, top: int = 20) -> list:
     return (payable + rest)[:top]
 
 
+def live_prices_for(symbols: list) -> dict:
+    """Live last-traded price per symbol, or {} when there is no session.
+
+    One batched quote sweep rather than a call per symbol: Kite caps a
+    quote at 500 instruments, so the whole universe is a handful of
+    requests. Returns {} on any failure - the horizons then fall back to
+    the last daily close, which is stale but not wrong, and the UI says
+    which anchor it used.
+    """
+    if not symbols:
+        return {}
+    try:
+        import market_source
+        return market_source.last_prices(list(symbols))
+    except Exception as exc:
+        logger.warning("No live prices, so the horizons stay anchored to "
+                       "the last daily close: %s", exc)
+        return {}
+
+
 def assess_universe(symbols: list, horizons: "list | None" = None,
                     benchmark_symbol: str = "NIFTY 50",
-                    top: int = 20, progress=None) -> dict:
+                    top: int = 20, progress=None,
+                    live: "dict | None" = None) -> dict:
     """Every symbol across the daily horizons, ranked, top `top` each.
 
     `progress` is called as progress(horizon, done, total) so a UI can fill
     its table as results arrive rather than waiting for the whole sweep.
+
+    `live` maps symbol to its current price. Pass it to anchor the levels
+    on now rather than on the last daily close; pass None during a replay
+    or outside market hours, where the close IS the right anchor.
     """
     wanted = [h for h in (horizons or list(HORIZONS))
               if HORIZONS.get(h, {}).get("daily")]
@@ -444,7 +492,9 @@ def assess_universe(symbols: list, horizons: "list | None" = None,
             if frame is None:
                 continue
             try:
-                assessment = assess_daily(symbol, frame, horizon, benchmark)
+                assessment = assess_daily(
+                    symbol, frame, horizon, benchmark,
+                    live_price=(live or {}).get(symbol))
             except Exception as exc:
                 logger.warning("%s at %s: %s", symbol, horizon, exc)
                 continue
