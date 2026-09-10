@@ -62,15 +62,71 @@ def parse_args(argv=None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def universe(explicit: str) -> list:
-    """Symbols to stream: an explicit list, or every F&O underlying."""
+def by_turnover(limit: int) -> list:
+    """The `limit` most-traded symbols by 20-session turnover, or [].
+
+    Turnover is close times volume averaged over the last twenty sessions,
+    read from the consolidated daily store - the same measure the scan's
+    own liquidity gate uses, so the feed covers what the gate can pass
+    rather than an arbitrary slice.
+    """
+    try:
+        import bar_store
+
+        frames = bar_store.load("day")
+    except Exception as exc:
+        logger.warning("No daily store, so no turnover ranking: %s", exc)
+        return []
+    ranked = []
+    for symbol, frame in frames.items():
+        if frame is None or not {"Close", "Volume"} <= set(frame.columns):
+            continue
+        tail = frame.tail(20)
+        if tail.empty:
+            continue
+        value = float((tail["Close"] * tail["Volume"]).mean())
+        if value == value and value > 0:
+            ranked.append((value, symbol))
+    ranked.sort(reverse=True)
+    return [symbol for _, symbol in ranked[:max(0, limit)]]
+
+
+def universe(explicit: str, limit: "int | None" = None) -> list:
+    """Symbols to stream: an explicit list, or the liquid universe.
+
+    Previously this returned the F&O underlyings and nothing else, which
+    left the scan's wider scopes downloading bars for ~2,350 symbols at
+    three requests a second. Kite allows 3,000 instruments on the one
+    connection this process uses, so there was never a reason for the
+    feed to be that narrow.
+
+    The F&O set is unioned in unconditionally rather than left to the
+    turnover rank, so the intraday scanner's own default scope cannot
+    lose a name to a ranking change.
+    """
     if explicit.strip():
         return [s.strip().upper() for s in explicit.split(",") if s.strip()]
     snapshot = instruments.load_latest()
     if snapshot is None:
         logger.warning("No instrument snapshot; run the sync first")
         return []
-    return sorted({inst.symbol for inst in snapshot.fo_underlyings})
+    core = {inst.symbol for inst in snapshot.fo_underlyings}
+    wanted = config.FEED_UNIVERSE_SIZE if limit is None else limit
+    liquid = set(by_turnover(wanted))
+    if not liquid:
+        logger.warning("Turnover ranking unavailable; streaming the %d F&O "
+                       "underlyings only", len(core))
+        return sorted(core)
+    combined = core | liquid
+    cap = kt.MAX_INSTRUMENTS_PER_CONNECTION
+    if len(combined) > cap:
+        # The F&O set is never dropped; the ranking tail is trimmed.
+        room = max(0, cap - len(core))
+        combined = core | set(sorted(liquid - core)[:room])
+        logger.warning("Trimmed the streaming universe to Kite's %d cap", cap)
+    logger.info("Streaming %d symbols: %d F&O underlyings plus the top %d "
+                "by 20-session turnover", len(combined), len(core), wanted)
+    return sorted(combined)
 
 
 def take_lock() -> bool:

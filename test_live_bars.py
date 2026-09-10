@@ -477,3 +477,50 @@ def test_the_staleness_limit_exceeds_the_peak_age_of_a_healthy_feed() -> None:
     peak = live_bars.BAR_SECONDS * 2 + flush_default
     assert config.SCAN_LIVE_MAX_AGE_SECONDS > peak, (
         config.SCAN_LIVE_MAX_AGE_SECONDS, peak)
+
+
+# --- snapshot builds incrementally (round 3) -----------------------------
+
+def test_snapshot_is_incremental_and_still_returns_everything() -> None:
+    # It used to rebuild the whole frame from the list of completed bars on
+    # every call: 1,805ms at 193,000 bars, 3,061ms at 400,000, every
+    # 15-second flush, competing for the GIL with tick handling. Correct
+    # but wasteful, and the waste grew all day.
+    builder = live_bars.BarBuilder()
+    seen = 0
+    for minute in range(0, 50, 5):
+        builder.add([tick(1, 100.0 + minute, 1_000 * (minute + 1),
+                          at(10, minute)),
+                     tick(2, 200.0 + minute, 2_000 * (minute + 1),
+                          at(10, minute))])
+        frame = builder.snapshot()
+        # Monotonic: a cached frame must never lose rows it already had.
+        assert len(frame) >= seen
+        seen = len(frame)
+    builder.close_open_bars()
+    final = builder.snapshot()
+    assert len(final) == 20                      # 10 buckets x 2 instruments
+    assert set(final["instrument_token"]) == {1, 2}
+    # Repeated calls are stable rather than accumulating duplicates.
+    assert len(builder.snapshot()) == 20
+    assert len(builder.snapshot()) == 20
+
+
+def test_the_forming_bars_are_never_cached() -> None:
+    # Completed bars are frozen so they can be cached; a forming bar is
+    # still moving, so caching it would freeze a price mid-bucket.
+    builder = live_bars.BarBuilder()
+    builder.add([tick(1, 100.0, 1_000, at(10, 0))])
+    first = builder.snapshot(include_forming=True)
+    assert float(first[first["partial"]]["Close"].iloc[0]) == 100.0
+    builder.add([tick(1, 123.0, 1_500, at(10, 2))])
+    second = builder.snapshot(include_forming=True)
+    assert float(second[second["partial"]]["Close"].iloc[0]) == 123.0
+    # And the forming row must not have been appended twice.
+    assert len(second) == len(first)
+
+
+def test_an_empty_builder_still_has_the_right_columns() -> None:
+    frame = live_bars.BarBuilder().snapshot()
+    assert frame.empty
+    assert list(frame.columns) == live_bars.BarBuilder.EMPTY_COLUMNS

@@ -174,6 +174,12 @@ SCAN_LIVE_MAX_AGE_SECONDS = 900
 # How often the intraday scan may re-run itself while the feed is live, and
 # the choices offered. A refresh is a full re-scan, so the floor is well
 # above the measured scan time rather than as low as the UI could allow.
+# How many symbols the live feed subscribes to, ranked by 20-session
+# turnover. Kite caps one connection at 3,000; this leaves headroom and
+# comfortably covers everything the scan's liquidity gate could pass -
+# the illiquid tail is rejected by that gate anyway.
+FEED_UNIVERSE_SIZE = 1000
+
 SCAN_AUTO_REFRESH_SECONDS = 60
 SCAN_AUTO_REFRESH_CHOICES = (30, 60, 120, 300)
 # Below this share of requested symbols actually streaming, the live path is

@@ -1409,7 +1409,7 @@ def _blocked(monkeypatch, feed=None, in_hours=True, as_of=None,
     monkeypatch.setattr(app, "live_feed_state", lambda: state)
     monkeypatch.setattr(app, "live_bars_in_hours", lambda: in_hours)
     if scope is None:
-        scope = app._FEED_COVERED_SCOPE
+        scope = "F&O single stocks (fastest)"
     return app.autoscan_blocked(as_of, want_options, scope)
 
 
@@ -1462,16 +1462,18 @@ def test_a_wide_scope_is_never_scanned_automatically(monkeypatch) -> None:
     # just because someone opened the tab.
     import app
 
-    for scope in ("All listed equities (~2,570 - downloads, several minutes)",
-                  "All listed equities, first 300 (downloads)"):
-        why = _blocked(monkeypatch, scope=scope)
-        assert "download" in why, scope
+    why = _blocked(monkeypatch,
+                   scope="All listed equities (~2,570 - downloads the illiquid tail)")
+    assert "download" in why
 
 
-def test_the_feed_covered_scope_still_scans_itself(monkeypatch) -> None:
+def test_the_feed_covered_scopes_still_scan_themselves(monkeypatch) -> None:
+    # The feed streams every F&O underlying plus the ~1,000 most traded,
+    # so these cost at most a handful of downloads.
     import app
 
-    assert _blocked(monkeypatch, scope=app._FEED_COVERED_SCOPE) == ""
+    for scope in app._AUTOSCAN_SCOPES:
+        assert _blocked(monkeypatch, scope=scope) == "", scope
 
 
 def test_the_default_scope_is_all_listed_equities() -> None:
@@ -1481,9 +1483,18 @@ def test_the_default_scope_is_all_listed_equities() -> None:
     assert list(app._SCAN_SCOPES)[0].startswith("All listed equities")
 
 
-def test_the_feed_covered_scope_name_matches_a_real_option() -> None:
-    # A typo here would silently disable the automatic scan for every
-    # scope, since nothing would ever equal _FEED_COVERED_SCOPE.
+def test_every_autoscan_scope_name_matches_a_real_option() -> None:
+    # A typo here would silently disable the automatic scan, since nothing
+    # would ever be a member of _AUTOSCAN_SCOPES.
     import app
 
-    assert app._FEED_COVERED_SCOPE in app._SCAN_SCOPES
+    assert app._AUTOSCAN_SCOPES
+    for scope in app._AUTOSCAN_SCOPES:
+        assert scope in app._SCAN_SCOPES, scope
+
+
+def test_the_widest_scope_is_not_an_autoscan_scope() -> None:
+    # It reaches ~1,580 symbols the feed does not carry, at 3 req/s.
+    import app
+
+    assert list(app._SCAN_SCOPES)[0] not in app._AUTOSCAN_SCOPES

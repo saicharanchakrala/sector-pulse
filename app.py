@@ -566,14 +566,21 @@ def render_sync_tab() -> None:
 # has to download bars for roughly 2,350 symbols at Kite's 3 requests a
 # second, which is about 13 minutes.
 _SCAN_SCOPES: dict[str, "int | None"] = {
-    "All listed equities (~2,570 - downloads, several minutes)": 0,
-    "All listed equities, first 300 (downloads)": 300,
-    "F&O single stocks (fast, uses the live feed)": None,
+    "All listed equities (~2,570 - downloads the illiquid tail)": 0,
+    "All listed equities, first 300": 300,
+    "F&O single stocks (fastest)": None,
 }
 
-# The only scope the live feed covers, so the only one cheap enough to
-# start without being asked. See autoscan_blocked.
-_FEED_COVERED_SCOPE = "F&O single stocks (fast, uses the live feed)"
+# Scopes small enough that the live feed covers essentially all of them,
+# so they are cheap enough to start without being asked. The feed streams
+# every F&O underlying plus the top config.FEED_UNIVERSE_SIZE by turnover
+# - about 1,000 symbols - so anything at or under that size needs at most
+# a handful of downloads. Only the full universe reaches into the illiquid
+# tail the feed does not carry.
+_AUTOSCAN_SCOPES = frozenset({
+    "All listed equities, first 300",
+    "F&O single stocks (fastest)",
+})
 
 
 @st.cache_data(ttl=config.CACHE_TTL_SECONDS, show_spinner=False)
@@ -738,13 +745,15 @@ def autoscan_blocked(as_of, want_options: bool,
     if want_options:
         return ("option contracts cost an NSE request per setup, so they "
                 "are never fetched automatically")
-    if scope is not None and scope != _FEED_COVERED_SCOPE:
-        # The live feed carries the F&O names only. Any wider scope has to
-        # download bars for ~2,350 symbols at 3 requests a second, and
-        # starting a quarter-hour of downloading because someone opened a
-        # tab is not a thing to do on their behalf.
-        return (f"{scope!r} has to download bars for symbols the feed does "
-                f"not stream, which takes several minutes - so it is never "
+    if scope is not None and scope not in _AUTOSCAN_SCOPES:
+        # The feed streams every F&O underlying plus the ~1,000 most
+        # traded, so the narrower scopes cost at most a few downloads.
+        # The FULL universe still reaches ~1,580 symbols the feed does not
+        # carry, at three requests a second, and starting nine minutes of
+        # downloading because someone opened a tab is not a thing to do on
+        # their behalf.
+        return (f"{scope!r} reaches symbols the feed does not stream, so it "
+                f"has to download them - minutes, not seconds. It is never "
                 f"started automatically")
     if not live_bars_in_hours():
         return "the market is closed"

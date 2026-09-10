@@ -121,6 +121,14 @@ class BarBuilder:
         self._refused_late = 0
         self._refused_stale = 0
         self._refused_naive = 0
+        # Completed bars already converted to a frame, and how many of
+        # _done that covers. snapshot() used to rebuild the whole frame on
+        # every call: measured at 1,805ms for 193,000 bars and 3,061ms for
+        # 400,000. It runs outside the lock so it never blocked tick
+        # ingestion, but seconds of CPU every 15-second flush competes for
+        # the GIL with the tick handler. Only the new tail is converted.
+        self._frame: "pd.DataFrame | None" = None
+        self._framed = 0
 
     def add(self, ticks: list) -> None:
         """Fold a batch of ticks into their buckets."""
@@ -236,32 +244,57 @@ class BarBuilder:
             "ticks": bar["ticks"], "partial": bool(partial),
         })
 
+    EMPTY_COLUMNS = ["instrument_token", "Date"] + COLUMNS + ["ticks",
+                                                              "partial"]
+
+    def _forming_rows(self) -> list:
+        """The bar still being built, per instrument. Caller holds the lock."""
+        rows = []
+        for token, bar in self._open.items():
+            mark = self._volume_mark.get(token)
+            cumulative = bar["cum_volume"]
+            known = (mark is not None and cumulative is not None
+                     and self._saw_volume.get(token, False))
+            rows.append({
+                "instrument_token": token, "Date": bar["start"],
+                "Open": bar["open"], "High": bar["high"],
+                "Low": bar["low"], "Close": bar["close"],
+                "Volume": (max(0.0, float(cumulative - mark)) if known
+                           else float("nan")),
+                "ticks": bar["ticks"], "partial": True,
+            })
+        return rows
+
     def snapshot(self, include_forming: bool = False) -> pd.DataFrame:
         """Completed bars, optionally with the bar still being built.
 
         The forming bar is excluded by default: every indicator here treats
         a bar as a finished period, and half a bar reads as a real one.
+
+        Built INCREMENTALLY. Completed bars never change once closed, so
+        the frame for them is cached and only bars closed since the last
+        call are converted. The forming bars are appended fresh each time
+        and never cached, because they are still moving.
         """
         with self._lock:
-            rows = list(self._done)
-            if include_forming:
-                for token, bar in self._open.items():
-                    mark = self._volume_mark.get(token)
-                    cumulative = bar["cum_volume"]
-                    known = (mark is not None and cumulative is not None
-                             and self._saw_volume.get(token, False))
-                    rows.append({
-                        "instrument_token": token, "Date": bar["start"],
-                        "Open": bar["open"], "High": bar["high"],
-                        "Low": bar["low"], "Close": bar["close"],
-                        "Volume": (max(0.0, float(cumulative - mark)) if known
-                                   else float("nan")),
-                        "ticks": bar["ticks"], "partial": True,
-                    })
-        if not rows:
-            return pd.DataFrame(columns=["instrument_token", "Date"] + COLUMNS
-                                + ["ticks", "partial"])
-        return pd.DataFrame(rows)
+            fresh = self._done[self._framed:]
+            done_total = len(self._done)
+            forming = self._forming_rows() if include_forming else []
+        if fresh:
+            block = pd.DataFrame(fresh)
+            self._frame = (block if self._frame is None
+                           else pd.concat([self._frame, block],
+                                          ignore_index=True))
+            self._framed = done_total
+        completed = self._frame
+        if completed is None and not forming:
+            return pd.DataFrame(columns=self.EMPTY_COLUMNS)
+        if not forming:
+            return completed
+        tail = pd.DataFrame(forming)
+        if completed is None:
+            return tail
+        return pd.concat([completed, tail], ignore_index=True)
 
     def close_open_bars(self, now: "datetime | None" = None) -> int:
         """Finish every open bar. Without this the last one is lost.
