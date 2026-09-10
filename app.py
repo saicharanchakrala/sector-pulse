@@ -560,11 +560,20 @@ def render_sync_tab() -> None:
 # None means every F&O single stock, which is the default and the whole
 # tradeable intraday universe. An int caps the listed-equity sweep, which is
 # slow and mostly rejected on turnover.
+# Ordered so the FIRST entry is the default the selectbox lands on.
+# "All listed equities" leads by request; the labels carry the cost,
+# because only the F&O set is covered by the live feed - everything wider
+# has to download bars for roughly 2,350 symbols at Kite's 3 requests a
+# second, which is about 13 minutes.
 _SCAN_SCOPES: dict[str, "int | None"] = {
-    "F&O single stocks (default)": None,
-    "All listed equities, first 300": 300,
-    "All listed equities (very slow)": 0,
+    "All listed equities (~2,570 - downloads, several minutes)": 0,
+    "All listed equities, first 300 (downloads)": 300,
+    "F&O single stocks (fast, uses the live feed)": None,
 }
+
+# The only scope the live feed covers, so the only one cheap enough to
+# start without being asked. See autoscan_blocked.
+_FEED_COVERED_SCOPE = "F&O single stocks (fast, uses the live feed)"
 
 
 @st.cache_data(ttl=config.CACHE_TTL_SECONDS, show_spinner=False)
@@ -714,7 +723,8 @@ def render_replay_controls() -> "datetime | None":
     return moment
 
 
-def autoscan_blocked(as_of, want_options: bool) -> str:
+def autoscan_blocked(as_of, want_options: bool,
+                     scope: "str | None" = None) -> str:
     """Why the first scan must NOT run itself, or "" when it may.
 
     Deliberately conservative. An automatic scan costs a full sweep of the
@@ -728,6 +738,14 @@ def autoscan_blocked(as_of, want_options: bool) -> str:
     if want_options:
         return ("option contracts cost an NSE request per setup, so they "
                 "are never fetched automatically")
+    if scope is not None and scope != _FEED_COVERED_SCOPE:
+        # The live feed carries the F&O names only. Any wider scope has to
+        # download bars for ~2,350 symbols at 3 requests a second, and
+        # starting a quarter-hour of downloading because someone opened a
+        # tab is not a thing to do on their behalf.
+        return (f"{scope!r} has to download bars for symbols the feed does "
+                f"not stream, which takes several minutes - so it is never "
+                f"started automatically")
     if not live_bars_in_hours():
         return "the market is closed"
     state = live_feed_state()
@@ -1674,7 +1692,7 @@ def render_scan_tab() -> None:
     # after that stays opt-in, because each one re-scores every symbol.
     auto = False
     if not run and st.session_state.get("scan") is None:
-        why_not = autoscan_blocked(as_of, want_options)
+        why_not = autoscan_blocked(as_of, want_options, scope)
         if why_not:
             st.caption(f"No scan yet - {why_not}. Press Run intraday scan "
                        f"to do it anyway.")

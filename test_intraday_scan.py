@@ -1400,7 +1400,7 @@ def test_a_close_outside_the_previous_range_is_refused() -> None:
 # a scan is a full sweep of the universe.
 
 def _blocked(monkeypatch, feed=None, in_hours=True, as_of=None,
-             want_options=False):
+             want_options=False, scope=None):
     """app.autoscan_blocked with a healthy live session as the baseline."""
     import app
 
@@ -1408,7 +1408,9 @@ def _blocked(monkeypatch, feed=None, in_hours=True, as_of=None,
     state.update(feed or {})
     monkeypatch.setattr(app, "live_feed_state", lambda: state)
     monkeypatch.setattr(app, "live_bars_in_hours", lambda: in_hours)
-    return app.autoscan_blocked(as_of, want_options)
+    if scope is None:
+        scope = app._FEED_COVERED_SCOPE
+    return app.autoscan_blocked(as_of, want_options, scope)
 
 
 def test_a_healthy_live_session_may_scan_itself(monkeypatch) -> None:
@@ -1451,3 +1453,37 @@ def test_a_stale_feed_blocks_the_automatic_scan(monkeypatch) -> None:
 def test_an_unknowable_bar_age_blocks_the_automatic_scan(monkeypatch) -> None:
     assert "too old" in _blocked(monkeypatch,
                                  feed={"age_seconds": float("nan")})
+
+
+def test_a_wide_scope_is_never_scanned_automatically(monkeypatch) -> None:
+    # "All listed equities" is now the DEFAULT in the dropdown, and the
+    # first scan runs itself. Those two together would start a ~13 minute
+    # download of bars for the ~2,350 symbols the live feed does not carry,
+    # just because someone opened the tab.
+    import app
+
+    for scope in ("All listed equities (~2,570 - downloads, several minutes)",
+                  "All listed equities, first 300 (downloads)"):
+        why = _blocked(monkeypatch, scope=scope)
+        assert "download" in why, scope
+
+
+def test_the_feed_covered_scope_still_scans_itself(monkeypatch) -> None:
+    import app
+
+    assert _blocked(monkeypatch, scope=app._FEED_COVERED_SCOPE) == ""
+
+
+def test_the_default_scope_is_all_listed_equities() -> None:
+    # The selectbox has no explicit index, so the FIRST key is the default.
+    import app
+
+    assert list(app._SCAN_SCOPES)[0].startswith("All listed equities")
+
+
+def test_the_feed_covered_scope_name_matches_a_real_option() -> None:
+    # A typo here would silently disable the automatic scan for every
+    # scope, since nothing would ever equal _FEED_COVERED_SCOPE.
+    import app
+
+    assert app._FEED_COVERED_SCOPE in app._SCAN_SCOPES

@@ -31,9 +31,9 @@ REPO = pathlib.Path(__file__).resolve().parent
 NOT_COLUMNS = {
     "Live (now)", "Replay a past instant",          # radio options
     # scan-scope selectbox options, taken verbatim from app._SCAN_SCOPES
-    "F&O single stocks (default)",
-    "All listed equities, first 300",
-    "All listed equities (very slow)",
+    "All listed equities (~2,570 - downloads, several minutes)",
+    "All listed equities, first 300 (downloads)",
+    "F&O single stocks (fast, uses the live feed)",
     # Pivot-ladder names. These are ROW VALUES under the "Level" column,
     # not columns of their own, and the "Level" tooltip explains the whole
     # ladder in one place.
