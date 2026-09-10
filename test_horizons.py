@@ -321,3 +321,77 @@ def test_live_prices_for_returns_empty_rather_than_raising(monkeypatch) -> None:
     monkeypatch.setattr(market_source, "last_prices", boom)
     assert horizons.live_prices_for(["RELIANCE"]) == {}
     assert horizons.live_prices_for([]) == {}
+
+
+# --- the lookup must anchor the same way the tables do -------------------
+#
+# The gap that made a lookup disagree with the broker's screen. MOLBIO
+# closed at 1,253.00 on 9 Sep 2026 and traded at 1,509.40 the next
+# morning; the horizon tables had been re-anchored on the live price and
+# instrument_report had not, so it reported the close as "Price" and
+# derived every stop and exit from a figure 20% away from the market.
+
+def test_the_lookup_passes_a_live_price_through_to_the_levels(monkeypatch) -> None:
+    import instrument_report
+
+    monkeypatch.setattr(horizons, "live_prices_for",
+                        lambda symbols: {"FAKE": 1509.40})
+    lookback = horizons._lookback_for("short")
+    # The stock must OUTPACE the benchmark, or relative is 0, the view is
+    # SHORT, and the levels straddle the other way round.
+    frame = daily([1000.0 * (1.01 ** i) for i in range(lookback + 20)])
+    flat = daily([1000.0] * (lookback + 20))
+    frames = {"FAKE": frame, "NIFTY 50": flat}
+    monkeypatch.setattr(instrument_report.bar_store, "load",
+                        lambda *a, **k: frames)
+    monkeypatch.setattr(instrument_report, "resolve",
+                        lambda q: ("FAKE", False, 0))
+    report = instrument_report.analyse("FAKE", include_intraday=False)
+    assert report.found
+    assert report.live_anchored is True
+    assert report.price == pytest.approx(1509.40)
+    short = report.verdicts["short"].assessment
+    assert short is not None
+    assert short.price == pytest.approx(1509.40)
+    # And the levels straddle the LIVE price, not the stale close.
+    assert short.stop_price < 1509.40 < short.target_price
+
+
+def test_the_lookup_falls_back_to_the_close_and_says_so(monkeypatch) -> None:
+    import instrument_report
+
+    monkeypatch.setattr(horizons, "live_prices_for", lambda symbols: {})
+    lookback = horizons._lookback_for("short")
+    closes = [1000.0 + i for i in range(lookback + 20)]
+    frame = daily(closes)
+    frames = {"FAKE": frame, "NIFTY 50": frame}
+    monkeypatch.setattr(instrument_report.bar_store, "load",
+                        lambda *a, **k: frames)
+    monkeypatch.setattr(instrument_report, "resolve",
+                        lambda q: ("FAKE", False, 0))
+    report = instrument_report.analyse("FAKE", include_intraday=False)
+    assert report.found
+    # Degrades to the close rather than to nothing - but flags it, so the
+    # UI can warn instead of presenting a stale price as current.
+    assert report.live_anchored is False
+    assert report.price == pytest.approx(closes[-1])
+
+
+def test_use_live_false_never_quotes(monkeypatch) -> None:
+    # The CLI and the tests must be able to run without a session.
+    import instrument_report
+
+    def boom(symbols):
+        raise AssertionError("should not have quoted")
+
+    monkeypatch.setattr(horizons, "live_prices_for", boom)
+    lookback = horizons._lookback_for("short")
+    frame = daily([1000.0 + i for i in range(lookback + 20)])
+    frames = {"FAKE": frame, "NIFTY 50": frame}
+    monkeypatch.setattr(instrument_report.bar_store, "load",
+                        lambda *a, **k: frames)
+    monkeypatch.setattr(instrument_report, "resolve",
+                        lambda q: ("FAKE", False, 0))
+    report = instrument_report.analyse("FAKE", include_intraday=False,
+                                       use_live=False)
+    assert report.found and report.live_anchored is False

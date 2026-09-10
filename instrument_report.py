@@ -72,6 +72,12 @@ class Report:
     # Previous session's pivot levels, for DISPLAY. Measured and found not
     # to improve stop placement, so it informs no verdict here.
     pivots: object = None
+    # Whether `price` and every level derived from it came from a live
+    # quote or from the last daily close. The difference is not cosmetic:
+    # MOLBIO closed at 1,253.00 on 9 Sep and traded at 1,509.40 the next
+    # morning, so a lookup anchored on the close was 20% away from the
+    # price you would actually pay.
+    live_anchored: bool = False
 
     @property
     def buys(self) -> list:
@@ -136,14 +142,22 @@ def _previous_session_pivots(daily: pd.DataFrame):
                                    float(last["Close"]))
 
 
-def _daily_verdicts(symbol: str, frames: dict) -> dict:
-    """Short, mid and long verdicts from the consolidated daily store."""
+def _daily_verdicts(symbol: str, frames: dict,
+                    live_price: "float | None" = None) -> dict:
+    """Short, mid and long verdicts from the consolidated daily store.
+
+    `live_price` re-anchors the levels the same way the horizon tables do.
+    Without it the stop and exit come off the last daily close, which
+    during a session is yesterday's.
+    """
     frame = frames.get(symbol)
     benchmark = frames.get("NIFTY 50")
     turnover = horizons.turnover_20d(frame)
     out = {}
     for horizon in ("short", "mid", "long"):
-        assessment = horizons.assess_daily(symbol, frame, horizon, benchmark)
+        assessment = horizons.assess_daily(symbol, frame, horizon,
+                                           benchmark,
+                                           live_price=live_price)
         if assessment is None:
             out[horizon] = HorizonVerdict(
                 horizon=horizon, verdict=NO_BUY,
@@ -200,8 +214,16 @@ def _intraday_verdict(symbol: str) -> HorizonVerdict:
         blocker=blocker, reasons=list(setup.reasons), setup=setup)
 
 
-def analyse(query: str, include_intraday: bool = True) -> Report:
-    """Full report for one instrument across all four horizons."""
+def analyse(query: str, include_intraday: bool = True,
+            use_live: bool = True) -> Report:
+    """Full report for one instrument across all four horizons.
+
+    Anchors on a LIVE quote when one can be had. This was the gap that
+    made a lookup disagree with the broker's screen: the horizon tables
+    were re-anchored on the live price and this path was not, so it kept
+    reporting the last daily close as "Price" and derived every stop and
+    exit from it.
+    """
     symbol, in_fo, lot = resolve(query)
     if not symbol:
         return Report(symbol=(query or "").strip().upper(), found=False,
@@ -218,13 +240,19 @@ def analyse(query: str, include_intraday: bool = True) -> Report:
                            "Run `python -m bar_store` after fetching, or "
                            "fetch this symbol's history first.")
     price = float(daily["Close"].dropna().iloc[-1])
+    live = horizons.live_prices_for([symbol]).get(symbol) if use_live else None
+    anchored = bool(live and live > 0)
+    if anchored:
+        price = float(live)
     pivots = _previous_session_pivots(daily)
-    verdicts = _daily_verdicts(symbol, frames)
+    verdicts = _daily_verdicts(symbol, frames,
+                               live_price=price if anchored else None)
     if include_intraday:
         verdicts = {"intraday": _intraday_verdict(symbol), **verdicts}
     return Report(symbol=symbol, found=True, price=price,
                   as_of=daily.index[-1].to_pydatetime(), in_fo=in_fo,
-                  lot_size=lot, verdicts=verdicts, pivots=pivots)
+                  lot_size=lot, verdicts=verdicts, pivots=pivots,
+                  live_anchored=anchored)
 
 
 def summary_frame(report: Report) -> pd.DataFrame:

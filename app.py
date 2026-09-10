@@ -1342,7 +1342,7 @@ def analyse_instrument(symbol: str, with_intraday: bool) -> dict:
         "found": report.found, "symbol": report.symbol,
         "note": report.note, "price": report.price, "in_fo": report.in_fo,
         "lot_size": report.lot_size, "buys": report.buys,
-        "as_of": report.as_of,
+        "as_of": report.as_of, "live_anchored": report.live_anchored,
         "table": instrument_report.summary_frame(report),
         "pivots": (None if report.pivots is None else
                    {"S3": report.pivots.s3, "S2": report.pivots.s2,
@@ -1584,11 +1584,23 @@ def render_instrument_search() -> None:
         return
 
     header = f"**{report['symbol']}**  {report['price']:,.2f}"
+    header += "  (live)" if report.get("live_anchored") else "  (last close)"
     header += (f"  |  F&O, lot {report['lot_size']:,}" if report["in_fo"]
                else "  |  cash only, no derivatives")
     if report["as_of"] is not None:
         header += f"  |  latest daily bar {report['as_of']:%Y-%m-%d}"
     st.markdown(header)
+    if not report.get("live_anchored"):
+        # Worth saying loudly. MOLBIO closed at 1,253.00 and opened the
+        # next morning on its way to 1,509.40 - a lookup anchored on the
+        # close was 20% away from the price you would actually pay, and
+        # every stop and exit below it was wrong by the same margin.
+        st.warning(
+            "This is the last DAILY CLOSE, not a live price - the market "
+            "may be closed, or there is no Kite session. Every stop and "
+            "exit below is derived from it, so during a session they can "
+            "sit a full day's move away from where the stock is now."
+        )
 
     buys = report["buys"]
     if buys:
