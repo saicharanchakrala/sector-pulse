@@ -218,6 +218,11 @@ def render_sidebar() -> tuple[str, float, int]:
         )
         if st.button("Refresh data"):
             st.cache_data.clear()
+            # The scan's bar assembly moved to cache_resource, which
+            # cache_data.clear() does not touch - so without this the
+            # button stopped refreshing the one cache most worth
+            # refreshing.
+            st.cache_resource.clear()
             st.rerun()
         news_weight = st.slider(
             "News vs momentum weight", 0.0, 1.0, config.DEFAULT_NEWS_WEIGHT, 0.05
@@ -583,7 +588,7 @@ _AUTOSCAN_SCOPES = frozenset({
 })
 
 
-@st.cache_data(ttl=config.CACHE_TTL_SECONDS, show_spinner=False)
+@st.cache_resource(ttl=config.CACHE_TTL_SECONDS, show_spinner=False)
 def load_scan_bars(tickers: tuple[str, ...],
                    target: "date | None" = None,
                    live_stamp: str = "") -> scan_data.BarSet:
@@ -595,6 +600,20 @@ def load_scan_bars(tickers: tuple[str, ...],
     gates against whatever it first saw, which defeats the point of
     streaming. A past window is a different download, so the date belongs
     in the key too.
+
+    cache_RESOURCE, not cache_data, and the difference is not cosmetic.
+    cache_data pickles whatever it returns so each caller gets its own
+    copy; a BarSet holds two dicts of DataFrames - thousands of them once
+    the scope is the whole equity universe - and pickling it raised
+    UnserializableReturnValueError in production, taking the tab down
+    mid-refresh. cache_resource stores the object itself.
+
+    What that costs, stated because it is the real trade: every session
+    shares ONE instance, so anything mutating it in place would corrupt
+    every other reader. Nothing does - truncate() and _carry_source()
+    both build new BarSets rather than editing one - and
+    test_the_cached_barset_is_never_mutated_in_place pins that, because it
+    is the assumption this decorator rests on.
     """
     return scan_data.fetch_bars(list(tickers), target=target)
 

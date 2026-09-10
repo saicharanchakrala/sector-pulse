@@ -1498,3 +1498,52 @@ def test_the_widest_scope_is_not_an_autoscan_scope() -> None:
     import app
 
     assert list(app._SCAN_SCOPES)[0] not in app._AUTOSCAN_SCOPES
+
+
+def test_the_cached_barset_is_never_mutated_in_place() -> None:
+    # THE ASSUMPTION app.load_scan_bars RESTS ON. It uses st.cache_resource
+    # rather than st.cache_data, because pickling a BarSet holding
+    # thousands of DataFrames raised UnserializableReturnValueError in
+    # production and took the tab down mid-refresh. cache_resource hands
+    # every session the SAME object, so anything editing one in place would
+    # corrupt every other reader.
+    import copy
+
+    index = pd.DatetimeIndex([pd.Timestamp("2026-09-10 09:15", tz=IST),
+                              pd.Timestamp("2026-09-10 09:20", tz=IST)])
+    frame = pd.DataFrame({c: [1.0, 2.0] for c in
+                          ("Open", "High", "Low", "Close", "Volume")},
+                         index=index)
+    bars = scan_data.BarSet(intraday={"A": frame, "B": frame},
+                            daily={"A": frame, "B": frame},
+                            requested=2, failed=[], source="live feed",
+                            live_symbols=2, live_age_seconds=60.0)
+    before = copy.deepcopy(bars.intraday), copy.deepcopy(bars.failed)
+
+    cut = scan_data.truncate(bars, pd.Timestamp("2026-09-10 09:18", tz=IST))
+    # truncate must have built a NEW BarSet, leaving the original intact.
+    assert cut is not bars
+    assert cut.intraday is not bars.intraday
+    assert set(bars.intraday) == set(before[0])
+    assert len(bars.intraday["A"]) == 2, "the source frame was truncated"
+    assert bars.failed == before[1], "the source failed list was extended"
+    # And the truncation really did happen on the copy.
+    assert len(cut.intraday["A"]) == 1
+
+
+def test_carrying_the_source_forward_does_not_edit_the_original() -> None:
+    frame = pd.DataFrame({c: [1.0] for c in
+                          ("Open", "High", "Low", "Close", "Volume")},
+                         index=pd.DatetimeIndex(
+                             [pd.Timestamp("2026-09-10 09:15", tz=IST)]))
+    bars = scan_data.BarSet(intraday={"A": frame}, daily={"A": frame},
+                            requested=1, failed=[], source="live feed",
+                            live_symbols=1, live_age_seconds=30.0)
+    rebuilt = scan_data._carry_source(bars, {}, {}, failed=["A"])
+    assert rebuilt is not bars
+    assert bars.failed == [], "the original failed list was mutated"
+    assert bars.intraday, "the original intraday dict was emptied"
+    # The provenance fields must survive the rebuild.
+    assert rebuilt.source == "live feed"
+    assert rebuilt.live_symbols == 1
+    assert rebuilt.live_age_seconds == 30.0
