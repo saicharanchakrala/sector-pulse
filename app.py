@@ -30,6 +30,7 @@ import streamlit as st
 
 import analyzer
 import claude_insights
+import bar_store
 import config
 import decision
 import daily_signal
@@ -1167,12 +1168,42 @@ def render_scan_results(ranked: list[setups.Setup], bars: scan_data.BarSet,
 
     shown = actionable or directional[:5]
     if shown:
-        st.subheader("Gate detail")
+        st.subheader("Gate detail" if actionable
+                     else "Blocked - these are NOT suggestions")
+        if not actionable:
+            # WHY THIS WARNING EXISTS. A blocked setup used to render as
+            # ten green PASS lines with one FAIL among them, above a full
+            # set of levels - and when nothing is actionable this panel is
+            # the only thing on screen. Measured on HDFCLIFE at 10:00 on
+            # 2026-09-10: SHORT, entry 511.20, stop 516.00, target 501.60,
+            # every gate passing except "relative strength +3.06pp, needs
+            # to underperform". It read as a trade ticket and was taken as
+            # one. The levels below are what the setup WOULD have used had
+            # it passed, which is not the same thing as a plan.
+            st.warning(
+                "Nothing cleared the gates, so these are the closest "
+                "misses. Each one names the check that stopped it. The "
+                "levels shown are what it WOULD have used had it passed - "
+                "they are arithmetic, not a recommendation.",
+                icon=":material/block:")
         for setup in shown[:8]:
-            suffix = (f" (score {setup.rank_score:.3f})" if setup.actionable
-                      else " - not actionable")
-            with st.expander(f"{setup.symbol} - {setup.direction}{suffix}"):
-                for reason in setup.reasons:
+            failed = [r for r in setup.reasons if "[FAIL]" in r]
+            if setup.actionable:
+                title = (f"{setup.symbol} - {setup.direction} "
+                         f"(score {setup.rank_score:.3f})")
+            else:
+                # The blocking reason belongs in the TITLE. Buried among
+                # eleven lines it was invisible.
+                why = (failed[0].split(" [")[0] if failed
+                       else "no directional agreement")
+                title = f"{setup.symbol} - BLOCKED: {why}"
+            with st.expander(title):
+                # Failures first for a blocked setup, so the reason is not
+                # read after the levels that look like a plan.
+                ordered = (setup.reasons if setup.actionable
+                           else failed + [r for r in setup.reasons
+                                          if "[FAIL]" not in r])
+                for reason in ordered:
                     st.caption(reason)
 
     if want_options and actionable:
@@ -1479,16 +1510,7 @@ def render_derivative_panel(symbol: str, kind: str, underlying: str,
                 f"this close to expiry, and the horizon buckets here start "
                 f"at 10 sessions - none of them fits."
             )
-    st.info(
-        "**No horizon assessment for contracts yet, and that is a limit "
-        "rather than a verdict.** The short, mid and long assessments read "
-        "cash daily bars from the consolidated store, price a 0.23% "
-        "delivery round trip, and assume you can hold as long as the "
-        "horizon says. A contract has none of those properties - it has an "
-        "expiry, its own cost stack, and for an option a price that moves "
-        "with the underlying only partly. Analysing the underlying is the "
-        "closest honest answer."
-    )
+    render_contract_assessment(symbol, kind, underlying)
     if underlying and st.button(f"Analyse {underlying} instead",
                                 key=f"jump_{symbol}"):
         st.session_state["lookup_last"] = underlying
@@ -1501,6 +1523,170 @@ def render_derivative_panel(symbol: str, kind: str, underlying: str,
         st.rerun()
     if kind == instrument_search.KIND_OPTION:
         render_option_cost_arithmetic(lot_size)
+
+
+def render_contract_assessment(symbol: str, kind: str,
+                               underlying: str) -> None:
+    """A horizon assessment for a FUTURE, or an honest refusal for an option.
+
+    A future gets the real thing: the underlying's daily readings, this
+    contract's live price for the levels, the futures cost stack, and only
+    the horizons that fit before expiry.
+
+    An option does not, and the reason is a modelling limit rather than
+    missing plumbing. A premium moves with the underlying only through
+    delta and decays with time whatever the underlying does, so the
+    "plausible move" of a premium is not something this project can
+    compute. Inventing one would contradict everything else measured here.
+    What an option gets instead is the underlying's assessment, labelled as
+    the underlying's, plus the premium arithmetic - which is the half that
+    survived measurement.
+    """
+    if kind == instrument_search.KIND_OPTION:
+        st.info(
+            f"**No horizon verdict on an option contract, and that is a "
+            f"modelling limit rather than a verdict.** A premium tracks "
+            f"{underlying} only partly, through delta, and decays with time "
+            f"whatever {underlying} does - so a plausible move for the "
+            f"premium is not something this tool can compute honestly. "
+            f"Below is {underlying}'s own assessment, which is a statement "
+            f"about {underlying} and not about this contract, and the "
+            f"premium cost arithmetic, which is exact."
+        )
+        if underlying:
+            report = analyse_instrument(underlying, False)
+            if report.get("found"):
+                table = report.get("table")
+                if table is not None and not table.empty:
+                    st.markdown(f"**{underlying}** "
+                                f"{report['price']:,.2f}"
+                                + ("  (live)" if report.get("live_anchored")
+                                   else "  (last close)"))
+                    show_table(table)
+                    st.caption(
+                        f"Every level above is a level on {underlying} "
+                        f"itself. None of them is a level on this option.")
+        return
+    match = instrument_search.find(symbol)
+    if match is None:
+        st.caption("Contract not found in the instrument master.")
+        return
+    days = match.days_to_expiry
+    if not horizons.reachable(days):
+        st.warning(
+            f"No horizon fits before expiry: {days} calendar day(s) left, "
+            f"and the shortest horizon here is "
+            f"{horizons.HORIZONS['short']['sessions']} sessions. A verdict "
+            f"for a holding period the contract cannot survive would be an "
+            f"answer to an impossible question."
+        )
+        return
+    with st.spinner(f"assessing {symbol}..."):
+        verdicts = contract_verdicts(symbol)
+    if not verdicts:
+        st.caption("Not enough underlying history to assess this contract.")
+        return
+    rows = []
+    for name, detail in verdicts.items():
+        rows.append({
+            "Horizon": name,
+            "Held": f"{horizons.HORIZONS[name]['sessions']} session(s)",
+            "Verdict": detail["verdict"],
+            "View": detail["view"],
+            "Stop loss at": detail["stop"],
+            "Exit price": detail["exit"],
+            "Round trip": f"{detail['cost']:.3f}%",
+            "Move vs fees": detail["covers"],
+            "Blocked by": detail["blocker"],
+        })
+    show_table(pd.DataFrame(rows))
+    st.caption(
+        f"Readings from **{underlying}**'s daily history - a contract's own "
+        f"history is weeks long and breaks across rolls. Levels from **this "
+        f"contract's** live price. Round trip is the futures stack on "
+        f"notional, not the 0.23% a cash delivery pays."
+    )
+    for name, detail in verdicts.items():
+        with st.expander(f"{name} - {detail['verdict']}"):
+            for line in detail["reasons"]:
+                st.caption(f"- {line}")
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def contract_verdicts(symbol: str) -> dict:
+    """Futures verdicts per horizon, as plain dicts so they cache."""
+    match = instrument_search.find(symbol)
+    if match is None:
+        return {}
+    frames = bar_store.load("day", symbols=[match.underlying, "NIFTY 50"])
+    frame = frames.get(match.underlying)
+    if frame is None or frame.empty:
+        return {}
+    live = horizons.live_prices_for([symbol]).get(symbol)
+    verdicts = instrument_report.assess_contract(
+        match, frame, frames.get("NIFTY 50"), live)
+    out = {}
+    for name, verdict in verdicts.items():
+        a = verdict.assessment
+        out[name] = {
+            "verdict": verdict.verdict, "view": a.direction,
+            "stop": round(a.stop_price, 2), "exit": round(a.target_price, 2),
+            "cost": a.cost_pct, "covers": f"{a.cost_multiple:.0f}x",
+            "blocker": (verdict.blocker.split(" [")[0]
+                        if verdict.blocker else ""),
+            "reasons": list(verdict.reasons),
+        }
+    return out
+
+
+def render_fno_browser(underlying: str) -> None:
+    """Reach a contract by expiry and strike rather than from a flat list.
+
+    A strike ladder is dozens of contracts - 39 strikes on one RELIANCE
+    expiry - so a list of chips is the wrong control no matter how long it
+    is allowed to be.
+    """
+    futures = [m for m in instrument_search.search(
+        underlying, limit=40, kinds=(instrument_search.KIND_FUTURE,))
+        if m.underlying == underlying]
+    expiries = instrument_search.expiries_for(underlying)
+    if not futures and not expiries:
+        return
+    with st.expander(f"F&O contracts on {underlying}"):
+        if futures:
+            st.markdown("**Futures**")
+            picked = st.pills(
+                "expiry", [f.symbol for f in futures],
+                selection_mode="single", key=f"fut_{underlying}",
+                label_visibility="collapsed")
+            if picked:
+                render_contract_assessment(
+                    picked, instrument_search.KIND_FUTURE, underlying)
+        if not expiries:
+            return
+        st.markdown("**Options**")
+        left, mid, right = st.columns([2, 2, 1])
+        expiry = left.selectbox(
+            "Expiry", expiries, key=f"opt_exp_{underlying}",
+            format_func=lambda d: f"{d:%d %b %Y}")
+        strikes = instrument_search.strikes_for(underlying, expiry)
+        if not strikes:
+            st.caption("no strikes listed for that expiry")
+            return
+        strike = mid.selectbox(
+            f"Strike ({len(strikes)} listed)", strikes,
+            index=len(strikes) // 2, key=f"opt_strike_{underlying}",
+            format_func=lambda v: f"{v:,.0f}")
+        side = right.segmented_control(
+            "Side", ["CE", "PE"], default="CE",
+            key=f"opt_side_{underlying}")
+        contract = instrument_search.contract(underlying, expiry, strike,
+                                              side or "CE")
+        if contract is None:
+            st.caption("no contract at that combination")
+            return
+        st.caption(contract.label)
+        render_option_cost_arithmetic(contract.lot_size)
 
 
 def render_option_cost_arithmetic(lot_size: int) -> None:
@@ -1571,7 +1757,10 @@ def render_instrument_search() -> None:
     query, picked = "", None
     if text:
         with st.spinner("searching..."):
-            matches = search_instruments(text.upper(), 25)
+            # 60, not 25. A strike ladder is dozens of contracts and the
+            # old cap silently hid most of them - though the real fix for
+            # options is the F&O browser below, not a longer list.
+            matches = search_instruments(text.upper(), 60)
         if not matches:
             # NOT a dead end. The horizon assessment reads the daily store
             # and needs no instrument master at all, so a symbol the
@@ -1601,7 +1790,12 @@ def render_instrument_search() -> None:
             # nothing being selected is the natural "not chosen yet" state
             # so no sentinel option is needed - which also means typing
             # cannot silently analyse whatever ranks first.
-            shown = matches[:12]
+            # Options are reached through the F&O browser rather than
+            # these chips, so they do not get to crowd out the stock and
+            # its futures - which is what a 12-pill window did when 79
+            # contracts matched.
+            head = [r for r in matches if r[2] != instrument_search.KIND_OPTION]
+            shown = (head or matches)[:12]
             chosen = st.pills(
                 f"{len(matches)} match(es) - pick one",
                 [row[0] for row in shown], selection_mode="single",
@@ -1671,6 +1865,10 @@ def render_instrument_search() -> None:
         show_terms("What the horizons mean", "Why charges matter so much",
                    "Why this tool will not predict for you")
     render_pivot_levels(report.get("pivots"), report["price"])
+    if report.get("in_fo"):
+        # Only for names that actually have derivatives - the browser is
+        # empty and confusing otherwise.
+        render_fno_browser(report["symbol"])
     for name, detail in report["detail"].items():
         label = (f"{name} - {detail['verdict']}"
                  + (f" ({detail['blocker'].split(' [')[0]})"

@@ -176,6 +176,49 @@ def _daily_verdicts(symbol: str, frames: dict,
     return out
 
 
+def assess_contract(contract, underlying_frame, benchmark,
+                    live_price: "float | None" = None) -> dict:
+    """Verdicts per reachable horizon for one FUTURES contract.
+
+    `contract` is an instrument_search.Match. The readings come from the
+    underlying's daily history and the levels from the contract's own live
+    price - see the module note for why those two cannot be the same
+    source.
+    """
+    import trade_costs
+
+    out = {}
+    days = contract.days_to_expiry
+    horizons_left = horizons.reachable(days)
+    if not horizons_left:
+        return out
+    lot = max(1, int(contract.lot_size or 1))
+    anchor = live_price if (live_price or 0) > 0 else None
+    cost = (trade_costs.futures_breakeven_pct(float(anchor), 1, lot)
+            if anchor else None)
+    turnover = horizons.turnover_20d(underlying_frame)
+    for horizon in horizons_left:
+        assessment = horizons.assess_daily(
+            contract.symbol, underlying_frame, horizon, benchmark,
+            live_price=anchor, cost_pct=cost)
+        if assessment is None:
+            continue
+        passed, lines = horizons.gate_lines(assessment, turnover)
+        blocker = ""
+        if not passed:
+            failed = [l for l in lines if "[FAIL]" in l]
+            blocker = failed[0] if failed else "a gate failed"
+        lines = [f"readings from the underlying {contract.underlying}, "
+                 f"levels from this contract, round trip "
+                 f"{cost:.3f}% of notional" if cost else
+                 "no live price, so the levels use the underlying's close"
+                 ] + list(lines)
+        out[horizon] = HorizonVerdict(
+            horizon=horizon, verdict=BUY if passed else NO_BUY,
+            blocker=blocker, reasons=lines, assessment=assessment)
+    return out
+
+
 def _intraday_verdict(symbol: str) -> HorizonVerdict:
     """Today's intraday verdict, from live or cached 5-minute bars."""
     import instruments

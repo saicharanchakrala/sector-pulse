@@ -121,6 +121,51 @@ def options_cost(entry_premium: float, exit_premium: float,
     )
 
 
+def futures_cost(entry_price: float, exit_price: float,
+                 lots: int, lot_size: int) -> CostBreakdown:
+    """Cost of one equity-futures round trip, charged on NOTIONAL.
+
+    The middle of the three stacks and by far the cheapest per rupee of
+    exposure: brokerage is capped at 20 rupees a leg, and every percentage
+    charge applies to the contract's notional rather than to a premium. On
+    a six-lakh contract the capped brokerage is about 0.003% - which is
+    why a future can clear its costs on a move an option cannot.
+
+    STT is 0.02% and sell-side only, a fifth of what equity delivery pays
+    on each leg and a fifth of what an option pays on premium.
+    """
+    quantity = lots * lot_size
+    if quantity <= 0 or entry_price <= 0.0 or exit_price <= 0.0:
+        return CostBreakdown(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    buy_turnover = entry_price * quantity
+    sell_turnover = exit_price * quantity
+    turnover = buy_turnover + sell_turnover
+
+    brokerage = sum(
+        min(leg * config.COST_FUT_BROKERAGE_PCT,
+            config.COST_FUT_BROKERAGE_CAP)
+        for leg in (buy_turnover, sell_turnover))
+    stt = sell_turnover * config.COST_FUT_STT_SELL_PCT
+    transaction = turnover * config.COST_FUT_TXN_PCT
+    stamp_duty = buy_turnover * config.COST_FUT_STAMP_BUY_PCT
+    sebi = turnover * config.COST_SEBI_PCT
+    return CostBreakdown(
+        brokerage=brokerage,
+        stt=stt,
+        transaction=transaction,
+        stamp_duty=stamp_duty,
+        sebi=sebi,
+        gst=_gst_on(brokerage, transaction, sebi),
+        buy_turnover=buy_turnover,
+        sell_turnover=sell_turnover,
+    )
+
+
+def futures_breakeven_pct(price: float, lots: int, lot_size: int) -> float:
+    """Round-trip breakeven as a percent move, assuming a flat exit."""
+    return futures_cost(price, price, lots, lot_size).breakeven_pct
+
+
 def equity_breakeven_pct(price: float, quantity: int) -> float:
     """Round-trip breakeven as a percent move, assuming a flat exit.
 

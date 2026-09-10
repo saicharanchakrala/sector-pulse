@@ -148,6 +148,26 @@ class Assessment:
         return self.price + step if self.direction == "LONG" else self.price - step
 
 
+def reachable(days_to_expiry: "int | None") -> list:
+    """Daily horizons that fit before a contract expires, longest last.
+
+    A September future cannot be held for 252 sessions, so offering a
+    long-term verdict on one is not a cautious estimate - it is an answer
+    to a question that cannot be asked. Sessions are converted from
+    calendar days at five per seven, which is close enough for a bound
+    that only ever excludes whole horizons.
+
+    None means no expiry, so every daily horizon applies.
+    """
+    daily = [h for h in HORIZONS if HORIZONS[h].get("daily")]
+    if days_to_expiry is None:
+        return daily
+    if days_to_expiry <= 0:
+        return []
+    sessions_left = int(days_to_expiry * 5 / 7)
+    return [h for h in daily if _sessions_for(h) <= sessions_left]
+
+
 def _sessions_for(horizon: str) -> int:
     return int(HORIZONS[horizon]["sessions"])
 
@@ -217,7 +237,8 @@ def _benchmark_move(dates, benchmark, lookback: int) -> float:
 
 def assess_daily(symbol: str, frame: pd.DataFrame, horizon: str,
                  benchmark: "pd.DataFrame | None",
-                 live_price: "float | None" = None) -> "Assessment | None":
+                 live_price: "float | None" = None,
+                 cost_pct: "float | None" = None) -> "Assessment | None":
     """One symbol at one daily horizon, from cached daily bars.
 
     No session-time gate: whether 40 minutes remain today is irrelevant to
@@ -281,7 +302,13 @@ def assess_daily(symbol: str, frame: pd.DataFrame, horizon: str,
     # sigma convention the intraday sizer uses.
     expected = (volatility / np.sqrt(252.0) * np.sqrt(sessions)
                 if volatility == volatility else float("nan"))
-    cost = float(HORIZONS[horizon]["cost_pct"])
+    # `cost_pct` overrides the horizon's default so a derivative can be
+    # priced on its own stack. A future's round trip is about 0.034% of
+    # notional against the 0.23% a cash delivery pays, and the cost
+    # multiple - which is a hard gate - is meaningless if the wrong one is
+    # used.
+    cost = (float(HORIZONS[horizon]["cost_pct"]) if cost_pct is None
+            else float(cost_pct))
     multiple = (expected / cost) if cost > 0 and expected == expected else 0.0
 
     direction = "LONG" if relative > 0 else "SHORT"

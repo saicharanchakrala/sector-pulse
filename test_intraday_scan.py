@@ -1547,3 +1547,81 @@ def test_carrying_the_source_forward_does_not_edit_the_original() -> None:
     assert rebuilt.source == "live feed"
     assert rebuilt.live_symbols == 1
     assert rebuilt.live_age_seconds == 30.0
+
+
+# --- the futures cost stack and expiry-bounded horizons ------------------
+
+def test_futures_cost_is_the_cheapest_of_the_three_stacks() -> None:
+    # Percentage charges apply to NOTIONAL for a future and to PREMIUM for
+    # an option, which is the whole reason a future can clear its costs on
+    # a move an option cannot.
+    import trade_costs
+
+    fut = trade_costs.futures_breakeven_pct(1280.0, 1, 500)
+    eq = trade_costs.equity_breakeven_pct(1280.0, 100)
+    opt = trade_costs.options_breakeven_pct(50.0, 1, 500)
+    cheap_opt = trade_costs.options_breakeven_pct(5.0, 1, 500)
+    assert fut < eq < opt < cheap_opt
+    assert fut < 0.1, fut
+    # A cheap option is where the flat fee dominates - over 2% of premium.
+    assert cheap_opt > 2.0, cheap_opt
+
+
+def test_futures_stt_is_charged_on_the_sell_leg_only() -> None:
+    import trade_costs
+
+    cost = trade_costs.futures_cost(100.0, 100.0, 1, 500)
+    assert cost.stt == pytest.approx(100.0 * 500 * config.COST_FUT_STT_SELL_PCT)
+    # Brokerage is capped per leg, so two legs cannot exceed twice the cap.
+    assert cost.brokerage <= 2 * config.COST_FUT_BROKERAGE_CAP
+
+
+def test_futures_brokerage_is_capped_on_a_large_notional() -> None:
+    import trade_costs
+
+    small = trade_costs.futures_cost(100.0, 100.0, 1, 10)
+    huge = trade_costs.futures_cost(100000.0, 100000.0, 10, 500)
+    assert small.brokerage < 2 * config.COST_FUT_BROKERAGE_CAP
+    assert huge.brokerage == pytest.approx(2 * config.COST_FUT_BROKERAGE_CAP)
+
+
+def test_no_futures_cost_for_a_nonsense_position() -> None:
+    import trade_costs
+
+    for args in ((0.0, 100.0, 1, 500), (100.0, 0.0, 1, 500),
+                 (100.0, 100.0, 0, 500), (100.0, 100.0, 1, 0)):
+        assert trade_costs.futures_cost(*args).total == 0.0
+
+
+def test_horizons_beyond_the_expiry_are_not_offered() -> None:
+    # A September contract cannot be held for 252 sessions, so a long-term
+    # verdict on one answers a question that cannot be asked.
+    import horizons
+
+    assert horizons.reachable(None) == ["short", "mid", "long"]
+    assert horizons.reachable(400) == ["short", "mid", "long"]
+    assert "long" not in horizons.reachable(100)
+    assert horizons.reachable(19) == ["short"]
+    assert horizons.reachable(5) == []
+    assert horizons.reachable(0) == []
+    assert horizons.reachable(-3) == []
+
+
+def test_a_cost_override_reaches_the_gate() -> None:
+    # The cost multiple is a hard gate, so pricing a future on the cash
+    # delivery stack would gate it on the wrong number entirely.
+    import horizons
+
+    lookback = horizons._lookback_for("short")
+    frame = pd.DataFrame(
+        {c: [100.0 + i * 0.3 for i in range(lookback + 20)]
+         for c in ("Open", "High", "Low", "Close")},
+        index=pd.date_range("2025-01-01", periods=lookback + 20, freq="B",
+                            tz=IST))
+    frame["Volume"] = 1e6
+    cash = horizons.assess_daily("X", frame, "short", None)
+    cheap = horizons.assess_daily("X", frame, "short", None, cost_pct=0.034)
+    assert cash is not None and cheap is not None
+    assert cheap.cost_pct == pytest.approx(0.034)
+    # Same plausible move over a smaller cost means a bigger multiple.
+    assert cheap.cost_multiple > cash.cost_multiple

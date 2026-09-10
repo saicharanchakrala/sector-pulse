@@ -200,6 +200,15 @@ COST_SEBI_PCT = 0.000001          # 10 rupees per crore, both legs
 COST_GST_PCT = 0.18               # on brokerage + transaction + SEBI
 
 # Zerodha options charges, levied on premium turnover rather than contract value.
+# Equity futures. Percentage charges apply to NOTIONAL here, not to a
+# premium, which is what makes a future cheap per rupee of exposure and an
+# option expensive on a small premium.
+COST_FUT_BROKERAGE_PCT = 0.0003   # 0.03% per executed order...
+COST_FUT_BROKERAGE_CAP = 20.0     # ...capped at 20 rupees per order
+COST_FUT_STT_SELL_PCT = 0.0002    # 0.02% of notional, sell leg only
+COST_FUT_TXN_PCT = 0.0000173      # NSE futures transaction charge
+COST_FUT_STAMP_BUY_PCT = 0.00002  # 0.002%, buy leg only
+
 COST_OPT_BROKERAGE_FLAT = 20.0    # per executed order
 COST_OPT_STT_SELL_PCT = 0.001     # 0.1% of premium, sell leg only
 COST_OPT_TXN_PCT = 0.0003503      # NSE options transaction charge

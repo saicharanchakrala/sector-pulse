@@ -90,6 +90,19 @@ class Match:
         return self.kind in (KIND_FUTURE, KIND_OPTION)
 
     @property
+    def days_to_expiry(self) -> "int | None":
+        """Calendar days until expiry, or None for a cash instrument.
+
+        What the horizon bound is computed from: a September contract
+        cannot be held for 252 sessions, so a long-term verdict on one is
+        not a cautious estimate but an answer to an impossible question.
+        """
+        if self.expiry is None:
+            return None
+        from datetime import date as _date
+        return (self.expiry - _date.today()).days
+
+    @property
     def label(self) -> str:
         """One line for a dropdown - the symbol plus what disambiguates it."""
         if self.kind == KIND_STOCK:
