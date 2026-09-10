@@ -1389,3 +1389,65 @@ def test_a_close_outside_the_previous_range_is_refused() -> None:
     # A close exactly on either bound is still valid.
     assert indicators.pivot_ladder(100.0, 90.0, 100.0) is not None
     assert indicators.pivot_ladder(100.0, 90.0, 90.0) is not None
+
+
+# --- when the first scan may run itself ----------------------------------
+#
+# Requiring a button press meant the intraday table was simply absent for
+# anyone opening the tab mid-session, and a Streamlit restart clears
+# session_state so a scan run before it is gone too. The FIRST scan now
+# runs itself - but only when the result will be current and cheap, since
+# a scan is a full sweep of the universe.
+
+def _blocked(monkeypatch, feed=None, in_hours=True, as_of=None,
+             want_options=False):
+    """app.autoscan_blocked with a healthy live session as the baseline."""
+    import app
+
+    state = {"running": True, "bars": 12, "age_seconds": 120.0}
+    state.update(feed or {})
+    monkeypatch.setattr(app, "live_feed_state", lambda: state)
+    monkeypatch.setattr(app, "live_bars_in_hours", lambda: in_hours)
+    return app.autoscan_blocked(as_of, want_options)
+
+
+def test_a_healthy_live_session_may_scan_itself(monkeypatch) -> None:
+    assert _blocked(monkeypatch) == ""
+
+
+def test_a_replay_is_never_started_for_you(monkeypatch) -> None:
+    why = _blocked(monkeypatch, as_of=datetime(2026, 9, 9, 10, 0))
+    assert "replay" in why
+
+
+def test_option_chains_are_never_fetched_automatically(monkeypatch) -> None:
+    # One NSE request per setup. Triggering that unasked is rude to a
+    # third party, not merely slow.
+    assert "NSE" in _blocked(monkeypatch, want_options=True)
+
+
+def test_nothing_scans_itself_outside_market_hours(monkeypatch) -> None:
+    assert "closed" in _blocked(monkeypatch, in_hours=False)
+
+
+def test_a_stopped_feed_blocks_the_automatic_scan(monkeypatch) -> None:
+    # Without the feed a scan downloads 216 symbols at 3 a second, which
+    # is not something to start on someone's behalf.
+    assert "not running" in _blocked(monkeypatch, feed={"running": False})
+
+
+def test_a_feed_with_no_completed_bar_yet_blocks_it(monkeypatch) -> None:
+    # Right after the open the first bucket has not closed, so there is
+    # nothing to scan from.
+    assert "completed bar" in _blocked(monkeypatch, feed={"bars": 0})
+
+
+def test_a_stale_feed_blocks_the_automatic_scan(monkeypatch) -> None:
+    why = _blocked(monkeypatch,
+                   feed={"age_seconds": config.SCAN_LIVE_MAX_AGE_SECONDS + 1})
+    assert "too old" in why
+
+
+def test_an_unknowable_bar_age_blocks_the_automatic_scan(monkeypatch) -> None:
+    assert "too old" in _blocked(monkeypatch,
+                                 feed={"age_seconds": float("nan")})

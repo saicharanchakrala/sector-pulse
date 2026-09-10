@@ -714,6 +714,33 @@ def render_replay_controls() -> "datetime | None":
     return moment
 
 
+def autoscan_blocked(as_of, want_options: bool) -> str:
+    """Why the first scan must NOT run itself, or "" when it may.
+
+    Deliberately conservative. An automatic scan costs a full sweep of the
+    universe, so it only happens when the result will be both current and
+    cheap: inside market hours, with the feed alive and fresh, on a live
+    scan rather than a replay, and without option chains - those cost one
+    NSE request per setup and are not something to trigger unasked.
+    """
+    if as_of is not None:
+        return "a replay is a deliberate choice, not something to start for you"
+    if want_options:
+        return ("option contracts cost an NSE request per setup, so they "
+                "are never fetched automatically")
+    if not live_bars_in_hours():
+        return "the market is closed"
+    state = live_feed_state()
+    if not state.get("running"):
+        return "the live feed is not running, so a scan would download 216 symbols"
+    age = state.get("age_seconds", float("nan"))
+    if not state.get("bars"):
+        return "the feed has not written a completed bar yet"
+    if not (age == age) or age > config.SCAN_LIVE_MAX_AGE_SECONDS:
+        return "the newest live bar is too old, so the feed looks stopped"
+    return ""
+
+
 def render_scan_refresh_controls(replaying: bool,
                                  want_options: bool) -> "int | None":
     """The auto-refresh toggle for the intraday scan, or None when idle.
@@ -1627,25 +1654,55 @@ def render_scan_tab() -> None:
     st.divider()
     render_live_feed_panel()
     capital, risk_pct, scope, want_options, as_of, run = render_scan_controls()
+    # AUTO-RUN THE FIRST SCAN when the session is live and the feed is
+    # carrying it. Requiring a button press meant the table was simply
+    # absent for anyone who opened the tab during market hours - and a
+    # Streamlit restart clears session_state, so a scan run before the
+    # restart is gone too. Only the FIRST scan is automatic; refreshing
+    # after that stays opt-in, because each one re-scores every symbol.
+    auto = False
+    if not run and st.session_state.get("scan") is None:
+        why_not = autoscan_blocked(as_of, want_options)
+        if why_not:
+            st.caption(f"No scan yet - {why_not}. Press Run intraday scan "
+                       f"to do it anyway.")
+        elif not st.session_state.get("scan_autotried"):
+            st.session_state["scan_autotried"] = True
+            auto = run = True
     if run:
         import time
 
-        label = ("Downloading bars and evaluating setups..." if as_of is None
+        label = ("Scanning from the live feed..." if auto else
+                 "Downloading bars and evaluating setups..." if as_of is None
                  else f"Replaying {as_of:%Y-%m-%d %H:%M} IST...")
         started = time.monotonic()
-        with st.spinner(label):
-            ranked, bars, benchmark, now, past = run_scan(
-                capital, risk_pct, scope, as_of)
-        # Measured so the auto-refresh cannot be set faster than a scan
-        # actually takes.
-        st.session_state["scan_seconds"] = time.monotonic() - started
-        st.session_state["scan"] = (ranked, bars, benchmark, now,
-                                    want_options, past)
-        # The inputs are kept beside the results so a timed refresh can
-        # reproduce the same scan without the widgets being on screen.
-        st.session_state["scan_params"] = {
-            "capital": capital, "risk_pct": risk_pct, "scope": scope,
-            "want_options": want_options}
+        try:
+            with st.spinner(label):
+                ranked, bars, benchmark, now, past = run_scan(
+                    capital, risk_pct, scope, as_of)
+        except Exception as exc:
+            # An automatic scan must not take the tab down. A manual one
+            # still raises, because the user asked for it and wants to see
+            # why it failed.
+            if not auto:
+                raise
+            # No logger in this module, and st.warning IS the right
+            # channel here anyway - the person who needs to know is
+            # looking at the page.
+            st.warning(f"The automatic scan could not complete ({exc}). "
+                       f"Press Run intraday scan to retry.")
+            ranked = None
+        if ranked is not None:
+            # Measured so the auto-refresh cannot be set faster than a scan
+            # actually takes.
+            st.session_state["scan_seconds"] = time.monotonic() - started
+            st.session_state["scan"] = (ranked, bars, benchmark, now,
+                                        want_options, past)
+            # The inputs are kept beside the results so a timed refresh can
+            # reproduce the same scan without the widgets being on screen.
+            st.session_state["scan_params"] = {
+                "capital": capital, "risk_pct": risk_pct, "scope": scope,
+                "want_options": want_options}
     stored = st.session_state.get("scan")
     if stored is None:
         st.info("Set your capital and risk, then hit Run intraday scan. "
