@@ -39,6 +39,7 @@ import intraday
 import market_data
 import news_fetcher
 import options_chain
+import position_watch
 import scan_data
 import instruments
 import option_history
@@ -1729,6 +1730,136 @@ def render_option_cost_arithmetic(lot_size: int) -> None:
             )
 
 
+def scanner_view(symbol: str) -> tuple:
+    """(direction, actionable, blocker) for one symbol from the live scan.
+
+    Read from the scan already in session state rather than re-scanning:
+    the watch must be cheap enough to render on every rerun, and a scan
+    that is 60 seconds old is the same scan the user is looking at.
+    Returns (None, None, "") when that symbol was not in the last scan,
+    which leaves the watch reporting the level checks only.
+    """
+    stored = st.session_state.get("scan")
+    if not stored:
+        return None, None, ""
+    ranked = stored[0] or []
+    for setup in ranked:
+        if setup.symbol != symbol:
+            continue
+        blocker = ""
+        if not setup.actionable:
+            failed = [r for r in setup.reasons if "[FAIL]" in r]
+            blocker = failed[0] if failed else ""
+        direction = (setup.direction
+                     if setup.direction in (position_watch.LONG,
+                                            position_watch.SHORT) else None)
+        return direction, bool(setup.actionable), blocker
+    return None, None, ""
+
+
+def render_position_watch() -> None:
+    """Positions you hold, checked against the scanner's own gates.
+
+    Renders nothing when the list is empty, so it costs no space until it
+    is being used. When it is, it goes first - the HDFCLIFE loss happened
+    because the invalidation was on the page but nowhere near where
+    someone holding the position would look.
+    """
+    positions = position_watch.load()
+    with st.expander(f"Positions I am watching ({len(positions)})",
+                     expanded=bool(positions)):
+        st.caption(
+            "The scanner is stateless - it describes every symbol now and "
+            "forgets. This is the one place that knows what you already "
+            "did. It reports where price sits against your own levels and "
+            "whether the gates still agree; it never tells you what to do."
+        )
+        if positions:
+            live = {}
+            try:
+                live = horizons.live_prices_for([p.symbol for p in positions])
+            except Exception as exc:
+                st.caption(f"no live prices ({exc})")
+            statuses = []
+            for held in positions:
+                direction, actionable, blocker = scanner_view(held.symbol)
+                statuses.append(position_watch.assess(
+                    held, live_price=live.get(held.symbol),
+                    current_direction=direction, actionable=actionable,
+                    blocker=blocker))
+            for status in position_watch.rank(statuses):
+                held = status.position
+                title = (f"**{held.symbol} {held.side}** from "
+                         f"{held.entry:,.2f} - {status.state}")
+                if status.state == position_watch.STOP_BREACHED:
+                    st.error(f"{title}\n\n{status.headline}. "
+                             f"{status.detail}", icon=":material/warning:")
+                elif status.state == position_watch.TARGET_REACHED:
+                    st.success(f"{title}\n\n{status.headline}. "
+                               f"{status.detail}", icon=":material/flag:")
+                elif status.needs_attention:
+                    st.warning(f"{title}\n\n{status.headline}. "
+                               f"{status.detail}",
+                               icon=":material/change_circle:")
+                else:
+                    st.info(f"{title}\n\n{status.headline}. "
+                            f"{status.detail}")
+                for line in status.lines:
+                    st.caption(f"- {line}")
+                if st.button(f"Stop watching {held.symbol} {held.side}",
+                             key=f"unwatch_{held.symbol}_{held.side}"):
+                    position_watch.remove(held.symbol, held.side)
+                    st.rerun()
+            st.divider()
+        render_watch_form()
+
+
+def render_watch_form() -> None:
+    """Record a position to watch. Levels are typed, never inferred.
+
+    Deliberately manual: the app cannot know what you filled at, and
+    guessing an entry from the last scan would attach real money to a
+    number nobody agreed to.
+    """
+    with st.form("watch_add", clear_on_submit=True):
+        st.caption("Add a position - use the price you actually filled at.")
+        one, two, three = st.columns([2, 1, 1])
+        symbol = one.text_input("Symbol", placeholder="HDFCLIFE")
+        side = two.selectbox("Side", [position_watch.LONG,
+                                      position_watch.SHORT])
+        quantity = three.number_input("Quantity", min_value=0, step=1,
+                                      value=0,
+                                      help="Optional - only used to turn a "
+                                           "percentage into rupees.")
+        four, five, six = st.columns(3)
+        entry = four.number_input("Filled at", min_value=0.0, step=0.05,
+                                  format="%.2f")
+        stop = five.number_input("Stop", min_value=0.0, step=0.05,
+                                 format="%.2f")
+        target = six.number_input("Target", min_value=0.0, step=0.05,
+                                  format="%.2f")
+        if st.form_submit_button("Watch this", type="primary"):
+            held = position_watch.Position(
+                symbol=symbol, side=side, entry=float(entry),
+                stop=float(stop), target=float(target),
+                quantity=int(quantity))
+            if not held.symbol:
+                st.warning("A symbol is needed.")
+            elif not held.is_valid:
+                # Refused rather than stored: a long whose stop sits above
+                # its entry would report a breach from the first tick.
+                st.error(
+                    f"Those levels cannot describe a {held.side}. For a "
+                    f"{position_watch.LONG} the stop must sit below the "
+                    f"entry and the target above it; for a "
+                    f"{position_watch.SHORT} the other way round."
+                )
+            else:
+                position_watch.add(held)
+                st.success(f"Watching {held.symbol} {held.side}.")
+                st.rerun()
+
+
 def render_instrument_search() -> None:
     """Search any instrument and show its verdict at every horizon.
 
@@ -2050,6 +2181,11 @@ _title, _sync = st.columns([5, 1], vertical_alignment="center")
 _title.title("📈 Sector Pulse")
 with _sync.popover("Instrument sync", width="stretch"):
     render_sync_popover()
+
+# FIRST, above even the lookup. The HDFCLIFE loss happened because the
+# invalidation was on the page and nowhere near where someone holding the
+# position would look.
+render_position_watch()
 
 # Above the tabs on purpose: "what about this one stock" is neither an
 # intraday scan nor an end-of-day sector signal, so it does not belong

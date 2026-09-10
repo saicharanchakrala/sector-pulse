@@ -50,6 +50,11 @@ forecast_cache/
 live_bars/
 
 # Local agent scratch: launch config is kept, worktrees are not.
+# Positions you have actually taken. Personal trading data, same as
+# holdings.csv - never committed.
+watched_positions.json
+watched_positions.tmp
+
 .claude/worktrees/
 # Machine-local tool permissions, not a project setting.
 .claude/settings.local.json
