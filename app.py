@@ -1147,7 +1147,30 @@ def render_scan_results(ranked: list[setups.Setup], bars: scan_data.BarSet,
                 "minutes. Usually it has done one but not the other."
             )
     else:
-        show_table(scan_frame(actionable))
+        frame = scan_frame(actionable)
+        # SELECTABLE, so a row can go straight to the watch. Every number
+        # the watch needs is already in the row; retyping it into a form
+        # was tedious and a chance to fumble a digit into a watch that
+        # then reports nonsense.
+        picked = st.dataframe(
+            frame, width="stretch", hide_index=True,
+            column_config=glossary.config_for(frame, st),
+            on_select="rerun", selection_mode="multi-row", key="scan_pick")
+        rows = list(getattr(picked, "selection", {}).get("rows", []))
+        if rows:
+            chosen = [actionable[i] for i in rows if i < len(actionable)]
+            if chosen and st.button(
+                    f"Watch {len(chosen)} selected: "
+                    + ", ".join(f"{c.symbol} {c.direction}" for c in chosen),
+                    type="primary", key="watch_selected"):
+                added = watch_setups(chosen)
+                st.success(
+                    f"Watching {added}. The entry used is the last traded "
+                    f"price when the scan ran - correct it to your real "
+                    f"fill in the watch panel at the top.")
+                st.rerun()
+        else:
+            st.caption("Tick a row to add it to the position watch.")
         show_terms("How a stop and target are set",
                    "Why charges matter so much",
                    "What 'volume vs normal' tells you")
@@ -1448,6 +1471,47 @@ def search_instruments(text: str, limit: int = 25) -> list:
     return [(m.symbol, m.label, m.kind, m.underlying,
              m.expiry, m.strike, m.right, m.lot_size)
             for m in instrument_search.search(text, limit=limit)]
+
+
+def render_watch_buttons(report: dict) -> None:
+    """One Watch button per horizon that has usable levels.
+
+    The lookup already shows a stop and an exit per horizon, so watching
+    one is a click rather than five typed fields. BUY and NO BUY both get
+    a button on purpose: people take positions the gates would refuse, and
+    a watch on one of those is MORE useful than a watch on a clean setup -
+    it is the case where an invalidation is most likely to arrive.
+    """
+    rows = report.get("table")
+    if rows is None or rows.empty:
+        return
+    usable = [r for _, r in rows.iterrows()
+              if r.get("Stop loss at") and r.get("Exit price")
+              and r.get("Horizon") != "intraday"]
+    if not usable:
+        return
+    st.caption("Watch a horizon to be told when its own gates stop "
+               "supporting it:")
+    columns = st.columns(max(1, len(usable)))
+    for column, row in zip(columns, usable):
+        horizon = row["Horizon"]
+        if column.button(f"Watch {horizon}", key=f"watchh_{report['symbol']}_{horizon}",
+                         width="stretch"):
+            side = (row.get("View") or position_watch.LONG).strip().upper()
+            held = position_watch.Position(
+                symbol=report["symbol"], side=side,
+                entry=float(report["price"]),
+                stop=float(row["Stop loss at"]),
+                target=float(row["Exit price"]),
+                note=f"from the {horizon} horizon")
+            if not held.is_valid:
+                st.warning(
+                    f"The {horizon} levels do not bracket the price the way "
+                    f"a {side} needs - nothing was added.")
+            else:
+                position_watch.add(held)
+                st.success(f"Watching {held.symbol} {side} ({horizon}).")
+                st.rerun()
 
 
 def render_pivot_levels(levels: "dict | None", price: float) -> None:
@@ -1757,6 +1821,28 @@ def scanner_view(symbol: str) -> tuple:
     return None, None, ""
 
 
+def watch_setups(setups_to_watch: list) -> str:
+    """Add each setup to the watch using its own levels. Returns a summary.
+
+    The entry is the setup's last traded price, which is NOT the user's
+    fill - the watch panel exposes it for correction rather than treating
+    it as exact.
+    """
+    names = []
+    for setup in setups_to_watch:
+        if setup.levels is None:
+            continue
+        position_watch.add(position_watch.Position(
+            symbol=setup.symbol, side=setup.direction,
+            entry=round(setup.levels.entry, 2),
+            stop=round(setup.levels.stop, 2),
+            target=round(setup.levels.target, 2),
+            quantity=int(setup.levels.quantity or 0),
+            note="from the intraday scan"))
+        names.append(f"{setup.symbol} {setup.direction}")
+    return ", ".join(names) if names else "nothing"
+
+
 def render_position_watch() -> None:
     """Positions you hold, checked against the scanner's own gates.
 
@@ -1806,12 +1892,31 @@ def render_position_watch() -> None:
                             f"{status.detail}")
                 for line in status.lines:
                     st.caption(f"- {line}")
-                if st.button(f"Stop watching {held.symbol} {held.side}",
-                             key=f"unwatch_{held.symbol}_{held.side}"):
+                # The fill price is the one thing a table row cannot know,
+                # so it is correctable here rather than assumed exact.
+                edit, drop = st.columns([3, 1], vertical_alignment="bottom")
+                filled = edit.number_input(
+                    f"Your actual fill for {held.symbol}",
+                    min_value=0.0, value=float(held.entry), step=0.05,
+                    format="%.2f",
+                    key=f"fill_{held.symbol}_{held.side}")
+                if abs(float(filled) - held.entry) > 1e-9:
+                    held.entry = float(filled)
+                    position_watch.add(held)
+                    st.rerun()
+                if drop.button("Stop watching",
+                               key=f"unwatch_{held.symbol}_{held.side}",
+                               width="stretch"):
                     position_watch.remove(held.symbol, held.side)
                     st.rerun()
             st.divider()
-        render_watch_form()
+        with st.expander("Add one by hand"):
+            st.caption(
+                "Only needed when there is no row to select - a position "
+                "taken before this session, say. Otherwise pick rows in "
+                "the scan table, or use Watch on a horizon in the lookup."
+            )
+            render_watch_form()
 
 
 def render_watch_form() -> None:
@@ -1993,6 +2098,7 @@ def render_instrument_search() -> None:
     table = report["table"]
     if table is not None and not table.empty:
         show_table(table)
+        render_watch_buttons(report)
         show_terms("What the horizons mean", "Why charges matter so much",
                    "Why this tool will not predict for you")
     render_pivot_levels(report.get("pivots"), report["price"])
