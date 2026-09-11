@@ -169,6 +169,47 @@ def release_lock() -> None:
         pass
 
 
+SEED_CHUNK = 100
+
+
+def seed_session(tokens: dict, stop=None) -> int:
+    """Fetch the part of today's session that preceded the stream.
+
+    Runs in a thread while ticks are already arriving. Written in chunks
+    rather than once at the end, because at 1,006 symbols "once at the
+    end" is half an hour away and a seed file that does not exist yet is
+    worth nothing to a scan running now.
+
+    Returns the rows written. Never raises into the caller's thread: a
+    failed seed costs the opening range, while an exception escaping here
+    would take the process down and cost the whole session.
+    """
+    symbols = list(tokens)
+    print(f"seeding today's session behind the stream "
+          f"({len(symbols)} symbols, {SEED_CHUNK} at a time)...", flush=True)
+    collected: dict = {}
+    rows = 0
+    for start in range(0, len(symbols), SEED_CHUNK):
+        if stop is not None and stop.is_set():
+            print("  seeding stopped", flush=True)
+            break
+        chunk = symbols[start:start + SEED_CHUNK]
+        try:
+            collected.update(live_bars.backfill_today(chunk))
+            rows = live_bars.write_seed(collected)
+        except Exception as exc:
+            # One bad chunk must not end the rest: the opening range for
+            # 900 symbols is worth more than a clean traceback for 100.
+            logger.warning("seed chunk %d-%d failed: %s",
+                           start, start + len(chunk), exc)
+            continue
+        covered = sum(1 for f in collected.values()
+                      if live_bars.session_is_covered(f))
+        print(f"  seeded {len(collected)}/{len(symbols)}, {rows} bars, "
+              f"{covered} reaching the open", flush=True)
+    return rows
+
+
 def main(argv=None) -> int:
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
@@ -207,19 +248,6 @@ def main(argv=None) -> int:
         release_lock()
         return 1
 
-    # Seed today's session BEFORE streaming. A feed started mid-day has no
-    # 09:15 bar, and the opening range is the session's first fifteen
-    # minutes - without it the scanner chooses no direction for any symbol,
-    # which looks exactly like a quiet market. Measured: 0 of 216 names got
-    # a direction from two bars of live data.
-    print("seeding today's session so far...")
-    seeded = live_bars.backfill_today(list(tokens))
-    rows = live_bars.write_seed(seeded)
-    covered = sum(1 for f in seeded.values()
-                  if live_bars.session_is_covered(f))
-    print(f"  {len(seeded)}/{len(tokens)} symbols seeded, {rows} bars, "
-          f"{covered} reaching the open")
-
     builder = live_bars.BarBuilder()
     stop = threading.Event()
 
@@ -250,6 +278,18 @@ def main(argv=None) -> int:
     pump = threading.Thread(target=flusher, name="flusher", daemon=True)
     pump.start()
 
+    # BEHIND THE SOCKET, not in front of it. This used to run to completion
+    # before subscribing: at 1,006 symbols that is one historical call each
+    # at 3 a second, so the feed stayed blind for the first half hour of
+    # the session - the very part the seed exists to cover. Measured on
+    # 2026-09-11: lock at 09:06, 397/1006 seeded by 09:28, socket not yet
+    # open. Now the stream starts immediately and the seed fills in behind
+    # it, which is safe because combined() keeps the LAST value for a
+    # stamp and live bars come after the seed in that concatenation.
+    seeder = threading.Thread(target=seed_session, args=(dict(tokens), stop),
+                              name="seeder", daemon=True)
+    seeder.start()
+
     def shutdown(*_) -> None:
         stop.set()
 
@@ -260,7 +300,8 @@ def main(argv=None) -> int:
             except Exception:
                 pass
 
-    print(f"streaming {len(tokens)} instruments; Ctrl-C to stop")
+    print(f"streaming {len(tokens)} instruments now; the seed for the "
+          f"earlier part of today fills in behind it. Ctrl-C to stop")
     deadline = (time.time() + args.minutes * 60) if args.minutes else None
 
     async def run() -> None:
