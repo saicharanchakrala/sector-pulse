@@ -7,14 +7,18 @@ and the Kite client are both substituted.
 """
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pytest
 
+import config
 import kite_bars
 import kite_client
 import market_source
+
+IST_ZONE = ZoneInfo("Asia/Kolkata")
 
 
 # --- symbol translation --------------------------------------------------
@@ -259,3 +263,136 @@ def test_last_prices_raises_when_there_is_no_session_at_all(monkeypatch) -> None
 def test_an_empty_request_is_not_a_failure() -> None:
     assert market_source.last_prices([]) == {}
     assert market_source.last_prices(["", "   "]) == {}
+
+# --- a cached span that ends TODAY goes stale ----------------------------
+#
+# WHY. Measured on 2026-09-11 at 15:02: the wide scan's per-symbol files
+# held 10 sessions of 3-minute bars ending today, and bars() served them
+# verbatim all day. The newest bar inside them clustered at 09:24-09:30,
+# five hours behind, while the gates comparing against now used the real
+# clock. The scan returned nothing rather than nonsense - the safe
+# failure, and a silent one.
+
+def _bar_frame(stamps, tz="Asia/Kolkata"):
+    import pandas as pd
+    index = pd.DatetimeIndex([pd.Timestamp(s, tz=tz) for s in stamps])
+    return pd.DataFrame({"Open": 1.0, "High": 1.0, "Low": 1.0,
+                         "Close": 1.0, "Volume": 1}, index=index)
+
+
+def _cached(tmp_path, stamps, written):
+    """A cache file whose mtime is `written` and whose bars end where told."""
+    import os
+    path = tmp_path / "kite__X__3minute__20260901_20260911.parquet"
+    frame = _bar_frame(stamps)
+    frame.to_parquet(path)
+    stamp = written.timestamp()
+    os.utime(path, (stamp, stamp))
+    return path, frame
+
+
+def test_a_span_that_ended_yesterday_is_never_stale(tmp_path) -> None:
+    # This is what makes the 12-day prewarm window cost one fetch a day.
+    # Refetching settled history would undo the whole point of the cache.
+    at = datetime(2026, 9, 11, 15, 2, tzinfo=IST_ZONE)
+    path, frame = _cached(tmp_path, ["2026-09-10 15:27"],
+                          datetime(2026, 9, 1, 9, 0, tzinfo=IST_ZONE))
+    assert not market_source._cache_is_stale(
+        path, frame, date(2026, 9, 10), "3minute", now=at)
+
+
+def test_a_today_span_frozen_at_the_open_is_stale_by_midday(tmp_path) -> None:
+    at = datetime(2026, 9, 11, 15, 2, tzinfo=IST_ZONE)
+    written = datetime(2026, 9, 11, 9, 31, tzinfo=IST_ZONE)
+    path, frame = _cached(tmp_path, ["2026-09-11 09:27", "2026-09-11 09:30"],
+                          written)
+    assert market_source._cache_is_stale(
+        path, frame, date(2026, 9, 11), "3minute", now=at)
+
+
+def test_a_freshly_written_today_span_is_kept(tmp_path) -> None:
+    at = datetime(2026, 9, 11, 12, 0, tzinfo=IST_ZONE)
+    written = datetime(2026, 9, 11, 11, 59, tzinfo=IST_ZONE)
+    path, frame = _cached(tmp_path, ["2026-09-11 11:54", "2026-09-11 11:57"],
+                          written)
+    assert not market_source._cache_is_stale(
+        path, frame, date(2026, 9, 11), "3minute", now=at)
+
+
+def test_after_the_close_todays_cache_stops_going_stale(tmp_path) -> None:
+    # The reference clock is min(now, close). Against a bare now() the whole
+    # universe would be refetched every evening for bars that will never
+    # change again.
+    at = datetime(2026, 9, 11, 19, 30, tzinfo=IST_ZONE)
+    written = datetime(2026, 9, 11, 15, 29, tzinfo=IST_ZONE)
+    path, frame = _cached(tmp_path, ["2026-09-11 15:24", "2026-09-11 15:27"],
+                          written)
+    assert not market_source._cache_is_stale(
+        path, frame, date(2026, 9, 11), "3minute", now=at)
+
+
+def test_a_symbol_that_cannot_catch_up_is_retried_at_most_once_per_limit(
+        tmp_path) -> None:
+    # A halt, a holiday, or a name that has not traded since the open: the
+    # data can never reach the clock, so the DATA condition alone would
+    # refetch it on every scan, one Kite call per symbol for ever. The file
+    # age is what bounds that.
+    at = datetime(2026, 9, 11, 15, 2, tzinfo=IST_ZONE)
+    just_written = at - timedelta(seconds=30)
+    path, frame = _cached(tmp_path, ["2026-09-11 09:27"], just_written)
+    assert not market_source._cache_is_stale(
+        path, frame, date(2026, 9, 11), "3minute", now=at)
+
+
+def test_an_empty_cache_for_today_is_decided_by_the_file_age(tmp_path) -> None:
+    at = datetime(2026, 9, 11, 15, 2, tzinfo=IST_ZONE)
+    old = datetime(2026, 9, 11, 9, 31, tzinfo=IST_ZONE)
+    import pandas as pd
+    path = tmp_path / "kite__X__3minute__20260901_20260911.parquet"
+    empty = pd.DataFrame({"Open": [], "High": [], "Low": [], "Close": [],
+                          "Volume": []}, index=pd.DatetimeIndex([]))
+    empty.to_parquet(path)
+    import os
+    os.utime(path, (old.timestamp(), old.timestamp()))
+    assert market_source._cache_is_stale(
+        path, empty, date(2026, 9, 11), "3minute", now=at)
+
+
+def test_the_limit_follows_the_interval_and_is_capped() -> None:
+    # Two bars plus a minute, so a 3-minute cache tolerates 420s - the same
+    # arithmetic as the live feed's staleness limit. Capped so a DAILY span
+    # ending today, where two bars would be two days, still refreshes
+    # within the session.
+    assert market_source._interval_seconds("3minute") == 180
+    assert market_source._interval_seconds("5minute") == 300
+    assert market_source._interval_seconds("minute") == 60
+    assert market_source._interval_seconds("day") == 86_400
+    assert min(2 * 180 + 60, config.CACHE_TODAY_MAX_AGE_SECONDS) == 420
+    assert min(2 * 86_400 + 60, config.CACHE_TODAY_MAX_AGE_SECONDS) == 900
+
+
+def test_bars_refetches_a_stale_today_cache(tmp_path, monkeypatch) -> None:
+    # The rule is only worth anything if bars() acts on it.
+    calls = []
+
+    def fake_historical(token, start, end, interval="3minute", oi=False,
+                        session=None):
+        calls.append(token)
+        return _bar_frame(["2026-09-11 15:00"])
+
+    monkeypatch.setattr(market_source, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(market_source.kite_client, "historical",
+                        fake_historical)
+    monkeypatch.setattr(market_source.kite_client, "load_session",
+                        lambda: object())
+    monkeypatch.setattr(market_source, "token_for", lambda symbol: 123)
+    monkeypatch.setattr(market_source, "canonical", lambda symbol: symbol)
+    path = market_source._cache_path("X", "3minute", date(2026, 9, 1),
+                                     date.today())
+    _bar_frame(["2026-09-11 09:30"]).to_parquet(path)
+    import os
+    old = (datetime.now(IST_ZONE) - timedelta(hours=5)).timestamp()
+    os.utime(path, (old, old))
+    market_source.bars(["X"], date(2026, 9, 1), date.today(),
+                       interval="3minute")
+    assert calls, "a stale today-ending cache was served instead of refetched"

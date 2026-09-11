@@ -28,7 +28,8 @@ entry in it was verified against Kite's own public instrument master.
 from __future__ import annotations
 
 import logging
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -37,6 +38,8 @@ import kite_client
 import kite_instruments as ki
 
 logger = logging.getLogger(__name__)
+
+IST = ZoneInfo("Asia/Kolkata")
 
 CACHE_DIR = config.PROJECT_ROOT / "bar_cache"
 
@@ -277,6 +280,66 @@ def _cache_path(symbol: str, interval: str, start: date, end: date,
                         f"{start:%Y%m%d}_{end:%Y%m%d}{suffix}.parquet")
 
 
+def _interval_seconds(resolved: str) -> int:
+    """Seconds in one candle of Kite's interval spelling."""
+    text = (resolved or "").strip().lower()
+    if text in ("day", "1day"):
+        return 86_400
+    if text == "minute":
+        return 60
+    digits = "".join(ch for ch in text if ch.isdigit())
+    return int(digits) * 60 if digits else 300
+
+
+def _cache_is_stale(path, frame, end: date, resolved: str,
+                    now: "datetime | None" = None) -> bool:
+    """Whether a cached span ending today has fallen behind the session.
+
+    A span that ended BEFORE today is settled: prior sessions do not
+    change, and refetching them would undo the one-fetch-a-day property
+    the whole cache exists for. Only a span reaching into today can rot.
+
+    Two conditions, because either alone misbehaves:
+
+      * the data must be behind the reference clock - otherwise a file
+        written seconds ago would be refetched;
+      * the file must itself be older than the limit - otherwise a symbol
+        that cannot catch up, on a holiday or after a halt, is refetched
+        on every scan for ever, one Kite call per symbol per run.
+
+    The reference clock is min(now, today's close): a file written at
+    15:27 is not stale at 16:00, because the session is over and nothing
+    further is coming. Comparing against a bare now() refetched the entire
+    universe every evening.
+    """
+    if end < date.today():
+        return False
+    limit = min(2 * _interval_seconds(resolved) + 60,
+                config.CACHE_TODAY_MAX_AGE_SECONDS)
+    now = now or datetime.now(IST)
+    close_hour, close_minute = config.SCAN_SESSION_CLOSE
+    close = now.replace(hour=close_hour, minute=close_minute, second=0,
+                        microsecond=0)
+    reference = min(now, close)
+    try:
+        written = datetime.fromtimestamp(path.stat().st_mtime, IST)
+    except OSError:
+        return False
+    if (reference - written).total_seconds() <= limit:
+        return False
+    newest = None
+    if frame is not None and len(frame):
+        try:
+            newest = frame.index[-1].astimezone(IST)
+        except (AttributeError, TypeError, IndexError):
+            newest = None
+    if newest is None:
+        # Nothing to measure against, so the file's own age decides - and
+        # it is already past the limit.
+        return True
+    return (reference - newest).total_seconds() > limit
+
+
 def bars(symbols: list[str], start: date, end: date, interval: str = "5minute",
          oi: bool = False, refresh: bool = False,
          session=None) -> dict[str, pd.DataFrame]:
@@ -306,8 +369,12 @@ def bars(symbols: list[str], start: date, end: date, interval: str = "5minute",
                 # missing it is refused rather than served, because the
                 # absence is invisible downstream.
                 if not oi or "OpenInterest" in cached.columns:
-                    out[symbol] = cached
-                    continue
+                    if not _cache_is_stale(path, cached, end, resolved):
+                        out[symbol] = cached
+                        continue
+                    logger.info("Cached %s ends at %s, refetching today's "
+                                "tail", path.name,
+                                cached.index[-1] if len(cached) else "nothing")
                 logger.warning("Cache %s has no OpenInterest; refetching",
                                path.name)
         token = token_for(symbol)

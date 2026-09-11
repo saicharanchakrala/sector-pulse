@@ -214,6 +214,13 @@ SCAN_COST_MULTIPLE = 3.0          # target must clear round-trip cost this many 
 # is not headroom, it is a window in which a dead feed still passes -
 # which is why this is derived and not typed.
 SCAN_LIVE_MAX_AGE_SECONDS = 2 * SCAN_BAR_SECONDS + 60
+# The same arithmetic, applied to DOWNLOADED bars: a cached span ending
+# today may be this far behind the clock before it is refetched. Derived
+# per interval in market_source, and capped here so a daily-interval cache
+# ending today - where two bars would be two days - still refreshes within
+# the session. 15 minutes is the ceiling, not the usual value: at
+# 3-minute bars the limit works out at 420 seconds.
+CACHE_TODAY_MAX_AGE_SECONDS = 900
 # How often the intraday scan may re-run itself while the feed is live, and
 # the choices offered. A refresh is a full re-scan, so the floor is well
 # above the measured scan time rather than as low as the UI could allow.
