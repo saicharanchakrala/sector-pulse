@@ -15,16 +15,25 @@ Run with: .venv\\Scripts\\python -m pytest test_kite_client.py -q
 """
 from __future__ import annotations
 
+import sys
+import subprocess
+import os
 import json
+import os
+import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
+from pathlib import Path
 
 import pytest
 
 import config
 import kite_client as kc
+
+REPO_ROOT = Path(__file__).resolve().parent
 
 
 @pytest.fixture(autouse=True)
@@ -35,6 +44,12 @@ def _offline(tmp_path, monkeypatch):
 
     monkeypatch.setattr(kc.requests, "get", _no_network)
     monkeypatch.setattr(kc.requests, "post", _no_network)
+    # The rate gate keeps its last-start stamps in FILES now, so they
+    # outlive a test. Without this, "both slots cold" in the test below
+    # means "cold unless an earlier test in this run warmed them", and the
+    # slot-independence assertion fails for an unrelated reason.
+    monkeypatch.setattr(kc, "PACE_DIR", tmp_path / "pace")
+    kc._LAST_CALL.clear()
     monkeypatch.setattr(config, "KITE_TOKEN_FILE",
                         tmp_path / ".kite_session.json")
     for name in (config.KITE_API_KEY_ENV, config.KITE_API_SECRET_ENV,
@@ -379,3 +394,99 @@ def test_exchange_request_token_refuses_an_empty_token(monkeypatch) -> None:
     monkeypatch.setenv(config.KITE_API_SECRET_ENV, "top_secret")
     with pytest.raises(kc.KiteError):
         kc.exchange_request_token("   ")
+
+# --- the rate budget is shared between processes -------------------------
+#
+# WHY A REAL SUBPROCESS BELOW. On 2026-09-11 the live feed's seed pass and
+# a Streamlit scan ran at once; each paced itself at Kite's documented 3
+# requests a second and Kite saw six. The pacer was a threading.Lock and an
+# in-memory stamp, so it metered one PROCESS - and every in-process test
+# passed against that code, and would pass again. That is why one test here
+# pays for two interpreters.
+
+PACE_CHILD = """
+import json, sys, time
+sys.path.insert(0, %r)
+import kite_client
+stamps = []
+for _ in range(int(sys.argv[1])):
+    kite_client._pace(rate_per_sec=float(sys.argv[2]), slot=sys.argv[3])
+    stamps.append(time.time())
+print(json.dumps(stamps))
+"""
+
+
+def test_a_paced_call_records_its_start_where_other_processes_can_see_it(
+) -> None:
+    before = time.time()
+    kc._pace(rate_per_sec=100.0, slot="pytest")
+    stamp_file = kc._pace_path("pytest")
+    assert stamp_file.exists(), "nothing was written for other processes"
+    written = float(stamp_file.read_text(encoding="utf-8").strip())
+    assert before <= written <= time.time() + 0.5
+
+
+def test_the_wait_comes_from_the_file_not_from_memory() -> None:
+    # Clearing the in-memory stamp is what another process looks like from
+    # in here: same file, no recollection of the last call. Against the old
+    # pacer this test passes trivially and means nothing.
+    kc._pace(rate_per_sec=4.0, slot="pytest")
+    kc._LAST_CALL.pop("pytest", None)
+    waited = _elapsed(lambda: kc._pace(rate_per_sec=4.0, slot="pytest"))
+    assert waited > 0.15, f"did not wait for the shared stamp ({waited:.3f}s)"
+
+
+def test_two_real_processes_share_one_budget(tmp_path) -> None:
+    # The test that would have caught this morning. Two interpreters, one
+    # stamp file, one budget: no two calls may start closer than the gap.
+    rate, calls = 8.0, 4
+    gap = 1.0 / rate
+    script = tmp_path / "child.py"
+    script.write_text(PACE_CHILD % str(REPO_ROOT), encoding="utf-8")
+    # The child cannot be monkeypatched, so the directory is passed in the
+    # environment - which is why PACE_DIR reads it.
+    env = dict(os.environ, SECTOR_PULSE_PACE_DIR=str(tmp_path / "shared"))
+    children = [
+        subprocess.Popen(
+            [sys.executable, str(script), str(calls), str(rate), "pytest"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env=env, cwd=str(REPO_ROOT))
+        for _ in range(2)]
+    stamps = []
+    for child in children:
+        out, err = child.communicate(timeout=180)
+        assert child.returncode == 0, err
+        stamps.extend(json.loads(out.strip().splitlines()[-1]))
+    stamps.sort()
+    assert len(stamps) == 2 * calls
+    tightest = min(b - a for a, b in zip(stamps, stamps[1:]))
+    # Slack for scheduling jitter, far below the gap: the broken version
+    # produced pairs microseconds apart.
+    assert tightest > gap * 0.6, (
+        f"two calls started {tightest * 1000:.0f}ms apart, gap is "
+        f"{gap * 1000:.0f}ms - the budget is not shared")
+
+
+def test_the_gate_degrades_rather_than_blocking_prices(monkeypatch) -> None:
+    # A gate that cannot be taken must not stop a fetch: it falls back to
+    # in-process pacing and warns once. Refusing would turn a metering
+    # problem into no prices at all.
+    monkeypatch.setattr(kc, "_lock_file", lambda handle: False)
+    kc._pace(rate_per_sec=100.0, slot="pytest")
+    assert "pytest" in kc._LAST_CALL
+
+
+def test_a_stamp_from_the_future_waits_a_whole_gap() -> None:
+    # A clock change, or a foreign writer, must not disable pacing.
+    stamp = kc._pace_path("pytest")
+    stamp.parent.mkdir(parents=True, exist_ok=True)
+    stamp.write_text(str(time.time() + 3600), encoding="utf-8")
+    kc._LAST_CALL.pop("pytest", None)
+    waited = _elapsed(lambda: kc._pace(rate_per_sec=5.0, slot="pytest"))
+    assert waited > 0.15
+
+
+def test_the_stamp_directory_is_not_the_repo_root() -> None:
+    # It is written to on every call, so it must be somewhere gitignored
+    # rather than beside the source.
+    assert kc.PACE_DIR.name in ("run", "pace", "shared")

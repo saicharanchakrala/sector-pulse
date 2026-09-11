@@ -31,8 +31,10 @@ import logging
 import os
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from pathlib import Path
 
 import pandas as pd
 import requests
@@ -248,6 +250,91 @@ _PACE_RATES = {
 # spending the historical budget and vice versa.
 _LAST_CALL: dict[str, float] = {}
 _PACE_LOCK = threading.Lock()
+# Where the cross-process stamps live. Beside the code rather than in the
+# system temp directory, so two processes started from the same checkout
+# share one budget and two unrelated checkouts do not. The environment
+# override exists so a test can use its own directory in a CHILD process,
+# where monkeypatching cannot reach - and so a deployment can point two
+# checkouts at one budget if they really do share an API key.
+PACE_DIR = Path(os.environ.get("SECTOR_PULSE_PACE_DIR")
+                or config.PROJECT_ROOT / "run")
+_PACE_WARNED = False
+
+
+def _pace_path(slot: str) -> Path:
+    return PACE_DIR / f"kite_pace_{slot}.lock"
+
+
+@contextmanager
+def _file_gate(slot: str):
+    """Hold an exclusive OS lock on this endpoint class's stamp file.
+
+    Yields an open file positioned at 0, or None when the gate could not
+    be taken - in which case the caller falls back to in-process pacing
+    rather than refusing to fetch prices.
+
+    The lock is held by the kernel, so it is released if this process
+    dies. That is the whole reason it is not an exclusive-create file:
+    feed.lock is that kind, and it needs a liveness check and a
+    stale-adoption path to survive one badly timed Ctrl-C.
+    """
+    global _PACE_WARNED
+    handle = None
+    locked = False
+    try:
+        PACE_DIR.mkdir(parents=True, exist_ok=True)
+        handle = open(_pace_path(slot), "a+", encoding="utf-8")
+        locked = _lock_file(handle)
+        yield handle if locked else None
+    except Exception as exc:
+        if not _PACE_WARNED:
+            _PACE_WARNED = True
+            logger.warning(
+                "Cross-process rate pacing unavailable (%s), so each "
+                "process meters itself. Two at once can exceed Kite's "
+                "documented rate and the 429s look like missing bars.",
+                exc)
+        yield None
+    finally:
+        if handle is not None:
+            try:
+                if locked:
+                    _unlock_file(handle)
+            finally:
+                handle.close()
+
+
+def _lock_file(handle) -> bool:
+    """Take an exclusive lock, blocking. True if it was taken."""
+    if os.name == "nt":
+        import msvcrt
+
+        # msvcrt gives up after about ten seconds, so retry rather than
+        # fail: a busy budget is normal, an unobtainable lock is not.
+        for _ in range(30):
+            try:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                return True
+            except OSError:
+                continue
+        return False
+    import fcntl
+
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    return True
+
+
+def _unlock_file(handle) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        return
+    import fcntl
+
+    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _pace(rate_per_sec: "float | None" = None,
@@ -259,10 +346,18 @@ def _pace(rate_per_sec: "float | None" = None,
     data downstream. An unknown slot raises rather than defaulting to some
     rate, because guessing a limit here means guessing wrong quietly.
 
-    The sleep happens while the lock is held, and that is what makes the
-    gate correct: two concurrent callers cannot both read the same
+    THE BUDGET IS SHARED ACROSS PROCESSES, through a lock file per endpoint
+    class holding the last start time. It used to be one in-memory stamp
+    per process: the live feed seeding and Streamlit scanning each paced
+    themselves at 3 a second and Kite saw six. Measured at 09:27 on
+    2026-09-11, 322 historical calls in 180 seconds across the two.
+
+    The sleep happens while both locks are held, and that is what makes
+    the gate correct: two concurrent callers cannot both read the same
     last-start time and then both go. What overlaps between callers is the
-    network round trip after this returns, not the wait.
+    network round trip after this returns, not the wait. Wall-clock time
+    rather than monotonic, because monotonic clocks are not comparable
+    between processes.
     """
     if rate_per_sec is None:
         rate_per_sec = _PACE_RATES[slot]()
@@ -270,10 +365,32 @@ def _pace(rate_per_sec: "float | None" = None,
         return
     gap = 1.0 / rate_per_sec
     with _PACE_LOCK:
-        wait = gap - (time.monotonic() - _LAST_CALL.get(slot, 0.0))
-        if wait > 0:
-            time.sleep(wait)
-        _LAST_CALL[slot] = time.monotonic()
+        with _file_gate(slot) as shared:
+            if shared is None:
+                # In-process only. Better than nothing, and warned about.
+                wait = gap - (time.time() - _LAST_CALL.get(slot, 0.0))
+                if wait > 0:
+                    time.sleep(wait)
+                _LAST_CALL[slot] = time.time()
+                return
+            try:
+                shared.seek(0)
+                last = float((shared.read() or "0").strip() or 0.0)
+            except ValueError:
+                last = 0.0
+            now = time.time()
+            # A stamp from the future means the clock moved back or the
+            # file was written by something else; waiting a whole gap is
+            # the safe reading of it.
+            wait = gap - (now - last) if last <= now else gap
+            if wait > 0:
+                time.sleep(wait)
+            stamp = time.time()
+            shared.seek(0)
+            shared.truncate()
+            shared.write(f"{stamp:.6f}")
+            shared.flush()
+            _LAST_CALL[slot] = stamp
 
 
 def profile(session: "Session | None" = None) -> dict:

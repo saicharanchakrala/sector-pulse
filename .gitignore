@@ -55,6 +55,9 @@ live_bars/
 watched_positions.json
 watched_positions.tmp
 watched_positions.prev.json
+# Cross-process rate-gate stamps. Written on every Kite call, meaningless
+# outside this machine.
+run/
 # Chime WAVs written by `python -m sound --save`: generated, never source.
 chimes_preview/
 
