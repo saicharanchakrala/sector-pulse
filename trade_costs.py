@@ -28,12 +28,13 @@ class CostBreakdown:
     gst: float
     buy_turnover: float
     sell_turnover: float
+    slippage: float = 0.0
 
     @property
     def total(self) -> float:
-        """Total rupees lost to costs across both legs."""
+        """Total rupees lost to costs across both legs, slippage included."""
         return (self.brokerage + self.stt + self.transaction
-                + self.stamp_duty + self.sebi + self.gst)
+                + self.stamp_duty + self.sebi + self.gst + self.slippage)
 
     @property
     def breakeven_pct(self) -> float:
@@ -72,6 +73,7 @@ def equity_intraday_cost(entry_price: float, exit_price: float,
                    config.COST_EQ_BROKERAGE_CAP)
 
     brokerage = leg_brokerage(buy_turnover) + leg_brokerage(sell_turnover)
+    slippage = turnover * config.COST_SLIPPAGE_PCT
     stt = sell_turnover * config.COST_EQ_STT_SELL_PCT
     transaction = turnover * config.COST_EQ_TXN_PCT
     stamp_duty = buy_turnover * config.COST_EQ_STAMP_BUY_PCT
@@ -85,6 +87,7 @@ def equity_intraday_cost(entry_price: float, exit_price: float,
         gst=_gst_on(brokerage, transaction, sebi),
         buy_turnover=buy_turnover,
         sell_turnover=sell_turnover,
+        slippage=slippage,
     )
 
 
@@ -105,6 +108,9 @@ def options_cost(entry_premium: float, exit_premium: float,
     turnover = buy_turnover + sell_turnover
 
     brokerage = config.COST_OPT_BROKERAGE_FLAT * 2
+    # Premium turnover at the OPTION slippage rate: the equity rate is
+    # quoted against notional and is roughly 100x too small here.
+    slippage = turnover * config.COST_OPT_SLIPPAGE_PCT
     stt = sell_turnover * config.COST_OPT_STT_SELL_PCT
     transaction = turnover * config.COST_OPT_TXN_PCT
     stamp_duty = buy_turnover * config.COST_OPT_STAMP_BUY_PCT
@@ -118,6 +124,7 @@ def options_cost(entry_premium: float, exit_premium: float,
         gst=_gst_on(brokerage, transaction, sebi),
         buy_turnover=buy_turnover,
         sell_turnover=sell_turnover,
+        slippage=slippage,
     )
 
 
@@ -145,6 +152,7 @@ def futures_cost(entry_price: float, exit_price: float,
         min(leg * config.COST_FUT_BROKERAGE_PCT,
             config.COST_FUT_BROKERAGE_CAP)
         for leg in (buy_turnover, sell_turnover))
+    slippage = turnover * config.COST_SLIPPAGE_PCT
     stt = sell_turnover * config.COST_FUT_STT_SELL_PCT
     transaction = turnover * config.COST_FUT_TXN_PCT
     stamp_duty = buy_turnover * config.COST_FUT_STAMP_BUY_PCT
@@ -158,6 +166,7 @@ def futures_cost(entry_price: float, exit_price: float,
         gst=_gst_on(brokerage, transaction, sebi),
         buy_turnover=buy_turnover,
         sell_turnover=sell_turnover,
+        slippage=slippage,
     )
 
 

@@ -3,7 +3,7 @@
 This exists because the live rule failed in a specific, diagnosable way: it
 reached its target in 1 of 21 setups where a driftless random walk predicts
 about a third. That gap is too large to be luck, and it points at the model
-rather than the market. The target was placed at one sigma, where sigma is
+rather than the market. The target was placed at one PLAUSIBLE MOVE, which is
 the bar ATR grown by sqrt(bars remaining) - which assumes intraday prices
 random-walk. They do not: at short horizons they mean-revert, so realised
 range grows slower than sqrt(time) and a target set that way sits beyond
@@ -63,20 +63,25 @@ class Signal:
     first_touch: dict          # (stop_mult, target_mult) -> "TARGET"/"STOP"/"NEITHER"
 
     @property
-    def sigma(self) -> float:
+    def plausible_move(self) -> float:
         """The sqrt-scaled remaining move the live rule assumes."""
         return self.atr_bar * math.sqrt(max(1, self.bars_left))
 
-    def excursion_in_sigma(self, favourable: bool) -> float:
-        """MFE or MAE expressed in the live rule's own sigma units."""
-        if self.sigma <= 0.0:
+    def excursion_in_moves(self, favourable: bool) -> float:
+        """MFE or MAE in the live rule's own plausible-move units.
+
+        One plausible move is levels.expected_remaining_range, about 1.4
+        true standard deviations - so a figure here is NOT a sigma and does
+        not transfer to a textbook one-sigma rule without dividing by 1.4.
+        """
+        if self.plausible_move <= 0.0:
             return 0.0
-        return (self.mfe if favourable else self.mae) / self.sigma
+        return (self.mfe if favourable else self.mae) / self.plausible_move
 
 
 @dataclass
 class Outcome:
-    """Aggregate result for one (stop, target) pair, in sigma multiples."""
+    """Aggregate result for one (stop, target) pair, in plausible moves."""
 
     stop_mult: float
     target_mult: float
@@ -226,7 +231,7 @@ def scan_session(symbol: str, history: pd.DataFrame, session_day: date,
         bars_left = per_session - (index + 1)
         if bars_left <= 0:
             continue
-        sigma = atr * math.sqrt(bars_left)
+        plausible_move = atr * math.sqrt(bars_left)
         highs, lows = _forward_paths(session, index)
         if highs.empty:
             continue
@@ -243,7 +248,7 @@ def scan_session(symbol: str, history: pd.DataFrame, session_day: date,
             for target_mult in target_mults:
                 touches[(stop_mult, target_mult)] = _first_touch(
                     highs, lows, direction, last,
-                    sigma * stop_mult, sigma * target_mult)
+                    plausible_move * stop_mult, plausible_move * target_mult)
         day_change = indicators.percent_change(last, prev_close)
         out.append(Signal(
             symbol=symbol, session=session_day, bar_index=index,
@@ -276,16 +281,23 @@ def aggregate(signals: list[Signal], stop_mults: tuple[float, ...],
 
 
 def excursion_percentiles(signals: list[Signal]) -> dict[str, float]:
-    """Where MFE and MAE actually land, in sigma units.
+    """Where MFE and MAE land, in the live rule's plausible-move units.
+
+    One plausible move is levels.expected_remaining_range, ATR*sqrt(bars),
+    measures about 1.4 true standard deviations, not one. Conclusions below
+    are in THAT unit. The direction of the one below is strengthened rather
+    than weakened by the correction: a target at one band is 1.37 to 1.50
+    true sigma, so it sits FURTHER beyond the typical move than the old
+    "one sigma" reading implied.
 
     This is the number the live rule got wrong. If the median MFE is well
-    below one sigma, a one-sigma target is beyond the typical move and no
+    below one move, a one-move target is beyond the typical move and no
     amount of gate tuning will rescue it.
     """
     if not signals:
         return {}
-    mfe = pd.Series([s.excursion_in_sigma(True) for s in signals])
-    mae = pd.Series([s.excursion_in_sigma(False) for s in signals])
+    mfe = pd.Series([s.excursion_in_moves(True) for s in signals])
+    mae = pd.Series([s.excursion_in_moves(False) for s in signals])
     out: dict[str, float] = {}
     for label, series in (("mfe", mfe), ("mae", mae)):
         for pct in (10, 25, 50, 75, 90):

@@ -53,9 +53,18 @@ import numpy as np
 import pandas as pd
 
 import config
+import trade_costs
 
 logger = logging.getLogger(__name__)
 
+# UNITS. Every column suffixed `_sigma` here - mfe_sigma, mae_sigma,
+# close_move_sigma - is in PLAUSIBLE-MOVE units, not standard deviations.
+# One plausible move is
+# levels.expected_remaining_range (ATR * sqrt(bars)) and measures roughly
+# 1.4 true sigma. The names are kept because they are written into saved
+# CSVs that would silently stop matching, but a figure read from them is
+# not a sigma and must be divided by about 1.4 before being compared with
+# any textbook one-sigma rule.
 LONG = "LONG"
 SHORT = "SHORT"
 
@@ -77,9 +86,19 @@ RVOL_BASELINE_SESSIONS = 20
 DEFAULT_STOPS = (0.25, 0.5, 0.75, 1.0, 1.5)
 DEFAULT_TARGETS = (0.25, 0.5, 0.75, 1.0, 1.5)
 
-# Round-trip equity cost as a fraction of turnover, measured in trade_costs:
-# 82.45 rupees on 1,00,000 of buy turnover.
-COST_FRACTION = 0.000824
+# Round-trip equity cost as a fraction of turnover. COMPUTED from the live
+# cost stack rather than transcribed out of it, so a rate change in config
+# cannot leave this copy behind - it was the hand-written 0.000824, which
+# silently excluded slippage once that was added.
+#
+# Cost per rupee is HYPERBOLIC in ticket size, because brokerage is capped
+# at 20 rupees an order, so a single constant is only right near one
+# ticket. That ticket is stated here rather than assumed: a tighter stop
+# buys more shares and pays a LOWER fraction than this.
+COST_TICKET = 100_000.0
+COST_PRICE = 1000.0
+COST_FRACTION = trade_costs.equity_breakeven_pct(
+    COST_PRICE, int(COST_TICKET / COST_PRICE)) / 100.0
 
 
 @dataclass

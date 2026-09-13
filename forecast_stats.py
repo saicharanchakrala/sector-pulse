@@ -29,17 +29,35 @@ DEFAULT_SEED = 20260909
 
 
 def block_bootstrap(values, groups, draws: int = DEFAULT_DRAWS,
-                    seed: int = DEFAULT_SEED) -> tuple:
+                    seed: int = DEFAULT_SEED, block_size: int = 1) -> tuple:
     """Mean and 95% interval, resampling whole GROUPS rather than rows.
 
     `groups` labels the unit of independence - a session-day for intraday
     signals, a calendar date for cross-sectional ones. Every value sharing a
     group is resampled together, because they share whatever moved that day.
 
+    `block_size` is how many CONSECUTIVE groups travel together, and must
+    be raised whenever the values themselves overlap in time. Resampling
+    dates independently assumes date t and date t+1 are separate draws;
+    with a 252-session forward return sampled every 5 sessions they share
+    98% of their window, so that assumption invents roughly 25x more
+    independent observations than exist and the interval comes out far too
+    narrow. Groups are ordered before blocking, so consecutive means
+    consecutive in time.
+
+    A moving (not circular) block is used: every START position is equally
+    likely, which is NOT the same as every observation being equally
+    likely. The first and last few groups belong to fewer blocks, so they
+    are underrepresented - with 20 groups and span 5 the occurrence counts
+    run 1,2,3,4,5,...,5,4,3,2,1. Wrapping the series would even that out
+    at the cost of stitching the end of the sample to its beginning, which
+    for a price series joins two unrelated regimes. The edge bias is the
+    lesser distortion and is left in deliberately.
+
     Returns (mean, low, high, p) where p is the one-sided bootstrap
     probability that the true mean is not above zero. With fewer than five
-    groups the interval is not estimable and comes back as NaN rather than
-    as a falsely narrow number.
+    EFFECTIVE blocks the interval is not estimable and comes back as NaN
+    rather than as a falsely narrow number.
     """
     values = np.asarray(values, dtype=float)
     groups = np.asarray(groups)
@@ -50,14 +68,25 @@ def block_bootstrap(values, groups, draws: int = DEFAULT_DRAWS,
     starts = np.flatnonzero(np.r_[True, groups[1:] != groups[:-1]])
     blocks = np.split(values, starts[1:])
     observed = float(values.mean())
-    if len(blocks) < 5:
+    count = len(blocks)
+    span = max(1, min(int(block_size), count))
+    # How many independent draws actually exist, not how many rows do.
+    effective = count // span
+    if effective < 5:
         return observed, float("nan"), float("nan"), float("nan")
     rng = np.random.default_rng(seed)
-    count = len(blocks)
     means = np.empty(draws, dtype=float)
-    for draw in range(draws):
-        pick = rng.integers(0, count, size=count)
-        means[draw] = np.concatenate([blocks[p] for p in pick]).mean()
+    if span == 1:
+        for draw in range(draws):
+            pick = rng.integers(0, count, size=count)
+            means[draw] = np.concatenate([blocks[p] for p in pick]).mean()
+    else:
+        joined = [np.concatenate(blocks[start:start + span])
+                  for start in range(count - span + 1)]
+        starts_available = len(joined)
+        for draw in range(draws):
+            pick = rng.integers(0, starts_available, size=effective)
+            means[draw] = np.concatenate([joined[p] for p in pick]).mean()
     low, high = np.percentile(means, [2.5, 97.5])
     return observed, float(low), float(high), float((means <= 0.0).mean())
 

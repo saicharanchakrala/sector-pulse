@@ -3,10 +3,15 @@
 The geometry is deliberately mechanical, because a level you cannot restate
 as arithmetic is a level you cannot audit after the trade:
 
-  sigma    the plausible move left in the session: bar ATR * sqrt(bars left)
-  stop     half that sigma, or a structural level when one sits near it
+  plausible move
+           what is left in the session: bar ATR * sqrt(bars left). It was
+           called `sigma`, which it is NOT - it measures about 1.4
+           standard deviations. See expected_remaining_range. Do not call
+           it a "band" either: `band` is already a PARAMETER of
+           build_levels, meaning the structural window fraction.
+  stop     half a plausible move, or a structural level near one
   target   the reward-to-risk multiple of the stop distance, which at the
-           default half-sigma stop lands on sigma itself
+           default half-move stop lands on one full plausible move
   risk     entry to stop, per share
   size     risk budget in rupees divided by risk per share
   target   entry plus the reward-to-risk multiple of risk
@@ -132,6 +137,38 @@ def expected_remaining_range(atr_per_bar: float, bars_left: int) -> float:
     link in the reachability gate: a trending day exceeds it and a dead
     afternoon falls short. It is here to reject targets that need a move
     twice the size of anything the day has offered, not to predict range.
+
+    THIS IS A BAND, NOT A SIGMA, AND THE CODE USED TO CALL IT ONE. ATR is
+    a mean absolute TRUE RANGE - a high-to-low span covering both
+    directions - while a sigma is the standard deviation of the signed
+    move. This returns the first; everything downstream was reading the
+    second.
+
+    Measured two ways, which is why a range is quoted rather than a point:
+
+        per-observation median ratio        1.37
+        per-symbol median ratio             1.50   (IQR 1.39 - 1.58)
+        terminal move inside it            88.6%   (a 1-sigma band: 68.3%)
+
+    So one band is about 1.4 standard deviations, and the published
+    geometry restates as:
+
+                        as written   in true sigma   touch probability
+        stop              0.5 move     0.69 - 0.75      45% - 49%
+        target            1.0 move     1.37 - 1.50      13% - 17%
+
+    The touch figures previously quoted - 62% and 32% - are the values at
+    r = 1.0, which is the assumption this measurement rejects. Both were
+    overstated.
+
+    WHAT THIS DOES NOT RESCUE, because reading it as good news is the
+    obvious mistake. The breakeven hit rate is stop / (stop + target), and
+    at half a band against one band that is 0.5b / 1.5b = 1/3 whatever b
+    measures - the unit cancels exactly. The empirical check against it is
+    a raw count with no unit in it at all: 280 targets against 782 stops is
+    26.4%, against the 33.3% required. Correcting the unit makes the
+    Varsity comparison less lopsided than it was relayed; it moves the
+    expectancy not at all.
     """
     if atr_per_bar <= 0.0 or bars_left <= 0:
         return 0.0
@@ -165,9 +202,9 @@ def _structural_levels(direction: str, opening_low: "float | None",
     effect - pivot-bearing sessions are simply quieter.
 
     Two cautions for anyone re-running this. Pairing does NOT hold
-    distance constant by itself; over the full 0.15-2.0 sigma range the
+    distance constant by itself; over the full 0.15-2.0 move range the
     same paired estimator returns +6.27 pp, a pure distance artefact. It
-    is the [0.30, 0.50] sigma WINDOW that makes it honest. And a
+    is the [0.30, 0.50] move WINDOW that makes it honest. And a
     permutation test that shuffles the pivot label within distance buckets
     only is invalid here - it treats 79,725 observations from 14,474
     sessions as exchangeable, and returns p 0.02 for an estimate whose
@@ -221,16 +258,20 @@ def build_levels(direction: str, entry: float, atr_per_bar: float,
     # a 2:1 target needs 3%, which the reachability gate correctly rejects.
     # Clamping keeps the structural level when it falls inside the band and
     # ignores it when it does not.
-    sigma = expected_remaining_range(atr_per_bar, bars_left)
-    if sigma <= 0.0:
+    # NOT named `band`: this function already has a parameter by that
+    # name (SCAN_STRUCTURE_BAND, the structural window FRACTION), and
+    # shadowing it silently collapses the window to [(1 - plausible move)
+    # * base, base]. The test suite caught exactly that.
+    plausible_move = expected_remaining_range(atr_per_bar, bars_left)
+    if plausible_move <= 0.0:
         return None
-    base = sigma * stop_fraction
+    base = plausible_move * stop_fraction
     if base <= 0.0:
         return None
     # A structural level is preferred when it sits just inside the volatility
     # distance, since a real level is a better stop than an arithmetic one.
     # The window is [(1-band)*base, base] and deliberately never exceeds
-    # base: a wider stop scales the target past sigma, which the reachability
+    # base: a wider stop scales the target past one plausible move, which the reachability
     # gate then rejects. Accepting structure out to 1.4*base made every
     # structural stop in (base, 1.4*base] a guaranteed rejection, which left
     # the feature all but unusable and shipped the suite red.
@@ -278,7 +319,7 @@ def build_levels(direction: str, entry: float, atr_per_bar: float,
         reward_risk=reward_risk,
         breakeven_pct=cost.breakeven_pct,
         cost_rupees=cost.total,
-        expected_range=sigma,
+        expected_range=plausible_move,
         stop_source=stop_source,
         capital_capped=capital_capped,
     )

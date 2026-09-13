@@ -192,12 +192,16 @@ def main() -> int:
     gc.collect()
     data["date"] = pd.to_datetime(data["date"]).dt.date
 
+    # Scrub BEFORE ranking: rank() sorts +inf above every finite value, so
+    # one infinite cell rewrites the whole date's percentiles. Scrubbing
+    # afterwards cleaned the source column and left the ranks corrupted.
+    data = data.replace([np.inf, -np.inf], np.nan)
     for column in ("mom21", "mom63", "mom252", "mom252_ex21", "rel_mom63",
                    "rel_mom252", "vol252", "vol_ratio", "pos_52w",
                    "volume_ratio", "turnover_log", "drawdown_from_high"):
         data[f"xs_{column}"] = (data.groupby("date")[column]
                                 .rank(pct=True).astype("float32"))
-    data = data.replace([np.inf, -np.inf], np.nan).dropna(subset=["y_short"])
+    data = data.dropna(subset=["y_short"])
 
     print(f"\nrows {len(data):,} | dates {data.date.nunique():,} | "
           f"symbols {data.symbol.nunique():,}")

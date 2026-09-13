@@ -46,11 +46,29 @@ IST = ZoneInfo("Asia/Kolkata")
 # Everything overnight is CNC delivery: zero brokerage but STT on BOTH
 # legs, which is dearer in absolute terms and cheaper as a share of a
 # larger expected move.
+#
+# The intraday figure is COMPUTED from the live cost stack rather than
+# transcribed from it. It used to be the literal 0.082, which was correct
+# when written and silently wrong the moment slippage was added - the same
+# way a hand-copied constant is always wrong one edit later. It is quoted
+# at a one-lakh ticket because brokerage is capped per order, so cost per
+# rupee falls as the ticket grows; see trade_costs.
+_INTRADAY_COST_PCT = trade_costs.equity_breakeven_pct(1000.0, 100)
+
+# Delivery has no function in trade_costs to call, so this half stays
+# hand-derived: 0.1% STT on BOTH legs plus stamp duty and exchange fees,
+# with no brokerage on CNC. Slippage is added on the same terms as
+# everywhere else rather than being quietly omitted from the one stack
+# that happens to lack a calculator.
+_DELIVERY_STATUTORY_PCT = 0.23
+_DELIVERY_COST_PCT = round(
+    _DELIVERY_STATUTORY_PCT + 2 * config.COST_SLIPPAGE_PCT * 100.0, 4)
+
 HORIZONS = {
-    "intraday": {"sessions": 1, "cost_pct": 0.082, "daily": False},
-    "short": {"sessions": 10, "cost_pct": 0.23, "daily": True},
-    "mid": {"sessions": 63, "cost_pct": 0.23, "daily": True},
-    "long": {"sessions": 252, "cost_pct": 0.23, "daily": True},
+    "intraday": {"sessions": 1, "cost_pct": _INTRADAY_COST_PCT, "daily": False},
+    "short": {"sessions": 10, "cost_pct": _DELIVERY_COST_PCT, "daily": True},
+    "mid": {"sessions": 63, "cost_pct": _DELIVERY_COST_PCT, "daily": True},
+    "long": {"sessions": 252, "cost_pct": _DELIVERY_COST_PCT, "daily": True},
 }
 
 HONESTY = (

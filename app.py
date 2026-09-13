@@ -1276,6 +1276,27 @@ def render_scan_results(ranked: list[setups.Setup], bars: scan_data.BarSet,
             render_scan_option_picks(actionable[:5])
 
 
+def _forecast_feature_count() -> "int | str":
+    """How many features the research module actually uses today.
+
+    Read from the module rather than typed here, so this caption cannot
+    drift the way the one above it did.
+    """
+    try:
+        import forecast_intraday
+        return len(forecast_intraday.FEATURES)
+    except Exception:
+        return "an unknown number of"
+
+
+def _forecast_permutations() -> "int | str":
+    try:
+        import forecast_intraday
+        return forecast_intraday.PERMUTATIONS
+    except Exception:
+        return "an unknown number of"
+
+
 def live_feed_state() -> dict:
     """What the live bar feed is doing, for the status panel."""
     try:
@@ -1561,7 +1582,8 @@ def render_derivative_panel(symbol: str, kind: str, underlying: str,
 
     A derivative reaches here rather than the horizon assessment because
     the consolidated store holds cash daily bars only, and the assessment
-    also assumes a 0.23% delivery round trip and a holding period bounded
+    also assumes a flat delivery round trip (horizons._DELIVERY_COST_PCT)
+    and a holding period bounded
     by nothing but the horizon. Neither holds for a contract with an
     expiry, so producing a number would be worse than declining to.
     """
@@ -1685,7 +1707,8 @@ def render_contract_assessment(symbol: str, kind: str,
         f"Readings from **{underlying}**'s daily history - a contract's own "
         f"history is weeks long and breaks across rolls. Levels from **this "
         f"contract's** live price. Round trip is the futures stack on "
-        f"notional, not the 0.23% a cash delivery pays."
+        f"notional, not the "
+        f"{horizons.HORIZONS['short']['cost_pct']:.2f}% a cash delivery pays."
     )
     for name, detail in verdicts.items():
         with st.expander(f"{name} - {detail['verdict']}"):
@@ -2462,13 +2485,32 @@ def render_scan_tab() -> None:
             "model, and no threshold is shared between the two."
         )
         st.caption(
-            "Gradient-boosted model, 32 features, 760,458 samples, purged "
+            "From a RECORDED RUN, not from the code as it stands today: "
+            "gradient-boosted model, 32 features, 760,458 samples, purged "
             "walk-forward with an embargo. Ranking accuracy (AUC) 0.5205 "
             "against 0.5165 for the same model on shuffled labels, where "
             "0.50 is a coin flip. Best geometry net -0.009 R per trade; "
             "exact permutation p 0.091 over 10 shuffles, whose floor is "
-            "0.091, so it cannot show significance at all. 0 of 12 "
+            "0.091, so it could not show significance at all. 0 of 12 "
             "geometries profitable."
+        )
+        st.caption(
+            f"**Those figures have drifted from the code, and the gap is "
+            f"now wider than a recount.** forecast_intraday.py carries "
+            f"{_forecast_feature_count()} features and "
+            f"{_forecast_permutations()} shuffles against the 32 and 10 "
+            f"above. Since that run, four things changed that move the "
+            f"measurement itself, not just its size: the bar ATR was "
+            f"averaging roughly one prior session rather than fourteen, "
+            f"and it sets every stop, target and label; relative strength "
+            f"subtracted the index measured from a different baseline; "
+            f"cost was a flat constant that only held at a one-lakh ticket "
+            f"and charged nothing for slippage; and the shuffled null "
+            f"permuted labels inside each day, which preserves that day's "
+            f"base rate and so was never the coin flip it was described "
+            f"as. Every number in the paragraph above predates those "
+            f"fixes. Treat it as a record of what was measured once, not "
+            f"as a statement about this code, until it is re-run."
         )
     render_live_feed_panel()
     capital, risk_pct, scope, want_options, as_of, run = render_scan_controls()

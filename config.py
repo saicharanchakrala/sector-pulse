@@ -254,6 +254,20 @@ COST_EQ_TXN_PCT = 0.0000297       # NSE transaction charge, both legs
 COST_EQ_STAMP_BUY_PCT = 0.00003   # 0.003%, buy leg only
 COST_SEBI_PCT = 0.000001          # 10 rupees per crore, both legs
 COST_GST_PCT = 0.18               # on brokerage + transaction + SEBI
+# Slippage and half-spread, per leg, as a fraction of that leg's turnover.
+# NOT a statutory rate - a modelling assumption, and the only cost here
+# that is not published by the exchange. Everything above assumed fills at
+# the exact bar close and the exact stop level, which no market provides:
+# a stop-loss order is a TRIGGER that becomes a market order, and the book
+# is walked by anything larger than the top level. 2bp a leg is modest for
+# a liquid F&O underlying and light for anything thinner.
+COST_SLIPPAGE_PCT = 0.0002
+# Options are quoted in PREMIUM, not notional, and their books are far
+# thinner. A half-spread that is 2bp of notional can be whole percent of a
+# 5-rupee premium, so charging the notional rate on premium understates it
+# by about two orders of magnitude. 0.5% a leg is at the optimistic end of
+# a realistic option spread and is still 50x the equity figure.
+COST_OPT_SLIPPAGE_PCT = 0.005
 
 # Zerodha options charges, levied on premium turnover rather than contract value.
 # Equity futures. Percentage charges apply to NOTIONAL here, not to a

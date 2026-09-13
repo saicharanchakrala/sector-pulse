@@ -21,6 +21,7 @@ it says.
 """
 from __future__ import annotations
 
+import math
 import sys
 import warnings
 from pathlib import Path
@@ -89,6 +90,12 @@ SEED = 20260909
 # Thirty gives a floor of 1/31 = 0.032, which can.
 PERMUTATIONS = 30
 TOP_FRACTION = 0.10          # size of the "buy" basket, per date
+# The stride, in sessions, between consecutive rows for one name. It
+# converts a horizon measured in SESSIONS into one measured in sampled
+# DATES, which is the unit the bootstrap blocks over. IMPORTED rather than
+# repeated: a silent divergence from the builder would mis-size every
+# bootstrap block while everything still ran.
+from forecast_universe import SAMPLE_EVERY  # noqa: E402
 
 BASE_FEATURES = [
     "mom5", "mom21", "mom63", "mom126", "mom252", "mom252_ex21",
@@ -105,7 +112,7 @@ XS_FEATURES = [
 
 
 def date_bootstrap(values: np.ndarray, dates: np.ndarray,
-                   draws: int = 2000) -> tuple:
+                   draws: int = 2000, block_size: int = 1) -> tuple:
     """(mean, lo, hi, one-sided p) resampling whole DATES as blocks.
 
     Every name selected on the same date shares that date's market move, so
@@ -118,7 +125,7 @@ def date_bootstrap(values: np.ndarray, dates: np.ndarray,
     randomised trials before being replaced by the call.
     """
     return forecast_stats.block_bootstrap(values, dates, draws=draws,
-                                          seed=SEED)
+                                          seed=SEED, block_size=block_size)
 
 
 def folds_for(dates: list, embargo_sessions: int) -> list:
@@ -203,6 +210,41 @@ def run_horizon(data: pd.DataFrame, name: str, span: int, features: list,
     return pd.concat(out, ignore_index=True) if out else pd.DataFrame()
 
 
+def top_per_date(frame: pd.DataFrame, fraction: float) -> pd.DataFrame:
+    """The top `fraction` of names on each date, rounded UP to a whole name.
+
+    Rounding up means a thin date is not perfectly proportional - a
+    one-name date contributes that name at 100% and a five-name date takes
+    one at 20%. That is the honest floor: you cannot hold a fifth of a
+    position in the only name available.
+
+    rank(pct=True) >= 0.90 does NOT do this once probabilities tie, and
+    isotonic regression ties them heavily - it collapsed 62,367 predictions
+    into 81 distinct values. Every name sharing the cut-off value takes the
+    same percentile, so the basket held a median of 2.5% of names on some
+    dates and 20% on others while the code claimed a flat 10%.
+
+    Ties are broken by symbol so the basket is reproducible. That is an
+    arbitrary rule, and it is arbitrary precisely because the model cannot
+    separate those names - which is the honest thing to surface rather than
+    to hide behind a percentile that silently changes size.
+    """
+    # No falling back to frame.columns[0]: on a frame whose first column
+    # happens to be an outcome, that breaks ties by the ANSWER and inflates
+    # the measured return. Unreachable today, which is exactly how it would
+    # survive to the day it is reachable.
+    if "symbol" not in frame.columns:
+        raise KeyError("top_per_date needs a 'symbol' column to break ties "
+                       "reproducibly; got " + ", ".join(map(str, frame.columns)))
+    order = "symbol"
+    keep = []
+    for _, block in frame.groupby("date", sort=False):
+        size = max(1, math.ceil(len(block) * fraction))
+        keep.append(block.sort_values(["p", order],
+                                      ascending=[False, True]).head(size))
+    return pd.concat(keep) if keep else frame.iloc[0:0]
+
+
 def evaluate(frame: pd.DataFrame, name: str, label: str) -> dict:
     """Excess return of the top-decile basket, versus every alternative."""
     target = f"y_{name}"
@@ -212,25 +254,49 @@ def evaluate(frame: pd.DataFrame, name: str, label: str) -> dict:
     # a relative choice, which is how factor strategies actually trade -
     # an absolute probability threshold would load up in bull regimes and
     # hold nothing in bear ones, confounding timing with selection.
-    frame = frame.copy()
-    frame["rank"] = frame.groupby("date")["p"].rank(pct=True)
-    picked = frame[frame["rank"] >= 1.0 - TOP_FRACTION]
+    picked = top_per_date(frame, TOP_FRACTION)
     if picked.empty:
         return {}
-    obs, lo, hi, p = date_bootstrap(picked[target].to_numpy(),
-                                    picked["date"].to_numpy())
-    everything, e_lo, e_hi, _ = date_bootstrap(frame[target].to_numpy(),
-                                               frame["date"].to_numpy())
+    # Dates carry different numbers of names, so pooling rows weights a
+    # crowded date more heavily than a thin one and reports something no
+    # portfolio earns. Average WITHIN the date first: that is the return of
+    # holding the basket equally weighted, which is the claim being made.
+    #
+    # Block over consecutive dates because the labels overlap: a 252
+    # session forward return sampled every 5 sessions repeats 98% of its
+    # window on the next row.
+    span = max(1, math.ceil(HORIZONS[name] / SAMPLE_EVERY))
+    basket = picked.groupby("date")[target].mean()
+    universe = frame.groupby("date")[target].mean()
+    obs, lo, hi, p = date_bootstrap(basket.to_numpy(),
+                                    basket.index.to_numpy(), block_size=span)
+    # An unexplained NaN reads as a crash. It is not: at the long horizon
+    # 210 out-of-fold dates blocked at 51 leave 4 independent blocks, below
+    # the five-block floor, and no interval is estimable from four draws.
+    note = ""
+    effective = len(basket) // span
+    if effective < 5:
+        note = (f"no interval: {len(basket)} dates blocked at {span} "
+                f"(the label's own length) leave {effective} independent "
+                f"observations, below the floor of 5")
+    everything, e_lo, e_hi, _ = date_bootstrap(
+        universe.to_numpy(), universe.index.to_numpy(), block_size=span)
     auc = (roc_auc_score(frame["label"], frame["p"])
            if frame["label"].nunique() > 1 else float("nan"))
     return {
         "label": label, "rows": len(frame), "picked": len(picked),
         "dates": frame["date"].nunique(), "auc": auc,
-        "excess": obs, "lo": lo, "hi": hi, "p": p,
+        "excess": obs, "lo": lo, "hi": hi, "p": p, "note": note,
         "all_names": everything, "all_lo": e_lo, "all_hi": e_hi,
         "spread": obs - everything,
-        "mdd": float(picked[f"mdd_{name}"].mean()),
-        "hit": float((picked[target] > 0).mean()),
+        # Averaged WITHIN date first, exactly like `excess` above. Pooled
+        # across rows these described a different portfolio from the one
+        # being reported beside them: on a constructed case of 100 names
+        # on a +10% date and 10 on a -40% date, the pooled hit rate reads
+        # 0.909 where the basket actually returned 0.5.
+        "mdd": float(picked.groupby("date")[f"mdd_{name}"].mean().mean()),
+        "hit": float(picked.assign(_w=picked[target] > 0)
+                     .groupby("date")["_w"].mean().mean()),
     }
 
 
@@ -331,11 +397,17 @@ def main() -> int:
             print(f"{row.get('label', '?'):>8} {'n/a':>10}  "
                   f"{row.get('note', '')}")
             continue
-        trips = 252.0 / HORIZONS[row["label"]]["sessions"]
+        # HORIZONS maps a label straight to its session count here -
+        # {"short": 10, ...} - unlike horizons.HORIZONS, where the values
+        # are dicts. The ["sessions"] came across with the copy and made
+        # this line raise after the whole permutation run had completed.
+        trips = 252.0 / HORIZONS[row["label"]]
         print(f"{row['label']:>8} {row['excess']:>+10.3f} "
               f"[{row['lo']:+9.3f},{row['hi']:+9.3f}] {row['p']:>8.4f} "
               f"{row.get('perm_p', float('nan')):>8.4f} "
               f"{row['spread']:>+8.3f} {row['mdd']:>8.2f} {trips:>9.1f}")
+        if row.get("note"):
+            print(f"{'':>8} {row['note']}")
     print()
     print("'worst forward close' is the lowest CLOSE over the horizon relative")
     print("to entry, not a true intraday drawdown - highs and lows are not")

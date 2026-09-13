@@ -293,9 +293,32 @@ def test_options_stt_and_stamp_duty_hit_only_their_own_leg() -> None:
 
 
 def test_cheap_options_cost_far_more_in_percentage_terms() -> None:
+    """The FLAT per-order fee is what makes a cheap option expensive.
+
+    This asserted `cheap > dear * 5` on the totals, which held while every
+    option cost was either flat or a percentage of premium. Slippage is a
+    flat PERCENTAGE of premium, so it adds the same 1.0pp to a 5-rupee and
+    a 100-rupee option and arithmetically drags any ratio between them
+    toward 1 - without weakening the effect being tested.
+
+    So the effect is asserted on the component that produces it, where it
+    is 7.4x, and the total is held to the weaker bound it can now support.
+    Known simplification: a real cheap option has a WIDER relative spread
+    than a dear one, so a flat percentage understates cheap options
+    specifically. It is not modelled as premium-dependent because there is
+    no measurement here to shape that curve with.
+    """
     dear = trade_costs.options_breakeven_pct(100.0, 1, 500)
     cheap = trade_costs.options_breakeven_pct(5.0, 1, 500)
-    assert cheap > dear * 5, (cheap, dear)
+    assert cheap > dear * 2, (cheap, dear)
+
+    def flat_fee_share(premium: float) -> float:
+        """Round-trip cost excluding the proportional slippage term."""
+        cost = trade_costs.options_cost(premium, premium, 1, 500)
+        return (cost.total - cost.slippage) / cost.buy_turnover * 100.0
+
+    assert flat_fee_share(5.0) > flat_fee_share(100.0) * 5, (
+        flat_fee_share(5.0), flat_fee_share(100.0))
 
 
 def test_zero_or_negative_size_costs_nothing_rather_than_raising() -> None:
@@ -314,15 +337,15 @@ def _long_levels(**kwargs):
     return levels_mod.build_levels(**defaults)
 
 
-def test_stop_is_half_the_remaining_sigma_by_default() -> None:
+def test_stop_is_half_the_plausible_move_by_default() -> None:
     trade = _long_levels()
     assert trade is not None
-    # sigma = 1.0 * sqrt(25) = 5.0; stop distance = 0.5 * 5.0 = 2.5
+    # plausible move = 1.0 * sqrt(25) = 5.0; stop = 0.5 * 5.0 = 2.5
     assert trade.stop == pytest.approx(97.5)
     assert trade.risk_per_share == pytest.approx(2.5)
 
 
-def test_target_lands_on_sigma_so_it_stays_reachable() -> None:
+def test_target_lands_on_one_move_so_it_stays_reachable() -> None:
     trade = _long_levels()
     assert trade is not None
     assert trade.target == pytest.approx(105.0)     # 2 * 2.5 above entry

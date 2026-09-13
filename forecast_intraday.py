@@ -43,6 +43,8 @@ from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import brier_score_loss, roc_auc_score
 
+import forecast_stats
+
 ROOT = Path(__file__).resolve().parent
 CACHE = ROOT / "bar_cache"
 OUT_DIR = ROOT / "forecast_cache"
@@ -154,8 +156,27 @@ def predict(model, iso, frame: pd.DataFrame) -> np.ndarray:
     return iso.predict(raw) if iso is not None else raw
 
 
+def _mean_loss(train: pd.DataFrame, label: str, realised: str) -> float:
+    """Mean realised R on the losing label, from training rows only.
+
+    Falls back to -1.0 - the old hardcoded assumption - when the fold has
+    no losers to measure, which keeps the gate defined rather than NaN.
+    """
+    losers = train.loc[train[label] == 0, realised]
+    value = float(losers.mean()) if len(losers) else float("nan")
+    if not np.isfinite(value):
+        return -1.0
+    # A positive mean loss would turn the EV gate into a pass-through:
+    # at p = 0.10 with loss = +0.75, ev = +0.725 and every row qualifies.
+    # Real data cannot produce it (stops pin the mean at or below -1 plus
+    # the mark-outs), so clamping here is a guard against a broken input
+    # rather than a modelling choice.
+    return min(value, 0.0)
+
+
 def walk_forward(data: pd.DataFrame, stop_fraction: float, reward: float,
-                 shuffle: bool = False, rng=None) -> pd.DataFrame:
+                 shuffle: bool = False, rng=None,
+                 shuffle_scope: str = "global") -> pd.DataFrame:
     """Out-of-fold predictions and realised outcomes for one geometry."""
     suffix = tag(stop_fraction, reward)
     long_label, short_label = f"L_{suffix}", f"S_{suffix}"
@@ -169,14 +190,53 @@ def walk_forward(data: pd.DataFrame, stop_fraction: float, reward: float,
         if train.empty or test.empty:
             continue
         if shuffle:
-            # Permute labels WITHIN each session, so the null keeps the same
-            # day structure and feature distribution and destroys only the
-            # feature-to-outcome link.
+            # WHAT EACH SCOPE ACTUALLY DESTROYS. This used to permute
+            # within each session and claim it "destroys only the
+            # feature-to-outcome link". It does not: shuffling inside a day
+            # PRESERVES that day's base rate, so every day-level feature -
+            # bench_change, gap_pct, atr_pct, which are near-constant
+            # across a session - still predicts it. The session null
+            # therefore scores about 0.53 AUC, not 0.50, and comparing the
+            # real model against it while calling 0.50 the reference
+            # flattered the result at both ends.
+            #
+            #   global   permute across the whole training block. The
+            #            reference the docstring always described, and the
+            #            one whose AUC really is 0.50 in expectation.
+            #   session  permute within each day. A STRICTER test - it asks
+            #            for skill beyond knowing the day - but its null is
+            #            not a coin flip and must not be read as one.
+            #
+            # ONE permutation, applied to all four outcome columns
+            # together. Permuting the long and short labels separately -
+            # which this did, and did before the scope was added - builds
+            # a null the market cannot produce: under a stop/target grid a
+            # long win and a short win on the same bar are close to
+            # mutually exclusive (measured correlation -0.96, and P(both
+            # win) = 0.0000), but independent shuffles give correlation
+            # ~0.00 and let 13-24% of rows win on BOTH sides. A reference
+            # distribution containing impossible rows is not a reference
+            # distribution for this pipeline.
+            #
+            # The realised-R columns travel with their labels for the same
+            # reason. Leaving them behind made _mean_loss below select a
+            # random subset of rows, so it returned E[r] instead of
+            # E[r | loss] - measured -0.035 against the real -0.609 - and
+            # the null's EV gate then opened on nearly every row. That, not
+            # calibration, was why the null appeared to trade 17x more.
             train = train.copy()
-            for column in (long_label, short_label):
-                train[column] = (
-                    train.groupby("day")[column]
-                    .transform(lambda s: rng.permutation(s.to_numpy())))
+            columns = (long_label, short_label, long_r, short_r)
+            if shuffle_scope == "session":
+                keys = train["day"].to_numpy()
+                index = np.arange(len(train))
+                shuffled = np.empty(len(train), dtype=int)
+                for day in np.unique(keys):
+                    at = index[keys == day]
+                    shuffled[at] = rng.permutation(at)
+            else:
+                shuffled = rng.permutation(np.arange(len(train)))
+            for column in columns:
+                train[column] = train[column].to_numpy()[shuffled]
         calib = set(train_days[-CALIB_DAYS:])
         long_model, long_iso = fit_side(train, long_label, calib)
         short_model, short_iso = fit_side(train, short_label, calib)
@@ -190,10 +250,20 @@ def walk_forward(data: pd.DataFrame, stop_fraction: float, reward: float,
                       long_r, short_r, cost_column]].copy()
         block["p_long"] = predict(long_model, long_iso, test)
         block["p_short"] = predict(short_model, short_iso, test)
+        # EV assumed every non-win costs exactly -1R. Label 0 lumps STOPS
+        # together with positions that never resolved and marked out at the
+        # close, and those mark-outs are often positive - 23% to 44% of
+        # rows depending on geometry. So the gate was optimising a quantity
+        # that is not the payoff r_long/r_short actually pays. Use the
+        # realised mean loss on label 0, measured on TRAIN only.
+        loss_long = _mean_loss(train, long_label, long_r)
+        loss_short = _mean_loss(train, short_label, short_r)
         block["ev_long"] = (block["p_long"] * reward
-                            - (1 - block["p_long"]) - block[cost_column])
+                            + (1 - block["p_long"]) * loss_long
+                            - block[cost_column])
         block["ev_short"] = (block["p_short"] * reward
-                             - (1 - block["p_short"]) - block[cost_column])
+                             + (1 - block["p_short"]) * loss_short
+                             - block[cost_column])
         block = block.rename(columns={long_label: "y_long",
                                       short_label: "y_short",
                                       long_r: "r_long", short_r: "r_short",
@@ -202,8 +272,16 @@ def walk_forward(data: pd.DataFrame, stop_fraction: float, reward: float,
     return pd.concat(out, ignore_index=True) if out else pd.DataFrame()
 
 
-def net_of_selection(frame: pd.DataFrame) -> tuple:
-    """Net R of taking whichever side has positive EV, best side per row."""
+def net_of_selection(frame: pd.DataFrame, limit: int = 0) -> tuple:
+    """Net R of taking whichever side has positive EV, best side per row.
+
+    `limit` caps the number of trades to the highest-EV ones. The null
+    shuffles select far more rows than the real model - a shuffled model is
+    poorly calibrated and lets almost everything through - so comparing the
+    mean of 150 highly-selected trades against the mean of 2,600 barely
+    selected ones compares two different estimators, not two hypotheses.
+    Matching the count makes the comparison like-for-like.
+    """
     if frame.empty:
         return np.array([]), np.array([])
     take_long = (frame["ev_long"] > 0) & (frame["ev_long"] >= frame["ev_short"])
@@ -212,10 +290,22 @@ def net_of_selection(frame: pd.DataFrame) -> tuple:
     chosen = frame[keep]
     if chosen.empty:
         return np.array([]), np.array([])
-    net = np.where(take_long[keep].to_numpy(),
+    long_side = take_long[keep].to_numpy()
+    net = np.where(long_side,
                    (chosen["r_long"] - chosen["cost_r"]).to_numpy(),
                    (chosen["r_short"] - chosen["cost_r"]).to_numpy())
-    return net.astype(float), chosen["day"].to_numpy()
+    days = chosen["day"].to_numpy()
+    if limit and net.size > limit:
+        edge = np.where(long_side, chosen["ev_long"].to_numpy(),
+                        chosen["ev_short"].to_numpy())
+        # Negate rather than reverse: argsort(...)[::-1] flips the tie
+        # order too, so tied rows are kept LAST-first and the subsample
+        # skews late in the sample. Isotonic ties EV heavily, so this is
+        # the common case rather than an edge one.
+        keep_at = np.argsort(-edge, kind="stable")[:limit]
+        keep_at.sort()
+        net, days = net[keep_at], days[keep_at]
+    return net.astype(float), days
 
 
 def main() -> int:
@@ -304,12 +394,18 @@ def main() -> int:
                 if not real_frame.empty and real_frame["y_long"].nunique() > 1
                 else float("nan"))
     rng = np.random.default_rng(SEED)
-    null_means, null_aucs = [], []
+    null_means, null_aucs, null_counts = [], [], []
     for k in range(PERMUTATIONS):
         frame = walk_forward(data, best[0], best[1], shuffle=True, rng=rng)
         if frame.empty:
             continue
+        # Same rule on both arms - ev > 0, uncapped. Capping the null to
+        # the real arm's trade count made the two sides different
+        # estimators; it was also compensating for the unshuffled
+        # realised-R bug fixed above, which is the actual reason the
+        # counts diverged.
         net, _ = net_of_selection(frame)
+        null_counts.append(int(net.size))
         if net.size:
             null_means.append(float(net.mean()))
         if frame["y_long"].nunique() > 1:
@@ -321,7 +417,16 @@ def main() -> int:
         print(f"\n  real  net R {real_mean:+.4f}   AUC {real_auc:.4f}   "
               f"trades {real_net.size:,}")
         print(f"  null  net R {arr.mean():+.4f} +/- {arr.std():.4f}  "
-              f"range [{arr.min():+.4f}, {arr.max():+.4f}]")
+              f"range [{arr.min():+.4f}, {arr.max():+.4f}]   "
+              f"trades {int(np.mean(null_counts)):,} mean")
+        # Both arms select on ev > 0. A large gap in trade count means the
+        # two are not comparable however close their means are, so it is
+        # printed rather than corrected away.
+        if null_counts and real_net.size:
+            ratio = float(np.mean(null_counts)) / max(real_net.size, 1)
+            if ratio > 2.0 or ratio < 0.5:
+                print(f"  WARNING: null selects {ratio:.1f}x the real "
+                      f"arm's trades - the means are not comparable")
         if null_aucs:
             print(f"  null  AUC {np.mean(null_aucs):.4f} "
                   f"+/- {np.std(null_aucs):.4f}")
@@ -346,7 +451,6 @@ def main() -> int:
         # more conservative test wearing BH's name. forecast_stats has the
         # tested implementation, and every geometry tried is passed in -
         # correcting only the winners defeats the correction.
-        import forecast_stats
         m = len(results)
         ranked = sorted(good, key=lambda r: r["p"])
         all_p = [r["p"] for r in results]

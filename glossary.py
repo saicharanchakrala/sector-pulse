@@ -78,7 +78,9 @@ COLUMNS = {
     "Cost": "Total charges to get in and out once: brokerage, taxes and "
             "exchange fees. Unavoidable.",
     "Cost %": "Charges to get in and out once, as a percentage of the "
-              "position. You start every trade this far behind.",
+              "position, INCLUDING an estimate for slippage - the gap "
+              "between the price you saw and the price you got. You start "
+              "every trade this far behind.",
     "Round trip": "Charges to get in and out once, as a percentage. You "
                   "start this far behind on every trade.",
     "Win % needed": "How often this trade must work just to break even "
@@ -198,12 +200,17 @@ CONCEPTS = {
         "stop distance, so one winner pays for two losers. Neither is a "
         "prediction - both are arithmetic from recent volatility.",
     "Why charges matter so much":
-        "Every round trip costs brokerage, taxes and exchange fees. "
-        "Intraday that is roughly 0.08% of the position; holding overnight "
-        "it is about 0.23% because the tax applies to both the buy and the "
-        "sell. On a small option position the flat per-order fee can be "
-        "over 6% of the premium. You must clear that before you make "
-        "anything, which is why the cost columns come first here.",
+        "Every round trip costs brokerage, taxes, exchange fees AND "
+        "slippage - the gap between the price you saw and the price you "
+        "got. Intraday that is roughly 0.12% of the position; holding "
+        "overnight it is about 0.27%, because the tax applies to both the "
+        "buy and the sell. On an option it is far worse: about 3% round "
+        "trip on a 5-rupee premium and about 6% on a 2-rupee one, because "
+        "the per-order fee is flat while the premium is not, and an "
+        "option's spread is a percent of premium rather than a basis "
+        "point of notional. You must clear "
+        "that before you make anything, which is why the cost columns come "
+        "first here.",
     "What the horizons mean":
         "Intraday means in and out the same day. Short is about two weeks, "
         "mid about three months, long about a year. They get different "
