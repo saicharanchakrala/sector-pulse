@@ -209,6 +209,13 @@ FINE_LOOKBACK_MAX = 20
 # uses the daily estimate - see the note in assess_daily.
 FINE_MIN_COVERAGE = 0.9
 FINE_MAX_STALE_DAYS = 7
+# How many completed SESSIONS the daily store may be missing before the
+# horizons say so. Sessions, not calendar days: four calendar days on a
+# Sunday is two missed sessions, and counting days let exactly that pass
+# unremarked. One missing session is worth stating - trend, drawdown and
+# position-in-range all come from this store and two of them are ranking
+# columns.
+DAILY_MAX_STALE_SESSIONS = 1
 
 
 def realised_volatility(fine: pd.DataFrame, sessions: int) -> float:
@@ -353,7 +360,28 @@ def assess_daily(symbol: str, frame: pd.DataFrame, horizon: str,
     # drawdown - both of them scored - reading the raw array, where a
     # single zero sets `low` and therefore the whole range position.
     series = series[np.isfinite(series) & (series > 0)]
-    closes = series.to_numpy(dtype=float)
+    return _assess_series(symbol, series.to_numpy(dtype=float), series.index,
+                          horizon, benchmark, live_price=live_price,
+                          cost_pct=cost_pct, fine=fine)
+
+
+def _assess_series(symbol: str, closes, dates, horizon: str,
+                   benchmark: "pd.DataFrame | None",
+                   live_price: "float | None" = None,
+                   cost_pct: "float | None" = None,
+                   fine: "pd.DataFrame | None" = None) -> "Assessment | None":
+    """The arithmetic, over already-cleaned closes and their dates.
+
+    Separated from assess_daily so the universe sweep can slice closes
+    straight out of one long frame instead of building a DataFrame per
+    symbol - measured at 6.7s for 2,285 of them, against 0.5s to read the
+    rows they came from. Both callers reach this function, so there is one
+    implementation of every reading rather than two that agree today.
+
+    `closes` must already have had nulls, non-finite values and
+    non-positive prices removed, and `dates` must be the stamps that
+    survived alongside them.
+    """
     lookback = _lookback_for(horizon)
     if closes.size < lookback + 5:
         return None
@@ -393,7 +421,7 @@ def assess_daily(symbol: str, frame: pd.DataFrame, horizon: str,
     span = max(high - low, 1e-9)
 
     relative = trend
-    bench_move = _benchmark_move(series.index, benchmark, lookback)
+    bench_move = _benchmark_move(dates, benchmark, lookback)
     if bench_move == bench_move:
         relative = trend - bench_move
 
@@ -477,12 +505,27 @@ def gate_lines(assessment: "Assessment", turnover: "float | None"
         f"round trip {assessment.cost_multiple:.1f}x, needs "
         f"{MIN_COST_MULTIPLE:.0f}x [{'PASS' if ok else 'FAIL'}]")
 
+    # THIS GATE IS LONG-ONLY, AND SO IS THE SYSTEM. `direction` is set to
+    # SHORT precisely when relative < 0 (see _direction_from), and this
+    # then requires relative > 0 - so every SHORT fails here by
+    # construction, always, whatever the rest of its readings say. That is
+    # not a bug in the gate: the daily horizons were built to find
+    # outperformers, and nothing here has ever been measured on the short
+    # side. It IS a bug to present those rows as ranked candidates with a
+    # stop and an exit, which is why to_frame now blanks them.
     ok = assessment.relative > 0
     checks.append(ok)
-    reasons.append(
-        f"relative to the index {assessment.relative:+.2f}pp over "
-        f"{_lookback_for(assessment.horizon)} sessions, needs to be ahead "
-        f"[{'PASS' if ok else 'FAIL'}]")
+    if assessment.direction == "SHORT":
+        reasons.append(
+            f"relative to the index {assessment.relative:+.2f}pp over "
+            f"{_lookback_for(assessment.horizon)} sessions - this system "
+            f"only evaluates LONG ideas, so a weaker-than-index reading is "
+            f"NO OPINION rather than a short suggestion [FAIL]")
+    else:
+        reasons.append(
+            f"relative to the index {assessment.relative:+.2f}pp over "
+            f"{_lookback_for(assessment.horizon)} sessions, needs to be "
+            f"ahead [{'PASS' if ok else 'FAIL'}]")
 
     deep = assessment.drawdown == assessment.drawdown and         assessment.drawdown < MAX_DRAWDOWN
     checks.append(not deep)
@@ -518,6 +561,13 @@ def rank(assessments: list, top: int = 20) -> list:
     thresholds, because "strong relative trend" only means anything next to
     what the rest of the market did. Names whose plausible move cannot
     cover costs are ranked last whatever else they show.
+
+    SHORT rows sort to the bottom, and that is deliberate rather than a
+    sign error: score is monotone in `relative`, and a SHORT is by
+    definition a negative `relative`. Since gate_lines is long-only by
+    construction, a SHORT can never become actionable, so ranking it above
+    a tradeable LONG would promote a row the system refuses to act on.
+    to_frame blanks its levels for the same reason.
     """
     usable = [a for a in assessments if a is not None]
     if not usable:
@@ -604,6 +654,63 @@ def _measurable_sessions(frame) -> int:
     return sum(1 for n in counts.values() if n >= 5)
 
 
+def last_completed_session(now: "datetime | None" = None) -> date:
+    """The most recent weekday whose session has finished.
+
+    Weekdays only, so it does not know about exchange holidays - which
+    makes it overcount the gap on one, and warning on a holiday is the
+    safe direction to be wrong in.
+    """
+    now = now or datetime.now(IST)
+    close_hour, close_minute = config.SCAN_SESSION_CLOSE
+    day = now.date()
+    finished_today = (now.hour, now.minute) >= (close_hour, close_minute)
+    if day.weekday() >= 5 or not finished_today:
+        day -= timedelta(days=1)
+    while day.weekday() >= 5:
+        day -= timedelta(days=1)
+    return day
+
+
+def daily_store_lag(long_frame=None, now: "datetime | None" = None) -> tuple:
+    """(newest session in the daily store, completed sessions missing).
+
+    Measured from the DATA, not the file's timestamp: a rebuild that folds
+    nothing still refreshes the mtime, so mtime records when someone last
+    ran a command rather than how current the bars are.
+
+    SESSIONS, not calendar days. Measured on 2026-09-13, a Sunday: the
+    store's newest bar was 2026-09-09, which is four calendar days and TWO
+    missed sessions. A day-based threshold of four let that pass.
+
+    Returns (None, None) when there is nothing to measure. Pass the long
+    frame a sweep has already loaded to make this free.
+    """
+    try:
+        # Only None means "fetch it yourself". An empty frame that was
+        # PASSED means the caller looked and found nothing, and quietly
+        # reloading the real store behind their back would answer a
+        # different question from the one asked.
+        if long_frame is None:
+            long_frame = bar_store.load_long("day")
+        if long_frame is None or len(long_frame) == 0:
+            return None, None
+        newest = pd.DatetimeIndex(long_frame["stamp"]).max()
+        if newest is pd.NaT or newest != newest:
+            return None, None
+        newest = newest.date()
+        missing = 0
+        day = last_completed_session(now)
+        while day > newest:
+            if day.weekday() < 5:
+                missing += 1
+            day -= timedelta(days=1)
+        return newest, missing
+    except Exception as exc:
+        logger.warning("Could not read the daily store's age: %s", exc)
+    return None, None
+
+
 def _usable_fine(fine: dict, symbols: list) -> dict:
     """The intraday store if it can be used for the whole run, else {}.
 
@@ -684,12 +791,53 @@ def assess_universe(symbols: list, horizons: "list | None" = None,
     longest = max(_lookback_for(h) for h in wanted)
     # Calendar days for the deepest lookback, with slack for holidays.
     start = date.today() - timedelta(days=int(longest * 7 / 5) + 30)
-    frames = bar_store.load("day", symbols=list(symbols) + [benchmark_symbol],
-                            start=start)
-    if not frames:
+    # ONE long frame plus positional bounds, rather than a DataFrame per
+    # symbol. Measured on this store: 5.71s to build 2,285 frames against
+    # 0.62s for the long read and its bounds, for the same rows.
+    long_frame = bar_store.load_long(
+        "day", symbols=list(symbols) + [benchmark_symbol], start=start)
+    bounds = bar_store.slice_bounds(long_frame)
+    if not bounds:
         logger.warning("No consolidated daily bars; run bar_store first")
         return {}
-    benchmark = frames.get(benchmark_symbol)
+    all_closes = long_frame["Close"].to_numpy(dtype=float)
+    all_dates = pd.DatetimeIndex(long_frame["stamp"])
+    # The daily store's own age, from the bars just loaded. The intraday
+    # store is REFUSED when it goes stale because the daily estimate
+    # stands behind it; nothing stands behind this one, so it warns and
+    # the caller puts the age on screen.
+    newest, behind = daily_store_lag(long_frame)
+    if behind is not None and behind > DAILY_MAX_STALE_SESSIONS:
+        logger.warning(
+            "The daily store's newest session is %s - %d completed "
+            "session(s) missing. Trend, drawdown and position in range "
+            "come from it, so they describe that date rather than today. "
+            "Rebuild with: python -m bar_store --intervals day",
+            newest, behind)
+
+    def cleaned(symbol: str):
+        """(closes, dates) for one symbol, filtered exactly as assess_daily
+        filters them: nulls, non-finite values and non-positive prices out,
+        their stamps out with them."""
+        span = bounds.get(symbol)
+        if span is None:
+            return None
+        begin, stop = span
+        closes = all_closes[begin:stop]
+        keep = np.isfinite(closes) & (closes > 0)
+        return closes[keep], all_dates[begin:stop][keep]
+
+    benchmark = None
+    bench = cleaned(benchmark_symbol)
+    if bench is not None:
+        # _benchmark_move reindexes onto the stock's dates, so the
+        # benchmark alone still arrives as a frame - one, not 2,285.
+        benchmark = pd.DataFrame({"Close": bench[0]}, index=bench[1])
+    prepared = {}
+    for symbol in symbols:
+        ready = cleaned(symbol)
+        if ready is not None:
+            prepared[symbol] = ready
     # Intraday bars for the short horizons only - mid and long never
     # consult them - and loaded once rather than per symbol. Bounded by
     # date: realised_volatility reads ten sessions and the store holds
@@ -710,12 +858,12 @@ def assess_universe(symbols: list, horizons: "list | None" = None,
         results = []
         total = len(symbols)
         for done, symbol in enumerate(symbols, start=1):
-            frame = frames.get(symbol)
-            if frame is None:
+            ready = prepared.get(symbol)
+            if ready is None:
                 continue
             try:
-                assessment = assess_daily(
-                    symbol, frame, horizon, benchmark,
+                assessment = _assess_series(
+                    symbol, ready[0], ready[1], horizon, benchmark,
                     live_price=(live or {}).get(symbol),
                     fine=fine.get(symbol))
             except Exception as exc:
@@ -737,10 +885,17 @@ def to_frame(assessments: list) -> pd.DataFrame:
         return pd.DataFrame()
     return pd.DataFrame([{
         "Symbol": a.symbol,
-        "View": a.direction,
+        # A SHORT row here is a stock weaker than the index, which this
+        # long-only system has no opinion about - so it gets no levels.
+        # Printing a stop and an exit beside a verdict the gates can never
+        # pass is how HDFCLIFE was read as a trade ticket.
+        "View": ("weaker than index (not evaluated)"
+                 if a.direction == "SHORT" else a.direction),
         "Price": round(a.price, 2),
-        "Stop loss at": round(a.stop_price, 2),
-        "Exit price": round(a.target_price, 2),
+        "Stop loss at": (None if a.direction == "SHORT"
+                         else round(a.stop_price, 2)),
+        "Exit price": (None if a.direction == "SHORT"
+                       else round(a.target_price, 2)),
         "Cost %": round(a.cost_pct, 3),
         "Plausible move %": round(a.expected_move, 2),
         "Move vs fees": f"{a.cost_multiple:.1f}x",

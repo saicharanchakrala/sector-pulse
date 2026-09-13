@@ -294,11 +294,33 @@ def _cached(tmp_path, stamps, written):
 def test_a_span_that_ended_yesterday_is_never_stale(tmp_path) -> None:
     # This is what makes the 12-day prewarm window cost one fetch a day.
     # Refetching settled history would undo the whole point of the cache.
+    # The file is written the NEXT morning, which is when the feed's
+    # prewarm actually writes it - a file cannot be captured before the
+    # data it holds, and the first version of this test pretended it was.
     at = datetime(2026, 9, 11, 15, 2, tzinfo=IST_ZONE)
     path, frame = _cached(tmp_path, ["2026-09-10 15:27"],
-                          datetime(2026, 9, 1, 9, 0, tzinfo=IST_ZONE))
+                          datetime(2026, 9, 11, 8, 26, tzinfo=IST_ZONE))
     assert not market_source._cache_is_stale(
         path, frame, date(2026, 9, 10), "3minute", now=at)
+
+
+def test_a_past_day_captured_before_its_own_close_is_partial(
+        tmp_path) -> None:
+    # THE BUG THIS PINS, measured on 2026-09-13. The wide scan's files for
+    # 25 Aug - 11 Sep were written at 09:23 ON the 11th, so they stop at
+    # 10 Sep 15:12. The rule said any past-dated span is settled, which
+    # froze that truncation as permanent history: a study of the 11th read
+    # those files and found no bars for the day it was studying.
+    at = datetime(2026, 9, 13, 10, 0, tzinfo=IST_ZONE)
+    mid_session = datetime(2026, 9, 11, 9, 23, tzinfo=IST_ZONE)
+    path, frame = _cached(tmp_path, ["2026-09-10 15:12"], mid_session)
+    assert market_source._cache_is_stale(
+        path, frame, date(2026, 9, 11), "3minute", now=at)
+    # Refetched after that day's close, it is settled and stays settled.
+    after_close = datetime(2026, 9, 11, 16, 30, tzinfo=IST_ZONE)
+    path, frame = _cached(tmp_path, ["2026-09-11 15:27"], after_close)
+    assert not market_source._cache_is_stale(
+        path, frame, date(2026, 9, 11), "3minute", now=at)
 
 
 def test_a_today_span_frozen_at_the_open_is_stale_by_midday(tmp_path) -> None:

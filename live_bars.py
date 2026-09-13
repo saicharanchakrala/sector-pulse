@@ -386,18 +386,45 @@ def load_today(tokens: "dict[str, int] | None" = None,
     return out
 
 
-def history_window(days: int = 12) -> tuple:
+def history_days(fallback: int = 12) -> int:
+    """Calendar days of prior sessions to hold, from ONE config value.
+
+    The download path asks market_source for config.SCAN_BAR_LOOKBACK and
+    gets 17 calendar days. The live path used to carry its own literal 12,
+    which is about 9 trading sessions against the download path's 14 - and
+    the relative-volume gate medians across exactly those sessions.
+    Measured on 2026-09-13, the gate's verdict differed on 7 of 40 symbols
+    depending on which path supplied the bars.
+
+    Falls back to `fallback` if the interval cannot be translated, because
+    a feed that will not start is worse than one with a slightly different
+    window.
+    """
+    import market_source
+
+    try:
+        return int(market_source.calendar_days(config.SCAN_BAR_LOOKBACK,
+                                               fallback))
+    except Exception as exc:
+        logger.warning("Could not derive the history window from %s (%s); "
+                       "using %d days", config.SCAN_BAR_LOOKBACK, exc,
+                       fallback)
+        return fallback
+
+
+def history_window(days: "int | None" = None) -> tuple:
     """A prior-session window that ENDS YESTERDAY, so it caches all day.
 
     The point is stability. A window ending today changes every session and
     misses the parquet cache every morning; ending yesterday means one fetch
     and then no network for the rest of the day.
     """
+    days = history_days() if days is None else days
     yesterday = datetime.now(IST).date() - timedelta(days=1)
     return yesterday - timedelta(days=max(1, days)), yesterday
 
 
-def prewarm(symbols: list, days: int = 12,
+def prewarm(symbols: list, days: "int | None" = None,
             interval: "str | None" = None) -> dict:
     """Fetch and cache prior-session bars once. Returns what was obtained.
 
@@ -465,7 +492,7 @@ def session_is_covered(frame, opening_minutes: int = 15) -> bool:
 
 
 def combined(symbols: list, tokens: "dict[str, int] | None" = None,
-             days: int = 12) -> dict:
+             days: "int | None" = None) -> dict:
     """Prior sessions from cache plus today from the stream, per symbol.
 
     This is what makes a scan instant: neither half touches the network on

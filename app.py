@@ -1436,6 +1436,20 @@ def render_horizon_tables(symbols: list, top: int = 20) -> None:
     anchor_live, bucket, why = horizon_anchor()
     result = load_horizon_picks(tuple(symbols), top, bucket, anchor_live)
     picks = result.get("picks") or {}
+    # THE AGE OF THE DAILY STORE, on screen rather than in a log. Trend,
+    # drawdown and position-in-range come from it, two of them are ranking
+    # columns, and the caption below says they "come from completed daily
+    # bars" - which was true and yet misleading while the store sat two
+    # sessions behind.
+    newest, missing = horizons.daily_store_lag()
+    if missing is not None and missing > horizons.DAILY_MAX_STALE_SESSIONS:
+        st.warning(
+            f"**The daily bars behind these tables stop at {newest}, "
+            f"{missing} completed session(s) ago.** Trend, drawdown and "
+            f"position in range describe that date, not today - and two of "
+            f"them are ranking columns, so the ORDER below is that old too. "
+            f"Rebuild with `python -m bar_store --intervals day`.",
+            icon=":material/update:")
     if anchor_live and result.get("live_count"):
         st.caption(
             f"Prices, stops and exits are anchored on the LIVE price for "

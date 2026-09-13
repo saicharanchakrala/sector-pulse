@@ -18,6 +18,9 @@ code to what it claims to compute.
 """
 from __future__ import annotations
 
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -25,6 +28,9 @@ import pytest
 import horizons
 
 IST = "Asia/Kolkata"
+# The tests that fix a clock need a real tzinfo; the string above is what
+# pandas wants for tz= and is kept so the rest of the file is untouched.
+IST_ZONE = ZoneInfo("Asia/Kolkata")
 
 
 def daily(closes: list, start: str = "2025-01-01") -> pd.DataFrame:
@@ -647,3 +653,190 @@ def test_the_bar_size_is_declared_once_and_fetched_at_that_size() -> None:
     # current, and the volatility behind every short-horizon plausible
     # move comes from another month.
     assert config.HORIZON_SHORT_INTERVAL == kite
+
+# --- the sweep and assess_daily must agree, exactly ----------------------
+#
+# assess_universe slices closes out of one long frame; assess_daily
+# extracts them from a per-symbol frame. Both call _assess_series, so they
+# agree by construction - and this is the test that says so out loud,
+# because "by construction" is an argument and equality is a fact.
+
+def test_the_sweep_matches_a_loop_over_assess_daily(monkeypatch) -> None:
+    import bar_store
+
+    rng = np.random.default_rng(11)
+    symbols = [f"S{i}" for i in range(12)]
+    frames = {}
+    rows = []
+    days = pd.date_range("2024-01-01", periods=300, freq="B", tz=IST)
+    for symbol in symbols + ["NIFTY 50"]:
+        closes = 100.0 * np.cumprod(1 + rng.normal(0.0004, 0.012, len(days)))
+        frame = pd.DataFrame({"Open": closes, "High": closes * 1.01,
+                              "Low": closes * 0.99, "Close": closes,
+                              "Volume": 1e6}, index=days)
+        frames[symbol] = frame
+        block = frame.reset_index().rename(columns={"index": "stamp"})
+        block["symbol"] = symbol
+        rows.append(block)
+    long = pd.concat(rows, ignore_index=True).sort_values(
+        ["symbol", "stamp"], kind="stable", ignore_index=True)
+
+    monkeypatch.setattr(bar_store, "load_long",
+                        lambda *a, **k: long)
+    swept = horizons.assess_universe(symbols, top=len(symbols))
+
+    for name, ranked in swept.items():
+        for assessment in ranked:
+            direct = horizons.assess_daily(
+                assessment.symbol, frames[assessment.symbol], name,
+                frames["NIFTY 50"])
+            assert direct is not None, assessment.symbol
+            # `score` is deliberately absent: rank() assigns it from the
+            # whole cohort's percentile ranks, so a lone assess_daily call
+            # has no cohort and scores 0.0. It is comparable within a run,
+            # never between one symbol and a sweep.
+            for field in ("price", "trend", "relative", "volatility",
+                          "drawdown", "position_in_range", "expected_move",
+                          "cost_pct", "cost_multiple"):
+                a, b = getattr(direct, field), getattr(assessment, field)
+                assert a == b or (a != a and b != b), (
+                    f"{assessment.symbol} {name} {field}: {a} vs {b}")
+            assert direct.direction == assessment.direction
+
+
+def test_a_symbol_with_dirty_closes_is_cleaned_the_same_way_in_both_paths(
+        monkeypatch) -> None:
+    # The cleaning - nulls, non-finite, non-positive - happens in
+    # assess_daily for one path and in the sweep for the other. If they
+    # ever diverge, a zero close sets `low` and moves position_in_range,
+    # which is scored.
+    import bar_store
+
+    days = pd.date_range("2024-01-01", periods=300, freq="B", tz=IST)
+    closes = np.linspace(100.0, 160.0, len(days))
+    closes[5] = np.nan
+    closes[9] = 0.0
+    closes[17] = -3.0
+    frame = pd.DataFrame({"Open": closes, "High": closes, "Low": closes,
+                          "Close": closes, "Volume": 1e6}, index=days)
+    bench = pd.DataFrame({"Open": 100.0, "High": 100.0, "Low": 100.0,
+                          "Close": np.linspace(100.0, 110.0, len(days)),
+                          "Volume": 1e6}, index=days)
+    rows = []
+    for symbol, source in (("X", frame), ("NIFTY 50", bench)):
+        block = source.reset_index().rename(columns={"index": "stamp"})
+        block["symbol"] = symbol
+        rows.append(block)
+    long = pd.concat(rows, ignore_index=True).sort_values(
+        ["symbol", "stamp"], kind="stable", ignore_index=True)
+    monkeypatch.setattr(bar_store, "load_long", lambda *a, **k: long)
+
+    swept = horizons.assess_universe(["X"], top=1)["mid"]
+    direct = horizons.assess_daily("X", frame, "mid", bench)
+    assert swept and direct is not None
+    assert swept[0].position_in_range == direct.position_in_range
+    assert swept[0].volatility == direct.volatility
+
+
+# --- the daily store's own age ------------------------------------------
+#
+# FOUND BY AN INDEPENDENT REVIEW on 2026-09-13. _usable_fine refuses a
+# stale INTRADAY store; the DAILY store had no guard at all, and trend,
+# drawdown and position-in-range all come from it - two of them ranking
+# columns. Measured that day: bars_day.parquet's newest session was
+# 2026-09-09 while the caption said the readings "come from completed
+# daily bars".
+
+def _daily_long(last_day: str):
+    stamps = pd.date_range("2026-08-01", last_day, freq="B", tz=IST)
+    return pd.DataFrame({
+        "stamp": list(stamps) * 2,
+        "symbol": ["A"] * len(stamps) + ["B"] * len(stamps),
+        "Open": 1.0, "High": 1.0, "Low": 1.0, "Close": 1.0, "Volume": 1,
+    })
+
+
+def test_the_lag_is_counted_in_sessions_not_calendar_days() -> None:
+    # The case that slipped through a day-based threshold: a Sunday, four
+    # calendar days after the store's newest bar, is TWO missed sessions.
+    sunday = datetime(2026, 9, 13, 10, 0, tzinfo=IST_ZONE)
+    newest, missing = horizons.daily_store_lag(_daily_long("2026-09-09"),
+                                               now=sunday)
+    assert newest == date(2026, 9, 9)
+    assert missing == 2, "the 10th and 11th are both missing"
+    assert missing > horizons.DAILY_MAX_STALE_SESSIONS
+
+
+def test_a_current_store_is_not_flagged() -> None:
+    # After Friday's close, a store holding Friday is current.
+    friday_evening = datetime(2026, 9, 11, 17, 0, tzinfo=IST_ZONE)
+    _, missing = horizons.daily_store_lag(_daily_long("2026-09-11"),
+                                          now=friday_evening)
+    assert missing == 0
+
+
+def test_during_a_session_todays_bar_is_not_yet_expected() -> None:
+    # At 11:00 the session has not closed, so yesterday's close is the
+    # newest COMPLETED one and a store holding it is not behind.
+    midday = datetime(2026, 9, 11, 11, 0, tzinfo=IST_ZONE)
+    _, missing = horizons.daily_store_lag(_daily_long("2026-09-10"),
+                                          now=midday)
+    assert missing == 0
+    assert horizons.last_completed_session(midday) == date(2026, 9, 10)
+
+
+def test_an_empty_or_missing_store_says_so_rather_than_guessing() -> None:
+    assert horizons.daily_store_lag(pd.DataFrame()) == (None, None)
+
+
+def test_the_weekend_is_not_counted_as_missed_sessions() -> None:
+    monday = datetime(2026, 9, 14, 10, 0, tzinfo=IST_ZONE)
+    _, missing = horizons.daily_store_lag(_daily_long("2026-09-11"),
+                                          now=monday)
+    # Friday's close is the newest completed session on a Monday morning.
+    assert missing == 0
+
+
+# --- the daily horizons are long-only, and now say so --------------------
+#
+# THE CONTRADICTION THIS PINS. assess_daily sets direction to SHORT
+# precisely when relative < 0, and gate_lines then requires relative > 0.
+# Every SHORT therefore fails by construction - while rank() scored it
+# monotonically in `relative`, so the strongest short sorted LAST, and
+# to_frame still printed a stop and an exit beside it. A verdict the
+# system can never approve, dressed as a trade ticket.
+
+def _short_assessment():
+    return horizons.Assessment(
+        symbol="WEAK", horizon="short", price=100.0, direction="SHORT",
+        trend=-5.0, relative=-5.0, volatility=20.0, drawdown=-8.0,
+        position_in_range=0.2, expected_move=3.0, cost_pct=0.23,
+        cost_multiple=13.0, reasons=[], blocked="")
+
+
+def test_a_short_row_carries_no_levels() -> None:
+    frame = horizons.to_frame([_short_assessment()])
+    row = frame.iloc[0]
+    assert row["Stop loss at"] is None or row["Stop loss at"] != row["Stop loss at"]
+    assert row["Exit price"] is None or row["Exit price"] != row["Exit price"]
+    assert "not evaluated" in str(row["View"])
+
+
+def test_a_long_row_still_carries_its_levels() -> None:
+    strong = horizons.Assessment(
+        symbol="STRONG", horizon="short", price=100.0, direction="LONG",
+        trend=5.0, relative=5.0, volatility=20.0, drawdown=-2.0,
+        position_in_range=0.8, expected_move=3.0, cost_pct=0.23,
+        cost_multiple=13.0, reasons=[], blocked="")
+    row = horizons.to_frame([strong]).iloc[0]
+    assert row["View"] == "LONG"
+    assert row["Stop loss at"] == pytest.approx(strong.stop_price, abs=0.01)
+
+
+def test_the_short_gate_line_says_no_opinion_not_needs_to_be_ahead() -> None:
+    # "needs to be ahead" is nonsense advice for a short, and reads as a
+    # near miss rather than a category the system does not cover.
+    lines = horizons.gate_lines(_short_assessment(), turnover=1e9)
+    text = " ".join(lines if isinstance(lines, list) else lines[1])
+    assert "only evaluates LONG" in text
+    assert "NO OPINION" in text

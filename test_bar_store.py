@@ -219,3 +219,78 @@ def test_an_unparseable_span_falls_back_to_mtime(cache) -> None:
     names = [p.name for _, p in bar_store._source_files("day")]
     assert names[-1].endswith("legacy.parquet")
     assert bar_store._span_end("legacy.parquet") == ""
+
+# --- the long frame, and the bounds that make it usable ------------------
+#
+# WHY THIS API EXISTS. Building a DataFrame per symbol is the entire cost
+# of a universe read: measured on the real daily store, 545,730 rows for
+# 2,285 symbols came off disk in 0.38s and took 6.7s to become 2,285
+# frames. The sweep only wants closes and dates, so it should never pay
+# that. These tests pin the equality that makes the cheap path safe.
+
+def test_load_long_returns_one_frame_sorted_by_symbol_then_stamp(cache) -> None:
+    write_cached(cache, "BBB", "day", "20260101_20260105",
+                 ["2026-01-02", "2026-01-01"], close=50.0)
+    write_cached(cache, "AAA", "day", "20260101_20260105",
+                 ["2026-01-02", "2026-01-01"], close=10.0)
+    bar_store.rebuild("day", verbose=False)
+    long = bar_store.load_long("day")
+    assert list(long["symbol"]) == ["AAA", "AAA", "BBB", "BBB"]
+    stamps = list(long["stamp"])
+    assert stamps[0] < stamps[1] and stamps[2] < stamps[3]
+
+
+def test_slicing_the_long_frame_reproduces_load_exactly(cache) -> None:
+    for symbol, close in (("AAA", 10.0), ("BBB", 50.0), ("CCC", 7.5)):
+        write_cached(cache, symbol, "day", "20260101_20260110",
+                     ["2026-01-01", "2026-01-02", "2026-01-05"], close=close)
+    bar_store.rebuild("day", verbose=False)
+    frames = bar_store.load("day")
+    long = bar_store.load_long("day")
+    bounds = bar_store.slice_bounds(long)
+    assert set(bounds) == set(frames)
+    for symbol, (begin, stop) in bounds.items():
+        block = long.iloc[begin:stop]
+        assert len(block) == len(frames[symbol]), symbol
+        for column in ("Open", "High", "Low", "Close", "Volume"):
+            assert list(block[column]) == list(frames[symbol][column]), (
+                f"{symbol}.{column} differs between the two paths")
+        assert list(block["stamp"]) == list(frames[symbol].index), symbol
+
+
+def test_slice_bounds_covers_every_row_exactly_once(cache) -> None:
+    # Gaps or overlaps here would silently hand one symbol another's bars.
+    for symbol in ("AAA", "BBB", "CCC"):
+        write_cached(cache, symbol, "day", "20260101_20260110",
+                     ["2026-01-01", "2026-01-02"])
+    bar_store.rebuild("day", verbose=False)
+    long = bar_store.load_long("day")
+    spans = sorted(bar_store.slice_bounds(long).values())
+    assert spans[0][0] == 0
+    assert spans[-1][1] == len(long)
+    for (_, stop), (begin, _) in zip(spans, spans[1:]):
+        assert stop == begin, "the bounds leave a gap or overlap"
+
+
+def test_the_long_frame_honours_the_same_filters_as_load(cache) -> None:
+    for symbol in ("AAA", "BBB"):
+        write_cached(cache, symbol, "day", "20260101_20260110",
+                     ["2026-01-01", "2026-01-05", "2026-01-09"])
+    bar_store.rebuild("day", verbose=False)
+    long = bar_store.load_long("day", symbols=["AAA"],
+                              start=date(2026, 1, 5), end=date(2026, 1, 5))
+    assert set(long["symbol"]) == {"AAA"}
+    assert [str(s)[:10] for s in long["stamp"]] == ["2026-01-05"]
+    frames = bar_store.load("day", symbols=["AAA"],
+                            start=date(2026, 1, 5), end=date(2026, 1, 5))
+    assert len(frames["AAA"]) == len(long)
+
+
+def test_an_absent_store_gives_an_empty_frame_not_a_crash(cache) -> None:
+    # load() answers {}; load_long() answers a frame, so a caller can treat
+    # the result as a frame unconditionally.
+    empty = bar_store.load_long("day")
+    assert empty.empty
+    assert list(empty.columns)[:2] == ["stamp", "symbol"]
+    assert bar_store.slice_bounds(empty) == {}
+    assert bar_store.slice_bounds(None) == {}

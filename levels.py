@@ -91,6 +91,23 @@ class TradeLevels:
         exactly what happens when the stop is tight - the real bar climbs
         fast. Returns 1.0 when costs exceed the whole reward, meaning the
         trade cannot break even at any win rate.
+
+        THE ASSUMPTION, WHICH THIS SYSTEM BREAKS. The formula treats every
+        non-winner as a full loss of `risk`. That is right for a trade held
+        strictly to its stop or its target, and wrong for this one: the
+        intraday scanner squares off at the close, so a position that
+        reaches neither level exits at whatever the market is then.
+
+        Measured over 93 sessions and 2,436 signals: 280 reached the
+        target, 782 stopped out, and 1,374 - 56%, the majority - ended at
+        NEITHER, averaging +0.24R rather than -1R. Counting those as full
+        losses overstates the bar this column reports, which for a tool
+        whose purpose is refusing trades means refusing too many.
+
+        It is left as it is, because the arithmetic is correct for what it
+        states and the alternative is a fitted constant that would move
+        with every regime. What changed is that the assumption is now
+        written down, here and in the column's own tooltip.
         """
         if self.lot_risk <= 0.0:
             return 1.0

@@ -312,19 +312,32 @@ def _cache_is_stale(path, frame, end: date, resolved: str,
     further is coming. Comparing against a bare now() refetched the entire
     universe every evening.
     """
-    if end < date.today():
-        return False
-    limit = min(2 * _interval_seconds(resolved) + 60,
-                config.CACHE_TODAY_MAX_AGE_SECONDS)
     now = now or datetime.now(IST)
     close_hour, close_minute = config.SCAN_SESSION_CLOSE
-    close = now.replace(hour=close_hour, minute=close_minute, second=0,
-                        microsecond=0)
-    reference = min(now, close)
     try:
         written = datetime.fromtimestamp(path.stat().st_mtime, IST)
     except OSError:
         return False
+    # "Today" is taken from the reference clock, not from date.today(): a
+    # caller that supplies `now` supplies the whole clock, and mixing the
+    # two made the tests for this function pass on the day they were
+    # written and fail the next morning.
+    if end < now.date():
+        # A PAST span is settled only if the file was captured after that
+        # date's close. One written DURING the day stops wherever the
+        # fetch reached, and treating it as history freezes a truncated
+        # session for ever: measured on 2026-09-13, the 25 Aug - 11 Sep
+        # files held nothing after 10 Sep 15:12, because they were written
+        # at 09:23 on the 11th. A study of the 11th read them and found no
+        # bars for the day it was studying.
+        end_close = datetime(end.year, end.month, end.day, close_hour,
+                             close_minute, tzinfo=IST)
+        return written < end_close
+    limit = min(2 * _interval_seconds(resolved) + 60,
+                config.CACHE_TODAY_MAX_AGE_SECONDS)
+    close = now.replace(hour=close_hour, minute=close_minute, second=0,
+                        microsecond=0)
+    reference = min(now, close)
     if (reference - written).total_seconds() <= limit:
         return False
     newest = None

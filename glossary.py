@@ -82,7 +82,12 @@ COLUMNS = {
     "Round trip": "Charges to get in and out once, as a percentage. You "
                   "start this far behind on every trade.",
     "Win % needed": "How often this trade must work just to break even "
-                    "after charges. Above about 55% is not realistic.",
+                    "after charges, ASSUMING you always exit at the stop "
+                    "or the target. This scanner squares off at the close "
+                    "instead, and measured over 93 sessions 56% of trades "
+                    "reached neither level and averaged a small GAIN - so "
+                    "the real bar is lower than this figure. Above about "
+                    "55% is not realistic either way.",
     "Can pay for itself?": "'no' means the charges are so large relative "
                            "to the likely move that being right about "
                            "direction still would not make money.",

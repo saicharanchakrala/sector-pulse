@@ -587,3 +587,52 @@ def test_an_empty_builder_still_has_the_right_columns() -> None:
     frame = live_bars.BarBuilder().snapshot()
     assert frame.empty
     assert list(frame.columns) == live_bars.BarBuilder.EMPTY_COLUMNS
+
+# --- one lookback for prior sessions, not one per path -------------------
+
+def test_the_history_window_comes_from_the_same_config_as_a_download(
+        ) -> None:
+    """THE BUG THIS PINS, measured on 2026-09-13 over 40 F&O names.
+
+    The download path asks market_source for config.SCAN_BAR_LOOKBACK and
+    gets 17 calendar days, about 14 trading sessions. The live path
+    carried its own literal 12 calendar days, about 9. The
+    relative-volume gate medians across exactly those prior sessions, so
+    the two paths disagreed on the verdict for 7 of 40 symbols -
+    ADANIPORTS passed on one and failed on the other - with nothing on
+    screen to say which bars had been used.
+    """
+    import market_source
+
+    assert live_bars.history_days() == market_source.calendar_days(
+        config.SCAN_BAR_LOOKBACK, 12)
+    # And the window actually used follows it.
+    start, end = live_bars.history_window()
+    assert (end - start).days == live_bars.history_days()
+
+
+def test_the_window_still_ends_yesterday() -> None:
+    # The property that makes the cache hit all day: a window ending today
+    # changes every session and misses every morning.
+    from datetime import datetime as dt
+    _, end = live_bars.history_window()
+    assert end == dt.now(IST).date() - timedelta(days=1)
+
+
+def test_an_explicit_window_still_wins() -> None:
+    # --history-days exists for a reason; deriving the default must not
+    # take the override away.
+    start, end = live_bars.history_window(3)
+    assert (end - start).days == 3
+
+
+def test_no_path_carries_its_own_history_literal() -> None:
+    # The whole point: the number exists once. This is the same class of
+    # fault as the fetch interval that was fixed on 11 September - two
+    # paths, one fact, two literals.
+    import inspect
+
+    for function in (live_bars.history_window, live_bars.prewarm,
+                     live_bars.combined):
+        default = inspect.signature(function).parameters["days"].default
+        assert default is None, (function.__name__, default)

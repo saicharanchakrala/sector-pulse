@@ -25,6 +25,7 @@ import os
 from datetime import date, datetime
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
@@ -170,9 +171,27 @@ def load(interval: str = "day", symbols: "list | None" = None,
     Filters are pushed into the parquet read where possible so a request for
     twenty symbols does not decompress two thousand.
     """
+    frame = _read_store(interval, symbols, start, end)
+    if frame is None or frame.empty:
+        return {}
+    out = {}
+    for symbol, group in frame.groupby("symbol", observed=True):
+        block = group.drop(columns=["symbol"]).set_index("stamp").sort_index()
+        block.index = pd.DatetimeIndex(block.index)
+        out[str(symbol)] = block
+    return out
+
+
+def _read_store(interval: str, symbols, start, end) -> "pd.DataFrame | None":
+    """The filtered long frame for one interval, or None when there is none.
+
+    Split out of load() so load() and load_long() cannot drift: every
+    subtlety below - the localised bounds, the strictly-before end, the
+    retry that refuses to over-serve - applies to both or to neither.
+    """
     path = store_path(interval)
     if not path.exists():
-        return {}
+        return None
     filters = []
     if symbols:
         filters.append(("symbol", "in", set(symbols)))
@@ -198,7 +217,7 @@ def load(interval: str = "day", symbols: "list | None" = None,
             frame = pd.read_parquet(path, filters=symbol_only or None)
         except Exception as inner:
             logger.warning("Could not read %s: %s", path.name, inner)
-            return {}
+            return None
         if frame is not None and not frame.empty:
             try:
                 stamps = pd.DatetimeIndex(frame["stamp"])
@@ -223,15 +242,51 @@ def load(interval: str = "day", symbols: "list | None" = None,
                 logger.warning("Could not apply date bounds to %s (%s); "
                                "refusing to return unbounded rows",
                                path.name, exc)
-                return {}
+                return None
+    return frame
+
+
+def load_long(interval: str = "day", symbols: "list | None" = None,
+              start: "date | None" = None,
+              end: "date | None" = None) -> pd.DataFrame:
+    """Every requested bar in ONE frame: stamp, symbol, OHLCV.
+
+    Sorted by symbol then stamp, so a caller takes contiguous slices per
+    symbol without sorting again.
+
+    WHY THIS EXISTS. load() returns a frame per symbol, and building those
+    IS the cost of a universe read: measured on the daily store, 545,730
+    rows for 2,285 symbols came off disk in 0.38s and then took 6.7s to
+    become 2,285 DataFrames. A caller that only needs closes and dates -
+    which the horizon sweep does - should not pay that.
+
+    Returns an empty frame rather than {} when there is nothing, so a
+    caller can treat the result as a frame unconditionally.
+    """
+    frame = _read_store(interval, symbols, start, end)
     if frame is None or frame.empty:
+        return pd.DataFrame(columns=["stamp", "symbol"] + list(OHLCV))
+    return frame.sort_values(["symbol", "stamp"], kind="stable",
+                             ignore_index=True)
+
+
+def slice_bounds(long_frame: pd.DataFrame) -> dict:
+    """{symbol: (start, stop)} positional bounds into a sorted long frame.
+
+    The reason load_long sorts: one pass over the symbol column gives every
+    symbol's span, and the caller then slices numpy arrays with them at no
+    allocation cost.
+    """
+    if long_frame is None or long_frame.empty:
         return {}
-    out = {}
-    for symbol, group in frame.groupby("symbol", observed=True):
-        block = group.drop(columns=["symbol"]).set_index("stamp").sort_index()
-        block.index = pd.DatetimeIndex(block.index)
-        out[str(symbol)] = block
-    return out
+    symbols = long_frame["symbol"].to_numpy()
+    # Vectorised rather than a Python loop over every row: the loop was
+    # 0.46s of the 0.97s this path costs, for work numpy does in one pass.
+    changes = np.flatnonzero(symbols[1:] != symbols[:-1]) + 1
+    starts = np.concatenate(([0], changes))
+    stops = np.concatenate((changes, [len(symbols)]))
+    return {str(symbols[begin]): (int(begin), int(stop))
+            for begin, stop in zip(starts, stops)}
 
 
 def status(interval: str = "day") -> dict:

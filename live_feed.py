@@ -55,8 +55,12 @@ def parse_args(argv=None) -> argparse.Namespace:
                         help="stop after N minutes (0 runs until interrupted)")
     parser.add_argument("--flush-every", type=int, default=20,
                         help="seconds between parquet flushes (default: 20)")
-    parser.add_argument("--history-days", type=int, default=12,
-                        help="prior calendar days to prewarm (default: 12)")
+    # No literal default: the window comes from config through
+    # live_bars.history_days(), so the feed and a download agree on how
+    # many prior sessions the relative-volume baseline is taken over.
+    parser.add_argument("--history-days", type=int, default=0,
+                        help="prior calendar days to prewarm "
+                             "(default: from config.SCAN_BAR_LOOKBACK)")
     parser.add_argument("--prewarm-only", action="store_true",
                         help="fetch and cache prior sessions, then exit")
     return parser.parse_args(argv)
@@ -220,10 +224,11 @@ def main(argv=None) -> int:
         return 1
     print(f"universe: {len(symbols)} symbols")
 
-    print(f"prewarming {args.history_days} prior days (once, cached)...")
+    history_days = args.history_days or live_bars.history_days()
+    print(f"prewarming {history_days} prior days (once, cached)...")
     started = time.time()
-    history = live_bars.prewarm(symbols, days=args.history_days)
-    start, end = live_bars.history_window(args.history_days)
+    history = live_bars.prewarm(symbols, days=history_days)
+    start, end = live_bars.history_window(history_days)
     print(f"  {len(history)}/{len(symbols)} symbols have prior bars "
           f"({start} .. {end}) in {time.time() - started:.0f}s")
     if args.prewarm_only:
