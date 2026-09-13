@@ -402,6 +402,14 @@ def test_bars_refetches_a_stale_today_cache(tmp_path, monkeypatch) -> None:
         calls.append(token)
         return _bar_frame(["2026-09-11 15:00"])
 
+    # Pin the close AHEAD of now, so the rule's reference clock is `now`
+    # rather than min(now, close). Without this the "five hours ago"
+    # below lands after 15:30 whenever the suite runs later than about
+    # 20:30; the rule then correctly calls the file fresh and the test
+    # fails for the hour it was run rather than for anything about the
+    # code. The after-close branch has its own test, which injects a
+    # clock instead of reading one.
+    monkeypatch.setattr(config, "SCAN_SESSION_CLOSE", (23, 59))
     monkeypatch.setattr(market_source, "CACHE_DIR", tmp_path)
     monkeypatch.setattr(market_source.kite_client, "historical",
                         fake_historical)
