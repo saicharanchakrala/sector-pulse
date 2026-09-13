@@ -10,9 +10,9 @@ Two tabs, two unrelated systems:
                      gate). Each prices the trade - round-trip cost and
                      whether the plausible move covers it - and ranks the
                      top 20. It is a cost and risk screen, NOT a forecast:
-                     measured AUC 0.5205 against 0.5165 for the same model
+                     measured AUC 0.5176 against 0.4859 for the same model
                      on shuffled labels, and at the daily horizons the
-                     selection was worse than equal-weighting.
+                     selection was worse than equal-weighting at all three.
 
 They share no thresholds and no data. Educational tool - not financial advice.
 """
@@ -2485,32 +2485,35 @@ def render_scan_tab() -> None:
             "model, and no threshold is shared between the two."
         )
         st.caption(
-            "From a RECORDED RUN, not from the code as it stands today: "
-            "gradient-boosted model, 32 features, 760,458 samples, purged "
-            "walk-forward with an embargo. Ranking accuracy (AUC) 0.5205 "
-            "against 0.5165 for the same model on shuffled labels, where "
-            "0.50 is a coin flip. Best geometry net -0.009 R per trade; "
-            "exact permutation p 0.091 over 10 shuffles, whose floor is "
-            "0.091, so it could not show significance at all. 0 of 12 "
-            "geometries profitable."
+            f"Measured on 13 September 2026 against the code as it stands, "
+            f"not transcribed from an older run: gradient-boosted model, "
+            f"{_forecast_feature_count()} features, 760,458 samples across "
+            f"210 stocks and 228 sessions, purged walk-forward with an "
+            f"embargo. Ranking accuracy (AUC) 0.5176, against 0.4859 for "
+            f"the same model on shuffled labels, where 0.50 is a coin "
+            f"flip. Chosen geometry net -0.391 R per trade. Exact "
+            f"permutation p 0.871 over {_forecast_permutations()} "
+            f"shuffles - 26 of them beat the real model. 0 of 12 "
+            f"geometries profitable, and every confidence interval but "
+            f"one sits entirely below zero."
         )
         st.caption(
-            f"**Those figures have drifted from the code, and the gap is "
-            f"now wider than a recount.** forecast_intraday.py carries "
-            f"{_forecast_feature_count()} features and "
-            f"{_forecast_permutations()} shuffles against the 32 and 10 "
-            f"above. Since that run, four things changed that move the "
-            f"measurement itself, not just its size: the bar ATR was "
-            f"averaging roughly one prior session rather than fourteen, "
-            f"and it sets every stop, target and label; relative strength "
-            f"subtracted the index measured from a different baseline; "
-            f"cost was a flat constant that only held at a one-lakh ticket "
-            f"and charged nothing for slippage; and the shuffled null "
-            f"permuted labels inside each day, which preserves that day's "
-            f"base rate and so was never the coin flip it was described "
-            f"as. Every number in the paragraph above predates those "
-            f"fixes. Treat it as a record of what was measured once, not "
-            f"as a statement about this code, until it is re-run."
+            "Why the gap cannot be closed by a better model: at the "
+            "chosen geometry the base hit rate is 27.9% and the rate "
+            "needed to clear costs is 42.0%, a gap of 14 points. The "
+            "model's whole edge over a coin flip is under 2 points of "
+            "AUC. The arithmetic is the binding constraint, not the "
+            "learning."
+        )
+        st.caption(
+            "Two things still open in that measurement, stated rather "
+            "than buried. The shuffled null selects 357 trades against "
+            "the real model's 2,137, so their mean R figures are not "
+            "strictly comparable and the permutation p inherits that. "
+            "And the null's AUC sits at 0.4859 when a true shuffle "
+            "should centre on 0.50 - consistently, across all 30 "
+            "shuffles. That is unexplained, and until it is, the +0.032 "
+            "AUC gap above should be read as an upper bound."
         )
     render_live_feed_panel()
     capital, risk_pct, scope, want_options, as_of, run = render_scan_controls()

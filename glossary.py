@@ -217,13 +217,15 @@ CONCEPTS = {
         "answers for the same stock, because a stock can be strong this "
         "fortnight and weak over the year.",
     "Why this tool will not predict for you":
-        "We tested it properly. Four holding periods, about 855,000 past "
+        "We tested it properly. Four holding periods, about 875,000 past "
         "examples, using a model free to find any pattern it liked. It "
         "performed the same as the identical model trained on deliberately "
-        "SCRAMBLED answers - and over a year, the scrambled version did "
-        "better. So the ordering carries no forecasting power. What does "
-        "hold up is the arithmetic: what a trade costs, how far the stock "
-        "is likely to move, and whether the second covers the first.",
+        "SCRAMBLED answers - and over three months and over a year, the "
+        "scrambled version did better. Buying every stock equally beat our "
+        "picks at every holding period we tested. So the ordering carries "
+        "no forecasting power. What does hold up is the arithmetic: what a "
+        "trade costs, how far the stock is likely to move, and whether the "
+        "second covers the first.",
     "What the pivot levels are":
         "Every broker shows the same seven numbers, worked out from "
         "yesterday's high, low and close: a central pivot, three levels "

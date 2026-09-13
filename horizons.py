@@ -73,12 +73,14 @@ HORIZONS = {
 
 HONESTY = (
     "**This list is not a prediction, and we tested that properly.** We ran "
-    "the same method on about 855,000 past examples. It picked winners no "
+    "the same method on about 875,000 past examples. It picked winners no "
     "better than the identical method fed deliberately scrambled answers - "
-    "and over a one-year holding period, the scrambled version actually did "
-    "better. Simply buying every stock equally beat our picks at all three "
-    "holding periods. So read the order as 'what the numbers look like "
-    "today', never as 'these are the good ones'."
+    "and over three months and over a year, the scrambled version actually "
+    "did better. Simply buying every stock equally beat our picks at all "
+    "three holding periods, by 0.06, 0.09 and 5.5 percentage points. Over "
+    "a year our ranking scored 0.47 where a coin flip is 0.50. So read the "
+    "order as 'what the numbers look like today', never as 'these are the "
+    "good ones'."
 )
 
 # The same finding for anyone who wants the figures rather than the plain

@@ -12,7 +12,7 @@ about arithmetic, not forecasts:
 
   * The cost columns are arithmetic and have held up under measurement.
   * The ranking has not. Four horizons were tested on this project's own
-    data across roughly 855,000 samples and none showed predictive skill;
+    data across roughly 875,000 samples and none showed predictive skill;
     at short, mid and long the model's selection scored WORSE than buying
     the same universe equally weighted.
 

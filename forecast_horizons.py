@@ -43,10 +43,11 @@ OUT_DIR.mkdir(exist_ok=True)
 warnings.filterwarnings("ignore")
 
 # A permutation p-value must be (1 + beats) / (1 + shuffles), never
-# beats/shuffles. With 10 shuffles the smallest ATTAINABLE p is 1/11 =
-# 0.091, so reporting 0.0000 when no shuffle wins claims a precision the
-# test cannot deliver - and 0.091 does not clear 0.05, which reverses the
-# conclusion. The +1 counts the observed statistic as one of its own
+# beats/shuffles. The smallest ATTAINABLE p is 1/(1 + shuffles), so with
+# the 10 this once used it was 0.091 - which does not clear 0.05, meaning
+# no result could have been significant however strong. At the 30 set
+# below the floor is 0.032. Reporting 0.0000 when no shuffle wins claims a
+# precision the test cannot deliver. The +1 counts the observed statistic as one of its own
 # reference draws, which is what makes the test exact.
 
 SP = OUT_DIR
