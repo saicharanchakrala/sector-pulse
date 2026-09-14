@@ -44,6 +44,7 @@ import position_watch
 import scan_data
 import instruments
 import option_history
+import filings
 import glossary
 import horizons
 import instrument_report
@@ -1110,6 +1111,40 @@ def render_scan_option_picks(actionable: list[setups.Setup]) -> None:
                 st.caption(f"- {reason}")
 
 
+def render_recent_filings(symbol: str, as_of=None) -> None:
+    """Any exchange filing on this symbol in the last half hour.
+
+    CONTEXT, NOT A SIGNAL, and the caption says so in as many words. The
+    measurement is unambiguous: trades taken after a material filing
+    resolved at 29.6% against 30.6% for trades with no filing, so this
+    must never read as a reason to take the trade. What DOES replicate out
+    of sample is that filings raise volatility - which makes the stop
+    tighter and the plausible move larger than the fourteen-session ATR
+    behind them assumes, and that is a reason for a human to be careful.
+
+    Silence here is only meaningful if the store is current, so a stale
+    store says so rather than implying there is no news.
+    """
+    try:
+        note = filings.note_for(symbol, now=as_of)
+        age = filings.store_age()
+    except Exception as exc:
+        logger.warning("Filings lookup failed for %s: %s", symbol, exc)
+        return
+    if age is None:
+        return
+    newest, behind = age
+    if behind > 1:
+        st.caption(
+            f":material/history: Filings shown are only as current as the "
+            f"store, whose newest record is {newest} - {behind} days back. "
+            f"Rebuild with `python fetch_announcements.py` before reading "
+            f"silence here as 'no news'.")
+        return
+    if note:
+        st.caption(f":material/campaign: {note}")
+
+
 def render_scan_results(ranked: list[setups.Setup], bars: scan_data.BarSet,
                         benchmark, now: datetime, want_options: bool,
                         replaying: bool = False,
@@ -1259,6 +1294,7 @@ def render_scan_results(ranked: list[setups.Setup], bars: scan_data.BarSet,
                                           if "[FAIL]" not in r])
                 for reason in ordered:
                     st.caption(reason)
+                render_recent_filings(setup.symbol, now)
 
     if want_options and actionable:
         if replaying:
