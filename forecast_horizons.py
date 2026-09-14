@@ -189,7 +189,7 @@ def run_horizon(data: pd.DataFrame, name: str, span: int, features: list,
     frame["label"] = (frame[target] > 0).astype(int)
     dates = sorted(frame["date"].unique())
     out = []
-    for train_dates, test_dates in folds_for(dates, span):
+    for fold, (train_dates, test_dates) in enumerate(folds_for(dates, span)):
         train = frame[frame["date"].isin(set(train_dates))]
         test = frame[frame["date"].isin(set(test_dates))]
         if train.empty or test.empty:
@@ -205,6 +205,7 @@ def run_horizon(data: pd.DataFrame, name: str, span: int, features: list,
                       f"raw_{name}", f"bench_{name}"]].copy()
         raw = model.predict_proba(
             test[features].to_numpy(dtype=np.float32))[:, 1]
+        block["fold"] = fold
         block["p"] = iso.predict(raw)
         block["label"] = test["label"].to_numpy()
         out.append(block)
@@ -282,8 +283,17 @@ def evaluate(frame: pd.DataFrame, name: str, label: str) -> dict:
                 f"observations, below the floor of 5")
     everything, e_lo, e_hi, _ = date_bootstrap(
         universe.to_numpy(), universe.index.to_numpy(), block_size=span)
-    auc = (roc_auc_score(frame["label"], frame["p"])
-           if frame["label"].nunique() > 1 else float("nan"))
+    # Scored INSIDE each fold, never pooled across them. Every fold has
+    # its own model and its own isotonic calibrator, miscalibrated by
+    # different amounts, and AUC is a pure ranking statistic - so one
+    # score over the stacked folds ranks fold 0's 0.30 against fold 2's
+    # 0.30 as though they were the same number. Measured on the intraday
+    # study, that inflated the model-versus-null gap about 2.5x, in the
+    # direction that flatters the model.
+    scored = [roc_auc_score(block["label"], block["p"])
+              for _, block in frame.groupby("fold", sort=True)
+              if block["label"].nunique() > 1] if "fold" in frame.columns else []
+    auc = float(np.mean(scored)) if scored else float("nan")
     return {
         "label": label, "rows": len(frame), "picked": len(picked),
         "dates": frame["date"].nunique(), "auc": auc,

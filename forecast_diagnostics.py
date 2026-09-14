@@ -83,17 +83,37 @@ def benchmark_changes(frame: pd.DataFrame) -> dict:
     rather than bar position, because 658 of 6,225 session-pairs in the
     cache have different bar counts and position-matching would read a
     later clock time off the benchmark.
+
+    MEASURED FROM THE PREVIOUS SESSION'S CLOSE, matching the stock. This
+    used today's FIRST BAR as the baseline while the stock's day_change_pct
+    below is taken from prev_close, so relative_strength subtracted two
+    quantities with different origins and every symbol on a given day
+    inherited a constant bias equal to the index's overnight gap. That gap
+    has a standard deviation of 0.64pp against a feature whose own spread
+    is 1.73pp.
+
+    It matters more here than in the dataset builder. There the bias shifts
+    a continuous feature; here relative_strength feeds a hard gate that is
+    a pure SIGN test (setups._strength_reason asks only whether it is
+    positive), so a constant offset flips the verdict outright on every
+    marginal name, in the same direction, all day.
+
+    The first session in the frame has no prior close and is skipped rather
+    than falling back to its own open, because a silent mixture of two
+    baselines is the thing this docstring exists to prevent.
     """
     if frame is None or frame.empty:
         return {}
     closes = frame["Close"].dropna()
     by_day: dict = {}
+    previous_close = None
     for day, series in closes.groupby(closes.index.date):
         if len(series) < 2:
+            by_day.pop(day, None)
             continue
-        first = float(series.iloc[0])
-        if first > 0:
-            by_day[day] = (series / first - 1.0) * 100.0
+        if previous_close is not None and previous_close > 0:
+            by_day[day] = (series / previous_close - 1.0) * 100.0
+        previous_close = float(series.iloc[-1])
     return by_day
 
 
