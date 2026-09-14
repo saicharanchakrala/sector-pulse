@@ -296,10 +296,15 @@ def fold_auc(frame: pd.DataFrame, truth: str = "y_long",
     errors compound into the comparison that matters:
 
         pooled     real 0.5176   null 0.4857   apparent edge +0.0319
-        per fold   real 0.5121   null 0.4996   actual edge   +0.0125
+        per fold   real 0.5121   null 0.4990   actual edge   +0.0131
 
-    The pooled reading overstates the model's ranking skill by about two
-    and a half times, in the direction that flatters it.
+    Both null figures are the mean of 30 shuffles. The pooled reading
+    overstates the model's ranking skill by about 2.4x, in the direction
+    that flatters it.
+
+    Worth reading the SPREAD and not only the mean: the real model's three
+    folds are 0.4863, 0.5143 and 0.5357, so on the first of them it ranked
+    WORSE than chance. One number hides that.
     """
     scores = []
     if frame.empty or "fold" not in frame.columns:
