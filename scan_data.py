@@ -131,7 +131,24 @@ def fetch_bars(tickers: list[str], batch_size: int = config.SCAN_BATCH_SIZE,
     if not intraday:
         intraday = _fetch(unique, end - timedelta(days=fine_days), end,
                           config.SCAN_BAR_INTERVAL)
-    daily = _fetch(unique, end - timedelta(days=coarse_days), end, "day")
+    # ENDS THE DAY BEFORE `end`, so the span is stable for the whole
+    # session and caches once instead of re-fetching every symbol every
+    # time the today-ending cache goes stale.
+    #
+    # Nothing is lost. The bar for `end` is DISCARDED twice over - once
+    # below in the cutoff filter and again in setups.measure - because a
+    # partial daily bar leaks the future into prev_close and the CPR. So
+    # the old span asked Kite for a bar, paid the request, and threw it
+    # away; the only thing it bought was a cache key that expired every
+    # CACHE_TODAY_MAX_AGE_SECONDS. Measured on 2026-09-15: 210 F&O
+    # symbols re-fetching their daily bars mid-session, which is what made
+    # a scan of an entirely streamed universe take minutes.
+    #
+    # live_bars.history_window does the same thing for intraday, and says
+    # so in the same words: a window that ends yesterday caches all day.
+    daily_end = end - timedelta(days=1)
+    daily = _fetch(unique, daily_end - timedelta(days=coarse_days),
+                   daily_end, "day")
     logger.info("Fetched %d/%d symbols", len(intraday), len(unique))
     failed = [t for t in unique if t not in intraday]
     if failed:

@@ -214,6 +214,13 @@ SCAN_COST_MULTIPLE = 3.0          # target must clear round-trip cost this many 
 # is not headroom, it is a window in which a dead feed still passes -
 # which is why this is derived and not typed.
 SCAN_LIVE_MAX_AGE_SECONDS = 2 * SCAN_BAR_SECONDS + 60
+
+# How often a tab waiting for the first automatic scan re-checks whether it
+# may run yet. The gate is only evaluated on a full script run, and its
+# reasons - the market is shut, the feed has not written a bar - clear on
+# their own with time, so without a poll a tab opened before the open just
+# sat there until someone touched a widget.
+AUTOSCAN_RECHECK_SECONDS = 20
 # The same arithmetic, applied to DOWNLOADED bars: a cached span ending
 # today may be this far behind the clock before it is refetched. Derived
 # per interval in market_source, and capped here so a daily-interval cache
@@ -225,10 +232,29 @@ CACHE_TODAY_MAX_AGE_SECONDS = 900
 # the choices offered. A refresh is a full re-scan, so the floor is well
 # above the measured scan time rather than as low as the UI could allow.
 # How many symbols the live feed subscribes to, ranked by 20-session
-# turnover. Kite caps one connection at 3,000; this leaves headroom and
-# comfortably covers everything the scan's liquidity gate could pass -
-# the illiquid tail is rejected by that gate anyway.
-FEED_UNIVERSE_SIZE = 1000
+# turnover. Kite caps one connection at 3,000.
+#
+# WIDE ON PURPOSE. At 1,000 the feed covered the F&O scopes and nothing
+# else, so "All listed equities" had to DOWNLOAD prior-session bars for
+# about 1,568 names at three a second - measured at roughly nine minutes,
+# once per session, because the history window rolls forward each day.
+#
+# 2,800 asks for more than exists: by_turnover returns the 2,479 names
+# that have daily bars to rank, and the union with the F&O set is 2,485,
+# leaving ~515 of headroom under Kite's cap.
+#
+# That covers 2,285 of the 2,568 listed equities. The remaining 283 have
+# no turnover history to rank on and still download - about 95 seconds at
+# three a second, against the nine minutes it was. They are the genuinely
+# untraded tail, and the scan's own liquidity gate rejects them anyway.
+#
+# WHAT THIS COSTS, so it is a choice and not a surprise. The feed's
+# startup prewarm now fetches prior sessions for 2,485 symbols instead of
+# 1,216, so a COLD start takes materially longer - that work simply moves
+# from the scan to the feed. It is the better place for it: the feed does
+# it once, before the open, while the scan would do it while you wait.
+# Tick volume and the bar builder's memory roughly double as well.
+FEED_UNIVERSE_SIZE = 2800
 
 SCAN_AUTO_REFRESH_SECONDS = 60
 SCAN_AUTO_REFRESH_CHOICES = (30, 60, 120, 300)
@@ -386,6 +412,25 @@ KITE_HISTORICAL_DEFAULT_SPAN = 60      # used for any interval not listed
 # Kite documents 3 requests/second for historical data. Pacing at 3/s keeps
 # a 1,500-request sweep inside the limit instead of collecting 429s.
 KITE_HISTORICAL_RATE_PER_SEC = 3.0
+
+# How many historical fetches may be IN FLIGHT at once. The rate limiter
+# meters how often a request may START; it does nothing about how long
+# Kite takes to answer, and measured on 2026-09-15 that is about 1.65s per
+# call. Issued one at a time, 210 symbols therefore took ~7 minutes while
+# the quota would have allowed ~70 seconds - the budget sat idle waiting
+# on round trips.
+#
+# Five keeps the 3-a-second gate saturated at that latency with headroom
+# for the live feed, which shares the same cross-process budget. Raising
+# it does NOT raise the request rate - _pace still meters every start -
+# it only stops the pipeline draining while replies are in transit.
+KITE_FETCH_WORKERS = 5
+
+
+# How many cached parquet files are read at once. Local IO with no rate
+# limit, and pyarrow releases the GIL while decoding, so this is close to
+# free. A warm 210-symbol scan reads ~420 files across two spans.
+CACHE_READ_WORKERS = 8
 # /quote is documented at 1 request/second, stricter than historical. It is a
 # separate budget with a separate clock in kite_client: pacing both endpoint
 # classes off one timestamp would let a quote sweep spend the historical

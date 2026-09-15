@@ -28,6 +28,7 @@ entry in it was verified against Kite's own public instrument master.
 from __future__ import annotations
 
 import logging
+import threading
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -370,13 +371,45 @@ def bars(symbols: list[str], start: date, end: date, interval: str = "5minute",
     live = session
     out: dict[str, pd.DataFrame] = {}
     needed: list[tuple[str, int]] = []
+
+    # READ THE CACHE IN PARALLEL. A warm scan of 210 symbols is ~420
+    # parquet reads across the intraday and daily spans, and they were
+    # read one after another - measured at 21.3s of a 46.8s page render
+    # with nothing being downloaded at all. Unlike the fetches below there
+    # is no rate limit here: this is local IO and pyarrow releases the GIL
+    # while decoding, so the pool is close to free.
+    #
+    # Only the READ is parallel. Staleness, the OpenInterest check and the
+    # decision to refetch all stay in the sequential loop, so the logic
+    # that decides what to serve is unchanged and reviewable in one place.
+    def read_cached(symbol: str):
+        path = _cache_path(symbol, resolved, start, end, oi=oi)
+        if not path.exists() or refresh:
+            return None
+        try:
+            return pd.read_parquet(path)
+        except Exception as exc:
+            logger.warning("Unreadable cache %s: %s", path.name, exc)
+            return None
+
+    readers = max(1, int(getattr(config, "CACHE_READ_WORKERS", 1)))
+    preread: dict = {}
+    if readers > 1 and len(symbols) > 1 and not refresh:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(readers, len(symbols))) as pool:
+            for symbol, frame in zip(symbols,
+                                     pool.map(read_cached, symbols)):
+                if frame is not None:
+                    preread[symbol] = frame
+
     for symbol in symbols:
         path = _cache_path(symbol, resolved, start, end, oi=oi)
         if path.exists() and not refresh:
-            try:
-                cached = pd.read_parquet(path)
-            except Exception as exc:
-                logger.warning("Unreadable cache %s: %s", path.name, exc)
+            cached = preread.get(symbol)
+            if cached is None and symbol not in preread:
+                cached = read_cached(symbol)
+            if cached is None:
+                pass
             else:
                 # With oi=True the column must actually be there. A frame
                 # missing it is refused rather than served, because the
@@ -408,30 +441,96 @@ def bars(symbols: list[str], start: date, end: date, interval: str = "5minute",
         # Not fatal: without a cache directory every fetch is a live one.
         logger.warning("Cannot create %s, running uncached: %s",
                        CACHE_DIR, exc)
-    for symbol, token in needed:
+    # ONE SESSION PER THREAD, never one shared across them. A Kite session
+    # wraps a requests.Session whose HTTPS connection pool is reused, and
+    # concurrent workers recycling the same pooled connection produce
+    # SSLEOFError("EOF occurred in violation of protocol") part-way through
+    # a sweep. Observed live on 2026-09-15 the moment the feed's seed ran
+    # through this path: APOLSINHOT, APOORVA, APTUS, AQYLON, ARCHIDPLY and
+    # more, three of them failing inside the same millisecond.
+    #
+    # Sequential code never hit it because there was only ever one caller.
+    # The fix is a session per worker, not fewer workers: the pacing gate
+    # already limits the REQUEST RATE, and starving the pool would only
+    # give back the speed without removing the race.
+    _local = threading.local()
+
+    def thread_session():
+        existing = getattr(_local, "session", None)
+        if existing is None:
+            # Falls back to the caller's session only if this thread cannot
+            # build its own - better a shared connection than no fetch.
+            existing = kite_client.load_session() or live
+            _local.session = existing
+        return existing
+
+    def fetch_one(symbol: str, token: int):
+        """One symbol, returning (frame, exception) and never raising.
+
+        Runs on a worker thread with its OWN Kite session. historical calls
+        _pace itself, so the shared 3-a-second gate still meters every
+        start - the pool only stops the pipeline draining while replies are
+        in transit.
+        """
         try:
-            frame = kite_client.historical(token, start, end,
-                                           interval=resolved, oi=oi,
-                                           session=live)
+            return kite_client.historical(token, start, end,
+                                          interval=resolved, oi=oi,
+                                          session=thread_session()), None
         # ValueError comes from kite_client on a bad span, OSError from the
         # filesystem. Neither should kill a sweep of two hundred names, and
         # market_data promises never to raise on this path.
         except (kite_client.KiteError, ValueError, OSError) as exc:
-            if is_session_failure(exc):
-                # Every later symbol would fail the same way. Stop, and say
-                # what it is, rather than logging two hundred rejections.
-                _no_session(out, detail=str(exc))
-                return out
-            logger.warning("%s: %s", symbol, exc)
-            continue
+            return None, exc
+
+    def keep(symbol: str, frame) -> None:
         if frame is None or frame.empty:
             logger.info("%s: no bars for %s..%s", symbol, start, end)
-            continue
+            return
         try:
             frame.to_parquet(_cache_path(symbol, resolved, start, end, oi=oi))
         except Exception as exc:
             logger.warning("Could not cache %s: %s", symbol, exc)
         out[symbol] = frame
+
+    # CONCURRENT, because the limiter meters how often a request may START
+    # and says nothing about how long Kite takes to ANSWER - measured at
+    # about 1.65s. Fetched one at a time the quota sat idle waiting on
+    # round trips, so 210 symbols cost ~7 minutes where 3 a second allows
+    # ~70 seconds.
+    workers = max(1, int(getattr(config, "KITE_FETCH_WORKERS", 1)))
+    if workers == 1 or len(needed) == 1:
+        for symbol, token in needed:
+            frame, exc = fetch_one(symbol, token)
+            if exc is not None:
+                if is_session_failure(exc):
+                    _no_session(out, detail=str(exc))
+                    return out
+                logger.warning("%s: %s", symbol, exc)
+                continue
+            keep(symbol, frame)
+        return out
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(workers, len(needed))) as pool:
+        pending = [(symbol, pool.submit(fetch_one, symbol, token))
+                   for symbol, token in needed]
+        # Collected in the order `needed` lists them, so the result is the
+        # same whatever order the replies arrive in.
+        for symbol, future in pending:
+            frame, exc = future.result()
+            if exc is not None:
+                if is_session_failure(exc):
+                    # Every later symbol would fail the same way. Stop, and
+                    # say what it is, rather than logging two hundred
+                    # rejections. Cancel what has not started; the ones
+                    # already in flight are left to finish and discarded.
+                    for _, other in pending:
+                        other.cancel()
+                    _no_session(out, detail=str(exc))
+                    return out
+                logger.warning("%s: %s", symbol, exc)
+                continue
+            keep(symbol, frame)
     return out
 
 
