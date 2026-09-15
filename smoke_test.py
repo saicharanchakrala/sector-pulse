@@ -13,17 +13,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger("smoke_test")
 
-import analyzer  # noqa: E402
-import claude_insights  # noqa: E402
-import config  # noqa: E402
-import decision  # noqa: E402
-import market_data  # noqa: E402
-import models  # noqa: E402
-import news_fetcher  # noqa: E402
-import profiles  # noqa: E402
-from intraday import IntradaySnapshot  # noqa: E402
-from models import NewsItem, SectorMomentum, SectorScore  # noqa: E402
-from profiles import PROFILES, MarketProfile  # noqa: E402
+import analyzer
+import claude_insights
+import config
+import decision
+import market_data
+import models
+import news_fetcher
+import profiles
+from intraday import IntradaySnapshot
+from models import NewsItem, SectorMomentum, SectorScore
+from profiles import PROFILES, MarketProfile
 
 
 def run_profile(profile: MarketProfile) -> tuple[list[NewsItem], dict[str, SectorMomentum]]:

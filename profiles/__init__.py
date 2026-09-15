@@ -30,7 +30,7 @@ class MarketProfile:
     trade_etfs: dict[str, str] = field(default_factory=dict)  # sector -> tradeable ETF ticker
 
 
-from profiles.india import IN_PROFILE  # noqa: E402  (needs MarketProfile above)
+from profiles.india import IN_PROFILE
 
 # India only. The US profile was eleven SPDR sector ETFs served by yfinance,
 # and it went with that dependency: Zerodha Kite is an Indian broker and

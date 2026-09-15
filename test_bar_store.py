@@ -139,7 +139,7 @@ def test_the_end_bound_still_includes_its_own_day(cache) -> None:
     # would silently drop the whole session.
     index = pd.DatetimeIndex([pd.Timestamp("2026-06-01 09:15", tz=IST),
                               pd.Timestamp("2026-06-01 15:25", tz=IST)])
-    frame = pd.DataFrame({c: 1.0 for c in bar_store.OHLCV}, index=index)
+    frame = pd.DataFrame(dict.fromkeys(bar_store.OHLCV, 1.0), index=index)
     frame.to_parquet(cache / "kite__ITC__5minute__s.parquet")
     bar_store.rebuild("5minute", verbose=False)
     got = bar_store.load("5minute", end=date(2026, 6, 1))["ITC"]

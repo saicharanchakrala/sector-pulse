@@ -96,7 +96,7 @@ TOP_FRACTION = 0.10          # size of the "buy" basket, per date
 # DATES, which is the unit the bootstrap blocks over. IMPORTED rather than
 # repeated: a silent divergence from the builder would mis-size every
 # bootstrap block while everything still ran.
-from forecast_universe import SAMPLE_EVERY  # noqa: E402
+from forecast_universe import SAMPLE_EVERY
 
 BASE_FEATURES = [
     "mom5", "mom21", "mom63", "mom126", "mom252", "mom252_ex21",

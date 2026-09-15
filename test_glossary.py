@@ -16,7 +16,6 @@ from __future__ import annotations
 import ast
 import pathlib
 
-import pandas as pd
 import pytest
 
 import glossary

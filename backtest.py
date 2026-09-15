@@ -31,12 +31,11 @@ from __future__ import annotations
 
 import logging
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date
 
 import pandas as pd
 
-import config
 import indicators
 from levels import LONG, SHORT
 

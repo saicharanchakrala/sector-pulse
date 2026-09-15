@@ -460,8 +460,8 @@ def main(argv=None) -> int:
                   f"UNUSABLE for any test that needs one")
     split = session_share(data)
     if split:
-        print(f"\nagainst market hours (the number that decides whether "
-              f"this is an intraday input):")
+        print("\nagainst market hours (the number that decides whether "
+              "this is an intraday input):")
         for label, key in (("before open", "before"),
                            ("DURING session", "during"),
                            ("after close", "after")):

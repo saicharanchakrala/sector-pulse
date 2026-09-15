@@ -1047,7 +1047,7 @@ def test_append_log_rotates_a_file_with_an_older_column_set(tmp_path,
     path.write_text("run_date,run_time,symbol\n2026-09-08,10:00:00,HAL\n",
                     encoding="utf-8")
     monkeypatch.setattr(config, "SCAN_LOG_CSV", path)
-    scan_intraday.append_log([{name: "" for name in scan_intraday._CSV_FIELDS}])
+    scan_intraday.append_log([dict.fromkeys(scan_intraday._CSV_FIELDS, "")])
     header = path.read_text(encoding="utf-8").splitlines()[0].split(",")
     assert header == scan_intraday._CSV_FIELDS
     superseded = list(tmp_path.glob("*.superseded*"))
@@ -1060,7 +1060,7 @@ def test_append_log_appends_when_the_header_already_matches(tmp_path,
     import scan_intraday
     path = tmp_path / "scan_log.csv"
     monkeypatch.setattr(config, "SCAN_LOG_CSV", path)
-    row = {name: "" for name in scan_intraday._CSV_FIELDS}
+    row = dict.fromkeys(scan_intraday._CSV_FIELDS, "")
     scan_intraday.append_log([row])
     scan_intraday.append_log([row])
     lines = path.read_text(encoding="utf-8").strip().splitlines()
@@ -1483,7 +1483,6 @@ def test_a_wide_scope_is_never_scanned_automatically(monkeypatch) -> None:
     # first scan runs itself. Those two together would start a ~13 minute
     # download of bars for the ~2,350 symbols the live feed does not carry,
     # just because someone opened the tab.
-    import app
 
     why = _blocked(monkeypatch,
                    scope="All listed equities (~2,570 - downloads the illiquid tail)")

@@ -152,7 +152,7 @@ def sector_article_baselines(
         items = load_archived_news(day, directory)
         if not items:
             continue
-        counts = {name: 0 for name in profile.sectors}
+        counts = dict.fromkeys(profile.sectors, 0)
         for sectors in analyzer.classify_items(items, profile):
             for name in sectors:
                 counts[name] += 1

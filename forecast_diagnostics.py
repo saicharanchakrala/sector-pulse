@@ -31,12 +31,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-import config          # noqa: E402
-import edge_lab        # noqa: E402
-import forecast_stats  # noqa: E402
-import indicators      # noqa: E402
-import setups          # noqa: E402
-from setups import Readings  # noqa: E402
+import edge_lab
+import forecast_stats
+import indicators
+import setups
+from setups import Readings
 
 ROOT = Path(__file__).resolve().parent
 CACHE = ROOT / "bar_cache"

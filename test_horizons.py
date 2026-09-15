@@ -202,7 +202,6 @@ def test_a_zero_close_does_not_poison_the_range_position() -> None:
     # Cleaning inside _annualised_volatility alone left position_in_range
     # and drawdown - both scored - reading the raw array, where a single
     # zero sets `low` and therefore the whole range position.
-    lookback = horizons._lookback_for("short")
     closes = [100.0 + i for i in range(80)]
     clean = horizons.assess_daily("C", daily(list(closes)), "short", None)
     closes[-3] = 0.0
@@ -593,7 +592,7 @@ def test_a_symbol_with_one_session_does_not_count_as_covered() -> None:
     assert horizons._measurable_sessions(one_day) == 1
     assert np.isnan(horizons.realised_volatility(one_day, 10))
     symbols = [f"S{i}" for i in range(10)]
-    store = {s: full for s in symbols}
+    store = dict.fromkeys(symbols, full)
     store["S9"] = one_day
     # One in ten unmeasurable is inside the tolerance, and that symbol is
     # dropped from the store rather than left to fall back silently.
@@ -622,7 +621,7 @@ def test_a_stale_intraday_store_is_refused_rather_than_quoted() -> None:
            for d in range(1, 11)}
     frame = intraday(old)
     symbols = ["S0", "S1"]
-    assert horizons._usable_fine({s: frame for s in symbols}, symbols) == {}
+    assert horizons._usable_fine(dict.fromkeys(symbols, frame), symbols) == {}
 
 
 def test_the_bar_size_is_declared_once_and_fetched_at_that_size() -> None:

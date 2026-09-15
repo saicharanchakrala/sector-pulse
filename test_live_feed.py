@@ -29,7 +29,7 @@ def fake_seed(monkeypatch):
 
     def backfill(symbols, interval=None):
         asked.append(list(symbols))
-        return {s: "frame" for s in symbols}
+        return dict.fromkeys(symbols, "frame")
 
     def write(frames, when=None):
         written.append(sorted(frames))
@@ -82,7 +82,7 @@ def test_one_bad_chunk_does_not_lose_the_rest(monkeypatch) -> None:
         calls["n"] += 1
         if calls["n"] == 2:
             raise RuntimeError("Kite said no")
-        return {s: "frame" for s in symbols}
+        return dict.fromkeys(symbols, "frame")
 
     monkeypatch.setattr(live_bars, "backfill_today", flaky)
     monkeypatch.setattr(live_bars, "write_seed",

@@ -49,7 +49,6 @@ TWO MISTAKES THIS SCRIPT EXISTS TO NOT REPEAT:
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
@@ -303,7 +302,7 @@ def report() -> int:
     ctrl = window[window.is_pivot == 0]
     inside = ctrl[ctrl.session.isin(has)]["hit"]
     outside = ctrl[~ctrl.session.isin(has)]["hit"]
-    print(f"   control stops only, so no pivot can act on them:")
+    print("   control stops only, so no pivot can act on them:")
     print(f"     in sessions WITH a pivot in the window: "
           f"{inside.mean() * 100:.2f}% hit (n {len(inside):,})")
     print(f"     in sessions WITHOUT one:                "
@@ -331,8 +330,8 @@ def report() -> int:
           f"[{MIN_SIGMA}, {MAX_SIGMA}] sigma range:")
     print(f"     {mean:+.3f} pp, CI [{lo:+.3f}, {hi:+.3f}] - and the within-"
           f"pair distance gap is {widepairs['gap'].mean():+.3f} sigma")
-    print(f"   Pairing alone does NOT hold distance constant. The window "
-          f"does.")
+    print("   Pairing alone does NOT hold distance constant. The window "
+          "does.")
 
     print("\nVERDICT: designs 3 and 4, which control for the session, find "
           "nothing.\nThe apparent benefit in 1 and 2 is the selection gap in "

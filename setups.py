@@ -487,7 +487,7 @@ def explain(setup: Setup) -> str:
            f"derivatives positioning is "
            f"{'building' if reading.oi_change_pct >= 0 else 'unwinding'}. "
            if reading.oi_change_pct is not None else ". ")
-        + 
+        +
         f"After {trade.cost_rupees:,.0f} of round-trip charges this has to "
         f"work {trade.required_win_rate * 100:.1f}% of the time just to break "
         f"even, which is the number that decides whether the "

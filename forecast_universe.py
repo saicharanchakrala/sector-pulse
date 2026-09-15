@@ -130,8 +130,16 @@ def main() -> int:
     out.index.names = ["date", "symbol"]
 
     def add(name: str, frame: pd.DataFrame) -> None:
-        """Narrow to sampled dates, stack onto the output, release."""
-        out[name] = frame.loc[dates].stack().reindex(index).astype("float32")
+        """Narrow to sampled dates, stack onto the output, release.
+
+        `out` is read from the enclosing scope, which is deleted further
+        down once the frame has been handed on. Every add() call happens
+        before that, so this is safe today - the linter flags it because
+        the deletion makes it POSSIBLE to call this afterwards, which
+        would raise rather than quietly misbehave.
+        """
+        out[name] = frame.loc[dates].stack().reindex(index).astype(  # noqa: F821
+            "float32")
         del frame
         gc.collect()
 

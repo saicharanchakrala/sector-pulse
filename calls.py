@@ -84,9 +84,9 @@ _RESULT_MARKERS = (
 
 _NUM = r"(\d+(?:\.\d+)?)"
 _OPTION_RE = re.compile(
-    rf"\b([A-Z][A-Z0-9&.\-]*(?:\s+[A-Z0-9&.\-]+){{0,3}}?)\s+(\d{{2,6}})\s*(CE|PE)\b")
+    r"\b([A-Z][A-Z0-9&.\-]*(?:\s+[A-Z0-9&.\-]+){0,3}?)\s+(\d{2,6})\s*(CE|PE)\b")
 _FUTURE_RE = re.compile(
-    rf"\b([A-Z][A-Z0-9&.\-]*(?:\s+[A-Z0-9&.\-]+){{0,3}}?)\s+FUT(?:URES)?\b")
+    r"\b([A-Z][A-Z0-9&.\-]*(?:\s+[A-Z0-9&.\-]+){0,3}?)\s+FUT(?:URES)?\b")
 _CMP_RE = re.compile(rf"\bCMP\s*:?\s*{_NUM}")
 _TRIGGER_RE = re.compile(rf"\b(?:ONLY\s+)?ABOVE\s*:?\s*{_NUM}")
 _STOP_RE = re.compile(rf"\b(?:MY\s+)?(?:SUPPORT|SL|STOP\s*LOSS)\s*:?\s*{_NUM}")

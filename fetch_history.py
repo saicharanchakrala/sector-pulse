@@ -28,8 +28,8 @@ import sys
 from datetime import date
 from pathlib import Path
 
-import kite_instruments as ki      # noqa: E402
-import market_source as ms         # noqa: E402
+import kite_instruments as ki
+import market_source as ms
 
 ROOT = Path(__file__).resolve().parent
 CACHE = ROOT / "bar_cache"
