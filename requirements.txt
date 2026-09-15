@@ -9,3 +9,4 @@ requests>=2.32
 anthropic>=0.69
 pytest>=8.0
 pyarrow>=17.0
+ruff==0.16.7

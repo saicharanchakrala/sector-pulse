@@ -1,0 +1,52 @@
+# Lint configuration. Chosen to find BUGS first and style second, because
+# the two defects this project shipped to a live session in one day - a
+# poll restarting its own scan, and one Kite session shared across five
+# threads - were both invisible to 688 tests and to compileall.
+#
+# LINE LENGTH 88, not 79. The codebase aims at 79 and mostly hits it, but
+# 567 lines sit over it against only 54 over 88 and 7 over 100. Setting it
+# at 79 would bury the genuine outliers under six hundred wrapped-comment
+# complaints and the rule would be switched off within a week.
+
+line-length = 88
+target-version = "py311"
+
+exclude = [
+    ".venv",
+    # Agent scratch worktrees: copies of this repo, not source of truth.
+    ".claude",
+    "__pycache__",
+]
+
+[lint]
+select = [
+    "F",    # pyflakes - undefined names, unused imports and variables.
+            # The whole reason for adding a linter: an `as_of` that was
+            # never in scope sat in app.py until it was read by eye.
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "B",    # flake8-bugbear - mutable default args, loop-variable capture,
+            # `except` that swallows, and other real footguns
+    "C4",   # comprehension misuse
+    "PIE",  # unnecessary passes, duplicate dict keys
+    "RUF",  # ruff's own checks, including mutable class defaults
+]
+
+ignore = [
+    # Ambiguous variable name. This codebase deliberately uses `l` nowhere,
+    # but `I` appears in market terminology and the rule fires on it.
+    "E741",
+    # Assert used. The dataset builders assert their own invariants at
+    # import - _check_cost_model is exactly that - and those asserts are
+    # the point, not a leftover.
+    "B011",
+]
+
+[lint.per-file-ignores]
+# Tests deliberately build broken frames, reimplement old behaviour as a
+# contrast, and import modules only to assert on their signatures.
+"test_*.py" = ["E501"]
+
+[lint.flake8-bugbear]
+# st.cache_data and friends legitimately take callables as defaults.
+extend-immutable-calls = ["streamlit.cache_data", "streamlit.cache_resource"]
