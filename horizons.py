@@ -809,8 +809,24 @@ def assess_universe(symbols: list, horizons: "list | None" = None,
     if not wanted:
         return {}
     longest = max(_lookback_for(h) for h in wanted)
-    # Calendar days for the deepest lookback, with slack for holidays.
-    start = date.today() - timedelta(days=int(longest * 7 / 5) + 30)
+    # Calendar days for the deepest lookback, with slack for holidays AND
+    # for a store that has fallen behind.
+    #
+    # THIS WAS `int(longest * 7 / 5) + 30` AND IT SILENTLY EMPTIED THE LONG
+    # HORIZON. Three things compound:
+    #   * _assess_series needs lookback + 5 sessions, not lookback;
+    #   * 7/5 assumes 1.4 calendar days per session and the real figure is
+    #     about 1.47, so the estimate runs short over a year;
+    #   * the window is measured back from TODAY while the data ends
+    #     wherever the store ends, so every stale session eats the margin
+    #     from the far end without moving the near one.
+    #
+    # Measured on 2026-09-15 with the store three sessions behind: 382 days
+    # yielded 256 sessions against the 257 long requires, so every symbol
+    # returned None and the table read "nothing assessable at this
+    # horizon" - which sounds like a market fact and was an arithmetic one.
+    start = date.today() - timedelta(
+        days=int((longest + 5) * 1.5) + 60)
     # ONE long frame plus positional bounds, rather than a DataFrame per
     # symbol. Measured on this store: 5.71s to build 2,285 frames against
     # 0.62s for the long read and its bounds, for the same rows.

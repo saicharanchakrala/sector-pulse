@@ -840,3 +840,34 @@ def test_the_short_gate_line_says_no_opinion_not_needs_to_be_ahead() -> None:
     text = " ".join(lines if isinstance(lines, list) else lines[1])
     assert "only evaluates LONG" in text
     assert "NO OPINION" in text
+
+
+def test_the_daily_window_is_wide_enough_for_the_deepest_lookback() -> None:
+    """The long horizon vanished because this window was one session short.
+
+    _assess_series needs lookback + 5 sessions. The window is measured back
+    from TODAY while the data ends wherever the store ends, so a store a
+    few sessions behind loses that margin from the far end without moving
+    the near one. Measured on 2026-09-15 with the store three sessions
+    stale, the old `int(longest * 7 / 5) + 30` gave 256 sessions against
+    the 257 required and every symbol silently returned None.
+
+    Asserted as arithmetic rather than against live data, so it holds on a
+    machine with no bar store at all.
+    """
+    from datetime import date, timedelta
+
+    longest = max(horizons._lookback_for(name)
+                  for name, spec in horizons.HORIZONS.items()
+                  if spec.get("daily"))
+    needed = longest + 5                     # _assess_series's own guard
+    start = date.today() - timedelta(days=int((longest + 5) * 1.5) + 60)
+    span_days = (date.today() - start).days
+    # NSE runs about 252 sessions a year, so ~1.47 calendar days each. Take
+    # the pessimistic 1.5, and charge the window for a store allowed to sit
+    # DAILY_MAX_STALE_SESSIONS behind plus a fortnight of neglect.
+    stale_days = (horizons.DAILY_MAX_STALE_SESSIONS + 10) * 1.5
+    sessions = (span_days - stale_days) / 1.5
+    assert sessions >= needed, (
+        f"window of {span_days}d yields about {sessions:.0f} sessions, "
+        f"but the deepest horizon needs {needed}")
