@@ -591,6 +591,12 @@ _SCAN_SCOPES: dict[str, "int | None"] = {
 # - about 1,000 symbols - so anything at or under that size needs at most
 # a handful of downloads. Only the full universe reaches into the illiquid
 # tail the feed does not carry.
+# The scope a fresh session starts on. The dict is ordered widest-first
+# for the reader, so the default has to be named rather than inherited
+# from position - naming it is also what keeps it honest against the help
+# text beside the widget.
+_DEFAULT_SCAN_SCOPE = "F&O single stocks (fastest)"
+
 _AUTOSCAN_SCOPES = frozenset({
     "All listed equities, first 300",
     "F&O single stocks (fastest)",
@@ -842,6 +848,60 @@ def autoscan_blocked(as_of, want_options: bool,
     return ""
 
 
+def autoscan_will_clear(as_of, want_options: bool,
+                        scope: "str | None" = None) -> bool:
+    """Whether the block on the first scan is one TIME lifts by itself.
+
+    The first three refusals in autoscan_blocked are deliberate choices -
+    a replay, option chains, a scope the feed does not stream - and no
+    amount of waiting changes them. Everything after is a fact about the
+    clock or the feed, and will clear on its own.
+
+    Only the second kind is worth polling for.
+    """
+    if as_of is not None or want_options:
+        return False
+    return scope is None or scope in _AUTOSCAN_SCOPES
+
+
+def autoscan_watch_fragment() -> None:
+    """Re-check the autoscan gate on a timer, and wake the page when it opens.
+
+    A fragment tick NEVER causes a full script run, so this cannot simply
+    exist and let the main body re-evaluate - it has to detect the change
+    and ask for the rerun explicitly. Without that, a tab opened before
+    09:15 showed "No scan yet - the market is closed" indefinitely, because
+    nothing re-ran the check once the market actually opened.
+    """
+    if st.session_state.get("scan") is not None:
+        return
+    # A SCAN ALREADY RUNNING IS NOT A REASON TO START ANOTHER. `scan` is
+    # only set once one COMPLETES, so without this guard every scan taking
+    # longer than the poll interval was restarted from the top by this
+    # fragment - forever, never finishing. Observed on 2026-09-15: the
+    # spinner ran for minutes with nothing left to download.
+    if st.session_state.get("scan_running"):
+        return
+    # FIRES AT MOST ONCE. Waking the page when the gate opens is the whole
+    # job; after that the main flow owns the decision. Relying on
+    # `scan_running` alone was not enough - a rerun tears the script down
+    # and the flag goes with it, so a scan slower than the poll interval
+    # could still be restarted in the gap. `scan_autotried` is set by the
+    # main flow the moment it accepts the automatic scan and is never
+    # cleared, so it survives that gap.
+    if st.session_state.get("scan_autotried"):
+        return
+    watching = st.session_state.get("autoscan_watch") or {}
+    if autoscan_blocked(watching.get("as_of"), watching.get("want_options"),
+                        watching.get("scope")):
+        return
+    # Claimed HERE, not left to the main flow after the rerun: between the
+    # rerun and the main flow reaching its own assignment there is a window
+    # in which another tick would fire again.
+    st.session_state["scan_autotried"] = True
+    st.rerun(scope="app")
+
+
 def render_scan_refresh_controls(replaying: bool,
                                  want_options: bool) -> "int | None":
     """The auto-refresh toggle for the intraday scan, or None when idle.
@@ -955,8 +1015,16 @@ def render_scan_controls() -> tuple[float, float, str, bool, "datetime | None", 
                  "is the share of your money you lose. 1% of Rs 1,00,000 "
                  "is Rs 1,000. It decides how many shares fit.")
     with right:
+        # index= AND key=, both deliberately. Without index the selectbox
+        # defaults to item 0 - the ~2,570 full universe, nine minutes of
+        # downloading - while the help text below claimed the default was
+        # the F&O list. Without key the choice is lost on every Streamlit
+        # restart, which silently put a live session back on the slow
+        # scope at 09:06 on 2026-09-15.
         scope = st.selectbox(
             "Which stocks to look at", list(_SCAN_SCOPES),
+            index=list(_SCAN_SCOPES).index(_DEFAULT_SCAN_SCOPE),
+            key="scan_scope",
             help="The default is the ~210 large, heavily traded names that "
                  "have futures and options. The wider choices include "
                  "smaller stocks and take much longer.")
@@ -2568,18 +2636,46 @@ def render_scan_tab() -> None:
     if not run and st.session_state.get("scan") is None:
         why_not = autoscan_blocked(as_of, want_options, scope)
         if why_not:
-            st.caption(f"No scan yet - {why_not}. Press Run intraday scan "
-                       f"to do it anyway.")
+            if autoscan_will_clear(as_of, want_options, scope):
+                st.session_state["autoscan_watch"] = {
+                    "as_of": as_of, "want_options": want_options,
+                    "scope": scope}
+                st.caption(
+                    f"No scan yet - {why_not}. Watching, and it will run "
+                    f"itself as soon as that clears. Press Run intraday "
+                    f"scan to do it now.")
+                st.fragment(autoscan_watch_fragment,
+                            run_every=config.AUTOSCAN_RECHECK_SECONDS)()
+            else:
+                st.caption(f"No scan yet - {why_not}. Press Run intraday "
+                           f"scan to do it anyway.")
         elif not st.session_state.get("scan_autotried"):
             st.session_state["scan_autotried"] = True
             auto = run = True
     if run:
         import time
 
-        label = ("Scanning from the live feed..." if auto else
-                 "Downloading bars and evaluating setups..." if as_of is None
-                 else f"Replaying {as_of:%Y-%m-%d %H:%M} IST...")
+        # The label described HOW THE SCAN WAS STARTED, not where its bars
+        # come from, so a manual scan reading entirely from the feed still
+        # announced "Downloading" - and a full-universe scan that really
+        # was downloading 1,568 symbols said the same thing, giving no way
+        # to tell seconds from minutes. It now describes the WORK.
+        if as_of is not None:
+            label = f"Replaying {as_of:%Y-%m-%d %H:%M} IST..."
+        elif scope in _AUTOSCAN_SCOPES and live_feed_state().get("running"):
+            label = "Scanning from the live feed..."
+        elif scope in _AUTOSCAN_SCOPES:
+            label = ("Feed not running, so downloading these bars once - "
+                     "seconds, not minutes...")
+        else:
+            label = (f"{scope} reaches symbols the feed does not stream, so "
+                     f"they download at three a second. This takes MINUTES. "
+                     f"Switch to '{_DEFAULT_SCAN_SCOPE}' if that was not "
+                     f"intended.")
         started = time.monotonic()
+        # Claimed BEFORE the spinner and released in the finally below, so
+        # the autoscan poll can tell "no scan yet" from "a scan is running".
+        st.session_state["scan_running"] = True
         try:
             with st.spinner(label):
                 ranked, bars, benchmark, now, past = run_scan(
@@ -2596,6 +2692,8 @@ def render_scan_tab() -> None:
             st.warning(f"The automatic scan could not complete ({exc}). "
                        f"Press Run intraday scan to retry.")
             ranked = None
+        finally:
+            st.session_state.pop("scan_running", None)
         if ranked is not None:
             # Measured so the auto-refresh cannot be set faster than a scan
             # actually takes.

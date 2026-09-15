@@ -1648,3 +1648,31 @@ def test_a_cost_override_reaches_the_gate() -> None:
     assert cheap.cost_pct == pytest.approx(0.034)
     # Same plausible move over a smaller cost means a bigger multiple.
     assert cheap.cost_multiple > cash.cost_multiple
+
+
+# --- the first scan running itself ---------------------------------------
+
+def test_a_deliberate_choice_is_not_something_to_wait_out() -> None:
+    """A replay, option chains and a wide scope are decisions, not delays.
+
+    Polling for them would spin forever: no amount of waiting turns a
+    replay into a live session. Only the clock-and-feed refusals clear on
+    their own, and only those are worth watching.
+    """
+    import app
+    from datetime import datetime
+
+    assert not app.autoscan_will_clear(datetime(2026, 9, 11), False, None)
+    assert not app.autoscan_will_clear(None, True, None)
+    assert not app.autoscan_will_clear(None, False, "every listed equity")
+
+
+def test_a_closed_market_is_worth_waiting_out() -> None:
+    # "the market is closed" and "the feed has not written a bar yet" both
+    # stop being true on their own, so a tab opened before the open should
+    # start the scan itself rather than waiting to be clicked.
+    import app
+
+    assert app.autoscan_will_clear(None, False, None)
+    for scope in app._AUTOSCAN_SCOPES:
+        assert app.autoscan_will_clear(None, False, scope)
