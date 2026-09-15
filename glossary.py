@@ -22,8 +22,15 @@ COLUMNS = {
     # that table is one the USER recorded, so the scan's wording - "sell
     # here if it goes against you", "set at twice the distance to the
     # stop" - is both advice and false there.
-    "Held": "Whether you are long or short this position, as you recorded "
-            "it.",
+    # ONE COLUMN NAME, TWO TABLES. Positions puts the SIDE here
+    # (app.py:2226) and the instrument lookup puts the HOLDING PERIOD
+    # (app.py:1797). There were two entries for this key and the
+    # second silently won, so the Positions column carried the
+    # lookup's meaning. Both are named until one of the tables is
+    # renamed.
+    "Held": "In Positions, whether you are long or short, as you "
+            "recorded it. In the lookup table, how many sessions "
+            "that horizon expects to hold for.",
     "State": "What is true about the position right now: whether price has "
              "passed your stop or reached your exit, whether it is nearing "
              "the exit, and whether the scan still points your way. A "
@@ -148,7 +155,6 @@ COLUMNS = {
                    "horizons it picked WORSE than simply buying everything. "
                    "Do not read the top as 'the best ones'.",
     "Horizon": "How long the position is meant to be held.",
-    "Held": "How long the position is meant to be held.",
     "Verdict": "BUY means every check passed. NO BUY names the check that "
                "failed. Neither is a prediction of the price.",
     "Blocked by": "The specific check that failed. This is the useful part "

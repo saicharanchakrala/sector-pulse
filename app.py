@@ -18,6 +18,8 @@ They share no thresholds and no data. Educational tool - not financial advice.
 """
 from __future__ import annotations
 
+import logging
+
 import json
 import re
 from dataclasses import asdict
@@ -27,6 +29,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+
 from streamlit.components.v1 import html as component_html
 
 import analyzer
@@ -55,6 +58,8 @@ import trade_costs
 from levels import LONG
 from models import NewsItem, ScoredNewsItem, SectorMomentum, SectorScore
 from profiles import PROFILES, MarketProfile, get_profile
+
+logger = logging.getLogger(__name__)
 
 st.set_page_config(page_title="Sector Pulse", page_icon="📈", layout="wide")
 
