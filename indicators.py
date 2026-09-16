@@ -60,15 +60,26 @@ def session_bars(frame: pd.DataFrame, day: "date | None" = None
     usable = _clean(frame)
     if usable is None:
         return None
-    try:
-        dates = [ts.date() for ts in usable.index]
-    except AttributeError:
+    # VECTORISED, and the difference is not marginal. This used to build a
+    # Python list of dates by iterating the index, build a second list by
+    # iterating it again, then look the rows up by label. Profiled across
+    # 180 measure() calls that produced 1,843,200 calls to
+    # DatetimeArray.__iter__ - roughly ten thousand Timestamp objects
+    # materialised per symbol, on frames of about 130 rows - and it was
+    # the single largest cost in a full-universe scan.
+    #
+    # index.date is one pass in C, the comparison is a numpy op, and a
+    # boolean mask avoids the label lookup entirely.
+    if not isinstance(usable.index, pd.DatetimeIndex):
+        return None
+    dates = usable.index.date
+    if len(dates) == 0:
         return None
     target = dates[-1] if day is None else day
-    keep = [ts for ts, own in zip(usable.index, dates) if own == target]
-    if not keep:
+    keep = dates == target
+    if not keep.any():
         return None
-    return usable.loc[keep]
+    return usable[keep]
 
 
 def typical_price(bars: pd.DataFrame) -> pd.Series:
@@ -117,20 +128,26 @@ class OpeningRange:
 
 
 def opening_range(bars: pd.DataFrame,
-                  minutes: int = config.SCAN_OPENING_RANGE_MINUTES
+                  minutes: int = config.SCAN_OPENING_RANGE_MINUTES,
+                  session: "pd.DataFrame | None" = None
                   ) -> "OpeningRange | None":
     """Opening range over the first `minutes` of the session in `bars`.
 
     Bars are selected by timestamp rather than by position, so a session
     missing its 09:15 print yields a shorter range instead of silently
     sliding the window later into the day.
+
+    `session` lets a caller that has ALREADY sliced the session hand it
+    over. measure() computes it, then called this and opening_range_closed
+    which each sliced it again - three identical passes per symbol, and
+    session_bars was the most expensive call in the scan.
     """
-    usable = session_bars(bars)
-    if usable is None or minutes <= 0:
+    usable = session_bars(bars) if session is None else session
+    if usable is None or usable.empty or minutes <= 0:
         return None
     start = usable.index[0]
     cutoff = start + timedelta(minutes=minutes)
-    window = usable.loc[[ts for ts in usable.index if ts < cutoff]]
+    window = usable[usable.index < cutoff]
     if window.empty:
         return None
     high = _finite(window["High"].max())
@@ -141,7 +158,8 @@ def opening_range(bars: pd.DataFrame,
 
 
 def opening_range_closed(bars: pd.DataFrame,
-                         minutes: int = config.SCAN_OPENING_RANGE_MINUTES
+                         minutes: int = config.SCAN_OPENING_RANGE_MINUTES,
+                         session: "pd.DataFrame | None" = None
                          ) -> bool:
     """Whether the session has traded past its opening range.
 
@@ -155,8 +173,8 @@ def opening_range_closed(bars: pd.DataFrame,
     before the range closes therefore returns "no setup" for arithmetic
     reasons, on every symbol, regardless of what the market is doing.
     """
-    session = session_bars(bars)
-    if session is None or minutes <= 0:
+    session = session_bars(bars) if session is None else session
+    if session is None or session.empty or minutes <= 0:
         return False
     start = session.index[0]
     return session.index[-1] >= start + timedelta(minutes=minutes)

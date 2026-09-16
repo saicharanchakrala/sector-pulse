@@ -87,15 +87,16 @@ def _clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
 
 def _bars_per_session(frame: pd.DataFrame) -> int:
     """Typical bar count in a full session, used to convert minutes to bars."""
-    try:
-        counts: dict = {}
-        for stamp in frame.index:
-            counts[stamp.date()] = counts.get(stamp.date(), 0) + 1
-    except AttributeError:
+    # One C-level pass over the index rather than a Python loop building a
+    # dict a Timestamp at a time. Profiled at 1.58s across 180 calls.
+    if frame is None or frame.empty:
         return 0
-    if not counts:
+    if not isinstance(frame.index, pd.DatetimeIndex):
         return 0
-    return int(pd.Series(list(counts.values())).median())
+    counts = pd.Series(frame.index.date).value_counts()
+    if counts.empty:
+        return 0
+    return int(counts.median())
 
 
 def measure(symbol: str, ticker: str, intraday: pd.DataFrame,
@@ -127,16 +128,23 @@ def measure(symbol: str, ticker: str, intraday: pd.DataFrame,
         # closed on an unexpected index is deliberate - swallowing the error
         # left the frame unfiltered, so prev_close became today's own partial
         # close and every reading derived from it leaked the future.
-        try:
+        # TYPE-CHECKED, NOT COERCED. pd.DatetimeIndex([0, 1]) succeeds - it
+        # reads plain integers as nanoseconds since 1970 - so coercing an
+        # untimestamped index produces 1970 dates that are all "before
+        # today", the filter passes everything, and prev_close becomes
+        # today's own partial close. That is the exact leak this block
+        # exists to prevent, and it is what an earlier version of this
+        # optimisation reintroduced;
+        # test_measure_drops_daily_context_rather_than_leaking_it caught it.
+        if isinstance(prior.index, pd.DatetimeIndex):
             # Anchored on the CLOCK, not on the last surviving bar. The old
             # anchor slid to D-1 whenever no bar of the replay date survived
             # the cutoff, which let D's completed daily bar become
             # prev_close - a straight leak into day_change_pct and from
             # there into the relative-strength gate.
             cutoff_day = now.astimezone(indicators.IST).date()
-            prior = prior.loc[[ts for ts in prior.index
-                               if ts.date() < cutoff_day]]
-        except AttributeError:
+            prior = prior[prior.index.date < cutoff_day]
+        else:
             logger.warning("%s: daily index is not timestamped, so today's "
                            "partial bar cannot be excluded; dropping daily "
                            "context rather than leaking it", symbol)
@@ -170,7 +178,7 @@ def measure(symbol: str, ticker: str, intraday: pd.DataFrame,
         day_change_pct=day_change,
         vwap=vwap,
         vwap_distance_pct=indicators.percent_change(last, vwap) if vwap else None,
-        opening_range=indicators.opening_range(intraday),
+        opening_range=indicators.opening_range(intraday, session=today),
         cpr=cpr,
         atr_bar=indicators.atr(intraday),
         rvol=indicators.relative_volume(intraday),
@@ -186,7 +194,8 @@ def measure(symbol: str, ticker: str, intraday: pd.DataFrame,
         minutes_left=minutes_left,
         bars_left=bars_left,
         session_bar_count=len(today),
-        range_closed=indicators.opening_range_closed(intraday),
+        range_closed=indicators.opening_range_closed(intraday,
+                                                     session=today),
     )
 
 
