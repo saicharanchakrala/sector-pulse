@@ -426,6 +426,19 @@ def load_today(tokens: "dict[str, int] | None" = None,
     back keyed by token, which is only useful for diagnostics.
     """
     frame = _read_frame(store_name(when), store_path(when), "live bar store")
+    return frames_from(frame, tokens, drop_partial=drop_partial)
+
+
+def frames_from(frame, tokens: "dict[str, int] | None" = None,
+                drop_partial: bool = True) -> dict:
+    """Split one flat bar frame into per-symbol frames.
+
+    EXTRACTED so a caller holding the bars ALREADY - the feed, which built
+    them - can split them without a round trip through storage to read
+    back what it just wrote. load_today keeps calling this, so there is one
+    copy of the partial-bar rule, the token mapping and the tz handling
+    rather than two that can drift.
+    """
     if frame is None or frame.empty:
         return {}
     if drop_partial and "partial" in frame.columns:
