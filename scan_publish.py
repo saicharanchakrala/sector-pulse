@@ -45,10 +45,16 @@ IST = ZoneInfo("Asia/Kolkata")
 # so a reader cannot pick up yesterday's believing it is today's.
 OBJECT_PREFIX = "setups_"
 
-# Seconds between scans. A pass over the F&O set measured 5.8s, so thirty
-# leaves the CPU mostly idle for the tick stream, which is the process's
-# actual job. Raising the universe or lowering this needs measuring, not
-# guessing: a scan that overruns its own interval just runs continuously.
+# Seconds between scans. Measured 2026-09-16 on the 216 F&O underlyings, a
+# FULL loop iteration - splitting the stream frame, splicing, measuring,
+# evaluating, ranking and publishing - took 14.0 seconds. The scan alone
+# is 6.1 of that; the rest is turning one flat frame of every streamed
+# symbol into per-symbol frames.
+#
+# Thirty therefore runs at roughly a 47% duty cycle, which leaves the CPU
+# for the tick stream - this process's actual job. Do not lower it without
+# measuring: a scan that overruns its own interval simply runs
+# continuously, and the socket is what suffers.
 DEFAULT_EVERY = 30
 
 

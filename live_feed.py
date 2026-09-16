@@ -42,6 +42,7 @@ import kite_client
 import kite_ticker as kt
 import live_bars
 import object_store
+import scan_publish
 
 IST = ZoneInfo("Asia/Kolkata")
 LOCK = live_bars.STORE / "feed.lock"
@@ -67,6 +68,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--history-days", type=int, default=0,
                         help="prior calendar days to prewarm "
                              "(default: from config.SCAN_BAR_LOOKBACK)")
+    parser.add_argument("--scan-every", type=int, default=-1,
+                        help="seconds between published scans; 0 disables, "
+                             "-1 (default) means on when an object store is "
+                             "configured and off otherwise")
     parser.add_argument("--prewarm-only", action="store_true",
                         help="fetch and cache prior sessions, then exit")
     return parser.parse_args(argv)
@@ -274,7 +279,8 @@ SEED_CHUNK = 100
 MAX_PUBLISH_FAILURES = 3
 
 
-def seed_session(tokens: dict, stop=None) -> int:
+def seed_session(tokens: dict, stop=None,
+                 into: "dict | None" = None) -> int:
     """Fetch the part of today's session that preceded the stream.
 
     Runs in a thread while ticks are already arriving. Written in chunks
@@ -289,7 +295,10 @@ def seed_session(tokens: dict, stop=None) -> int:
     symbols = list(tokens)
     print(f"seeding today's session behind the stream "
           f"({len(symbols)} symbols, {SEED_CHUNK} at a time)...", flush=True)
-    collected: dict = {}
+    # SHARED, not re-read. The scan loop needs the same seed frames, and
+    # reading them back from storage cost 2.3 seconds a pass - a third of
+    # the scan's own budget - for bars this thread already has in hand.
+    collected: dict = {} if into is None else into
     rows = 0
     for start in range(0, len(symbols), SEED_CHUNK):
         if stop is not None and stop.is_set():
@@ -472,9 +481,49 @@ def main(argv=None) -> int:
     # open. Now the stream starts immediately and the seed fills in behind
     # it, which is safe because combined() keeps the LAST value for a
     # stamp and live bars come after the seed in that concatenation.
-    seeder = threading.Thread(target=seed_session, args=(dict(tokens), stop),
+    # Shared with the scan loop below, and filled as the seeding proceeds,
+    # so an early scan sees whatever is seeded so far rather than nothing.
+    seeded: dict = {}
+    seeder = threading.Thread(target=seed_session,
+                              args=(dict(tokens), stop, seeded),
                               name="seeder", daemon=True)
     seeder.start()
+
+    # THE SCAN, WHERE THE BARS ALREADY ARE. Measured 2026-09-16: on the
+    # laptop a scan of these 216 names cost 48 seconds, of which only 5.8
+    # was the scan - the rest was fetching bars this process built itself.
+    # Here it costs the 5.8 and publishes a 56 KB table.
+    #
+    # Default -1 means "on when there is somewhere to publish to": the
+    # container has an object store and wants this, a local feed has
+    # neither and would burn CPU producing nothing.
+    scan_every = args.scan_every
+    if scan_every < 0:
+        scan_every = (scan_publish.DEFAULT_EVERY
+                      if object_store.enabled() else 0)
+    if scan_every:
+        import daily_context
+
+        context = daily_context.load(symbols)
+        if not context:
+            logger.warning("No daily context published, so the scan would "
+                           "have no previous close, pivot range or turnover "
+                           "- run daily_context.py. Scanning anyway, with "
+                           "those gates failing closed.")
+        else:
+            stamp = daily_context.age()
+            if stamp:
+                logger.info("Daily context covers %d symbols, newest %s "
+                            "(%d day(s) ago)", len(context), stamp[0], stamp[1])
+        scanner = threading.Thread(
+            target=scan_publish.loop,
+            args=(builder, symbols, history, tokens, context, stop,
+                  scan_every),
+            kwargs={"seed": seeded},
+            name="scanner", daemon=True)
+        scanner.start()
+    else:
+        logger.info("No scan loop: nowhere to publish to")
 
     def shutdown(*_) -> None:
         stop.set()
