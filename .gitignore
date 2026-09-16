@@ -64,3 +64,11 @@ chimes_preview/
 .claude/worktrees/
 # Machine-local tool permissions, not a project setting.
 .claude/settings.local.json
+
+# The live track record: every setup the scanner proposed and what it did.
+# Personal trading data, same as scan_log.csv beside it.
+outcomes.csv
+
+# The pre-open watchlist, rebuilt nightly from the daily store.
+# Derived data, and the store it comes from is gitignored too.
+premarket.parquet
