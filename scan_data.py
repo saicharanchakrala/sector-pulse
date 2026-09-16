@@ -222,6 +222,17 @@ def _live_intraday(symbols: list[str]) -> tuple:
         logger.info("Live bars unavailable (%s); downloading", exc)
         return empty
     state = live_bars.status()
+    # AN UNREACHABLE STORE IS NOT AN ABSENT ONE. status() reports a storage
+    # fault rather than raising, because it renders on every page load - so
+    # this gate, which is what the scan actually depends on, has to read
+    # that field. Without it an expired token or a denied read arrives here
+    # as "no live bars", and the scan answers by downloading the whole
+    # universe at three requests a second while reporting nothing wrong.
+    if state.get("error"):
+        logger.error("Live bar store unreachable (%s). NOT falling back to "
+                     "a download: fix the store rather than re-fetching "
+                     "what the feed has already published.", state["error"])
+        return empty
     if not state.get("present") or not state.get("bars"):
         logger.info("No live bars written today; downloading instead")
         return empty

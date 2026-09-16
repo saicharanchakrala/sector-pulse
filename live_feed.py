@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import io
 import logging
 import os
 import signal
@@ -33,14 +34,20 @@ import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+import pandas as pd
+
 import config
 import instruments
 import kite_client
 import kite_ticker as kt
 import live_bars
+import object_store
 
 IST = ZoneInfo("Asia/Kolkata")
 LOCK = live_bars.STORE / "feed.lock"
+# Set by the ECS agent on every Fargate task, so it needs no config of our
+# own and cannot drift out of step with where the process actually runs.
+ON_FARGATE = bool(os.environ.get("ECS_CONTAINER_METADATA_URI_V4"))
 logger = logging.getLogger("live_feed")
 
 
@@ -65,6 +72,61 @@ def parse_args(argv=None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+TURNOVER_SESSIONS = 20
+
+
+def turnover_values(frames: dict) -> list:
+    """[(turnover, symbol)] descending, from daily frames.
+
+    Extracted so publish_turnover.py computes the ranking the SAME way the
+    feed would have computed it from a local store. Two copies of this
+    arithmetic would let the container stream a different universe from
+    the one the laptop believed it had ranked, and nothing would report
+    the divergence.
+    """
+    ranked = []
+    for symbol, frame in (frames or {}).items():
+        if frame is None or not {"Close", "Volume"} <= set(frame.columns):
+            continue
+        tail = frame.tail(TURNOVER_SESSIONS)
+        if tail.empty:
+            continue
+        value = float((tail["Close"] * tail["Volume"]).mean())
+        if value == value and value > 0:
+            ranked.append((value, symbol))
+    ranked.sort(reverse=True)
+    return ranked
+
+
+def turnover_from_store() -> list:
+    """Symbols ranked by turnover, from the file publish_turnover writes.
+
+    Returns [] when there is no object store or no published file, so the
+    caller falls back to the F&O underlyings exactly as it did before.
+    """
+    if not object_store.enabled():
+        return []
+    # A StorageError is deliberately NOT caught. Swallowing it would narrow
+    # the streaming universe to the F&O set for the whole session because a
+    # bucket was unreachable, and log it as a warning nobody reads.
+    payload = object_store.get(object_store.TURNOVER_OBJECT)
+    if payload is None:
+        logger.warning("No %s published yet, so the feed cannot rank beyond "
+                       "the F&O underlyings - run publish_turnover.py",
+                       object_store.TURNOVER_OBJECT)
+        return []
+    try:
+        frame = pd.read_parquet(io.BytesIO(payload))
+    except Exception as exc:
+        logger.warning("Published turnover is unreadable: %s", exc)
+        return []
+    if frame.empty or "symbol" not in frame.columns:
+        return []
+    if "turnover" in frame.columns:
+        frame = frame.sort_values("turnover", ascending=False)
+    return [str(s) for s in frame["symbol"].tolist()]
+
+
 def by_turnover(limit: int) -> list:
     """The `limit` most-traded symbols by 20-session turnover, or [].
 
@@ -78,20 +140,25 @@ def by_turnover(limit: int) -> list:
 
         frames = bar_store.load("day")
     except Exception as exc:
-        logger.warning("No daily store, so no turnover ranking: %s", exc)
-        return []
-    ranked = []
-    for symbol, frame in frames.items():
-        if frame is None or not {"Close", "Volume"} <= set(frame.columns):
-            continue
-        tail = frame.tail(20)
-        if tail.empty:
-            continue
-        value = float((tail["Close"] * tail["Volume"]).mean())
-        if value == value and value > 0:
-            ranked.append((value, symbol))
-    ranked.sort(reverse=True)
-    return [symbol for _, symbol in ranked[:max(0, limit)]]
+        logger.info("No local daily store (%s)", exc)
+        frames = {}
+    ranked = [symbol for _, symbol in turnover_values(frames)]
+    if not ranked:
+        # KEYED ON AN EMPTY RANKING, NOT ON AN EXCEPTION. bar_store.load
+        # returns {} for an absent store rather than raising, so a
+        # container - which has no 559 MB forecast_cache and never will -
+        # arrives here silently. An earlier version put this in an `except`
+        # arm that therefore never fired at all: the feed streamed the ~216
+        # F&O underlyings this change exists to widen, and the published
+        # ranking was read by nothing.
+        ranked = turnover_from_store()
+        if ranked:
+            logger.info("Ranking %d symbols from the published turnover "
+                        "file rather than a local daily store", len(ranked))
+    if not ranked:
+        logger.warning("No turnover ranking from either the local daily "
+                       "store or the object store")
+    return ranked[:max(0, limit)]
 
 
 def universe(explicit: str, limit: "int | None" = None) -> list:
@@ -139,6 +206,15 @@ def take_lock() -> bool:
     fatal: the PID it names is checked, and a lock naming nothing alive is
     overwritten.
     """
+    if ON_FARGATE:
+        # The lock guards a SHARED disk, and a container's disk is neither
+        # shared nor durable: every task would take a fresh one and the
+        # guarantee would be silently absent rather than merely different.
+        # ECS gives the real one instead - desiredCount 1 on the service
+        # means the scheduler will not place a second task at all.
+        logger.info("Running on ECS, so the singleton guarantee is the "
+                    "service's desiredCount rather than a file lock")
+        return True
     live_bars.STORE.mkdir(parents=True, exist_ok=True)
     if LOCK.exists():
         try:
@@ -157,6 +233,25 @@ def take_lock() -> bool:
 
 def _alive(pid: int) -> bool:
     """Whether a PID is still running, without psutil."""
+    if pid <= 0:
+        # os.kill(0, 0) signals the whole PROCESS GROUP and a negative pid
+        # signals another one. Harmless with signal 0, but a lock file
+        # holding a stray value should read as "nothing alive", not as a
+        # question about someone else's processes.
+        return False
+    if os.name != "nt":
+        # os.kill with signal 0 tests for existence without delivering
+        # anything. tasklist does not exist outside Windows and returned
+        # an empty string there, which read as "not alive" for every PID.
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except Exception:
+            return False
     try:
         out = os.popen(f'tasklist /FI "PID eq {pid}" /NH').read()
     except Exception:
@@ -173,6 +268,10 @@ def release_lock() -> None:
 
 
 SEED_CHUNK = 100
+# Three consecutive failures is one minute at the default
+# twenty-second flush: long enough to ride out a blip, short
+# enough that a broken policy does not cost the session.
+MAX_PUBLISH_FAILURES = 3
 
 
 def seed_session(tokens: dict, stop=None) -> int:
@@ -213,10 +312,55 @@ def seed_session(tokens: dict, stop=None) -> int:
     return rows
 
 
+# Beyond this the instrument snapshot is old enough that tokens may have
+# been reissued and the F&O set may have changed at an expiry. Not fatal -
+# a feed that will not start is worse than one ranking a slightly stale
+# universe - so it warns rather than refusing.
+SNAPSHOT_STALE_DAYS = 14
+
+
+def _warn_if_snapshot_is_stale() -> None:
+    """Say how old the baked-in instrument snapshot is.
+
+    On a container this is frozen at image build time and nothing syncs it,
+    so without this line a months-old universe.json would look exactly like
+    a fresh one - and every instrument token the feed subscribes to comes
+    out of it.
+    """
+    try:
+        snapshot = instruments.load_latest()
+        captured = getattr(snapshot, "captured_at", None) if snapshot else None
+        if not captured:
+            logger.warning("Instrument snapshot carries no capture date")
+            return
+        stamp = datetime.fromisoformat(str(captured).replace("Z", "+00:00"))
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=IST)
+        days = (datetime.now(IST) - stamp).days
+        message = "Instrument snapshot is %d day(s) old (captured %s)"
+        if days >= SNAPSHOT_STALE_DAYS:
+            logger.warning(message + " - rebuild the image to refresh it",
+                           days, stamp.date())
+        else:
+            logger.info(message, days, stamp.date())
+    except Exception as exc:
+        logger.warning("Could not date the instrument snapshot: %s", exc)
+
+
 def main(argv=None) -> int:
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
     args = parse_args(argv)
+    if ON_FARGATE and not object_store.enabled():
+        # Otherwise the task runs, logs healthy flush lines all session,
+        # writes every bar to the container's own ephemeral disk and throws
+        # the lot away when it stops - with nothing anywhere reporting it.
+        logger.error("Running on ECS with no object store configured. Set "
+                     "%s on the task definition, or this feed would publish "
+                     "nothing.", object_store.BUCKET_ENV)
+        return 1
+    logger.info("Publishing to %s", object_store.describe())
+    _warn_if_snapshot_is_stale()
     symbols = universe(args.symbols)
     if not symbols:
         print("no symbols to stream")
@@ -248,7 +392,11 @@ def main(argv=None) -> int:
 
     session = kite_client.load_session()
     if session is None:
-        print("No Kite session. Run: .venv\\Scripts\\python -m kite_login")
+        # A container has no .kite_session.json and no way to run an
+        # interactive login, so the local advice is unfollowable there.
+        print("No KITE_API_KEY/KITE_ACCESS_TOKEN in the environment"
+              if ON_FARGATE else
+              "No Kite session. Run: .venv\\Scripts\\python -m kite_login")
         release_lock()
         return 1
 
@@ -260,6 +408,7 @@ def main(argv=None) -> int:
 
     def flusher() -> None:
         """Persist on a timer so a reader always sees a recent file."""
+        failures = 0
         while not stop.wait(args.flush_every):
             try:
                 rows = builder.flush()
@@ -267,17 +416,50 @@ def main(argv=None) -> int:
                 # One bad flush must not end all future ones: this thread
                 # is the only thing writing the file the scanner reads.
                 logger.warning("flush failed: %s", exc)
-                continue
-            state = live_bars.status()
-            age = state.get("age_seconds")
+                rows = 0
+            # STATS FROM MEMORY, NOT FROM A FRESH READ. This used to call
+            # live_bars.status(), which re-downloads the whole object it
+            # has just written - about 1,170 extra GETs over a session,
+            # each one larger than the last, purely to print a line.
+            frame = builder.snapshot()
+            if frame.empty:
+                failures = 0
+            elif rows:
+                failures = 0
+            else:
+                # There were bars to write and none were written, so the
+                # publish failed. Silently retrying forever means a bad
+                # task-role policy costs the entire session with nothing
+                # but a warning per flush to show for it.
+                failures += 1
+                logger.error("publish failed %d time(s) in a row - %d bars "
+                             "held in memory and none persisted",
+                             failures, len(frame))
+                if failures >= MAX_PUBLISH_FAILURES:
+                    logger.error("giving up after %d consecutive failures; "
+                                 "a feed that cannot publish is doing no "
+                                 "work, so stopping for ECS to restart it",
+                                 failures)
+                    stop.set()
+                    return
+            # Publish the numbers a reader needs, so nobody has to pull
+            # the whole growing session object to learn them.
+            live_bars.write_status(frame)
+            instruments = (int(frame["instrument_token"].nunique())
+                           if not frame.empty else 0)
+            age = None
+            if not frame.empty:
+                latest = pd.DatetimeIndex(frame["Date"]).max()
+                if latest is not None and latest.tzinfo:
+                    age = (datetime.now(IST)
+                           - latest.tz_convert(IST)).total_seconds()
             # `age == age` alone was a NaN check, but None passes it too and
             # formatting None raised inside this thread - which killed the
             # flusher silently and stopped every write.
             fresh = (f", newest {age:.0f}s old"
                      if isinstance(age, (int, float)) and age == age else "")
             print(f"  {datetime.now(IST):%H:%M:%S}  bars {rows} across "
-                  f"{state.get('instruments', 0)} instruments{fresh}",
-                  flush=True)
+                  f"{instruments} instruments{fresh}", flush=True)
 
     pump = threading.Thread(target=flusher, name="flusher", daemon=True)
     pump.start()

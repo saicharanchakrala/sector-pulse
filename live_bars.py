@@ -32,6 +32,8 @@ because a partial bar looks exactly like a quiet one.
 """
 from __future__ import annotations
 
+import io
+import json
 import logging
 import os
 import threading
@@ -42,6 +44,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 import config
+import object_store
 
 logger = logging.getLogger(__name__)
 
@@ -95,10 +98,77 @@ def in_session(stamp: datetime) -> bool:
     return start <= local < end
 
 
+def store_name(when: "date | None" = None) -> str:
+    """The bare file name for one session's live bars.
+
+    Split out from store_path because the same session is addressed two
+    ways now: as a path on the feed's own disk, and as an object key when
+    the feed and the reader are not on the same machine.
+    """
+    day = when or datetime.now(IST).date()
+    return f"live_{day:%Y%m%d}.parquet"
+
+
 def store_path(when: "date | None" = None) -> Path:
     """Where one session's live bars live."""
-    day = when or datetime.now(IST).date()
-    return STORE / f"live_{day:%Y%m%d}.parquet"
+    return STORE / store_name(when)
+
+
+def _read_frame(name: str, path: Path, label: str):
+    """One session's frame from the object store, else local disk.
+
+    Returns None when there is genuinely nothing yet. A StorageError is
+    deliberately NOT caught: an unreachable bucket must not arrive
+    downstream looking like a feed that has not started, because the
+    scan's response to the latter is to download the whole universe at
+    three requests a second while reporting nothing wrong.
+    """
+    if object_store.enabled():
+        payload = object_store.get(name)
+        if payload is None:
+            return None
+        try:
+            return pd.read_parquet(io.BytesIO(payload))
+        except Exception as exc:
+            logger.warning("Unreadable %s in %s: %s", name,
+                           object_store.describe(), exc)
+            return None
+    if not path.exists():
+        return None
+    try:
+        return pd.read_parquet(path)
+    except Exception as exc:
+        logger.warning("Unreadable %s %s: %s", label, path.name, exc)
+        return None
+
+
+def _write_frame(frame, name: str, path: Path, label: str) -> bool:
+    """Persist a frame to the object store, else atomically to disk.
+
+    The local path writes a temporary and renames because Streamlit may
+    read it mid-write and a half-written parquet is not a smaller parquet,
+    it is a crash. A single put_object needs no equivalent: S3 serves the
+    old object or the new one, never a mixture.
+    """
+    if object_store.enabled():
+        buffer = io.BytesIO()
+        try:
+            frame.to_parquet(buffer)
+            object_store.put(name, buffer.getvalue())
+            return True
+        except Exception as exc:
+            logger.warning("Could not publish %s to %s: %s", label,
+                           object_store.describe(), exc)
+            return False
+    STORE.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    try:
+        frame.to_parquet(temporary)
+        os.replace(temporary, path)
+        return True
+    except Exception as exc:
+        logger.warning("Could not write %s: %s", label, exc)
+        return False
 
 
 class BarBuilder:
@@ -341,14 +411,8 @@ class BarBuilder:
         frame = self.snapshot()
         if frame.empty:
             return 0
-        STORE.mkdir(parents=True, exist_ok=True)
-        target = store_path(when)
-        temporary = target.with_suffix(".tmp")
-        try:
-            frame.to_parquet(temporary)
-            os.replace(temporary, target)
-        except Exception as exc:
-            logger.warning("Could not flush live bars: %s", exc)
+        if not _write_frame(frame, store_name(when), store_path(when),
+                            "live bars"):
             return 0
         return len(frame)
 
@@ -361,22 +425,30 @@ def load_today(tokens: "dict[str, int] | None" = None,
     `tokens` maps symbol to instrument token; without it the frames come
     back keyed by token, which is only useful for diagnostics.
     """
-    path = store_path(when)
-    if not path.exists():
-        return {}
-    try:
-        frame = pd.read_parquet(path)
-    except Exception as exc:
-        logger.warning("Unreadable live bar store %s: %s", path.name, exc)
-        return {}
-    if frame.empty:
+    frame = _read_frame(store_name(when), store_path(when), "live bar store")
+    if frame is None or frame.empty:
         return {}
     if drop_partial and "partial" in frame.columns:
         frame = frame[~frame["partial"].astype(bool)]
-    by_token = {token: group for token, group in frame.groupby("instrument_token")}
+
     lookup = {int(v): k for k, v in (tokens or {}).items()}
+    # FILTER BEFORE THE GROUPBY, not after. The feed streams ~2,500
+    # symbols into one object, and this used to build a DataFrame for
+    # every one of them and then look up which were wanted - so a scan of
+    # the 216 F&O underlyings constructed 2,497 frames and discarded
+    # 2,281. Measured 2026-09-16: 22.5 seconds of that, against 1.2
+    # seconds for the prior-session read of the same 216 names, and it was
+    # the largest single cost in the default scope by a wide margin.
+    #
+    # Nothing changes when `tokens` is None: without a mapping there is
+    # nothing to filter on, and the frames come back keyed by token
+    # exactly as before.
+    if lookup:
+        frame = frame[frame["instrument_token"].isin(lookup)]
+        if frame.empty:
+            return {}
     out = {}
-    for token, group in by_token.items():
+    for token, group in frame.groupby("instrument_token"):
         key = lookup.get(int(token), int(token))
         block = group.sort_values("Date").set_index("Date")
         block.index = pd.DatetimeIndex(block.index)
@@ -438,11 +510,93 @@ def prewarm(symbols: list, days: "int | None" = None,
     import market_source
     interval = interval or market_source.kite_interval(config.SCAN_BAR_INTERVAL)
     start, end = history_window(days)
+
+    # THE CONSOLIDATED STORE FIRST, for the symbols it genuinely covers.
+    # Measured 2026-09-16 on 2,302 symbols: one read of the consolidated
+    # parquet takes 3.6 seconds against 33 seconds for the same data as
+    # 2,302 separate per-symbol cache files. Same bars either way - the
+    # store is folded FROM that cache - so this is a file-layout win, not
+    # a different answer.
+    covered = from_store(symbols, start, end, interval)
+    missing = [s for s in symbols if s not in covered]
+    if not missing:
+        return covered
+
     try:
-        return market_source.bars(symbols, start, end, interval=interval)
+        fetched = market_source.bars(missing, start, end, interval=interval)
     except market_source.NoSession as exc:
         logger.warning("%s", exc)
+        return covered
+    covered.update(fetched)
+    return covered
+
+
+# How far behind the window's end the consolidated store may fall before
+# it is refused outright. ONE session of slack, not more: the relative
+# volume gate medians across the sessions in this window, and this project
+# measured the gate's verdict differing on 7 of 40 symbols when the two
+# paths supplied different windows. A store missing yesterday is not a
+# smaller window, it is a different measurement.
+STORE_MAX_STALE_DAYS = 1
+
+
+def from_store(symbols: list, start, end, interval: str) -> dict:
+    """Prior sessions from the consolidated store, for symbols it covers.
+
+    RETURNS ONLY WHAT IT CAN PROVE. A symbol appears in the result only if
+    its own newest bar in the store reaches the freshest session the store
+    holds, and the store as a whole is refused if that session is more than
+    STORE_MAX_STALE_DAYS behind the window's end.
+
+    The alternative - returning whatever the store happens to hold - would
+    quietly hand back a shorter history for some symbols and a full one for
+    others, so the relative-volume baseline and the ATR would be computed
+    over different windows on different names in the same scan, with
+    nothing anywhere reporting it. A slow scan is recoverable; that is not.
+    """
+    try:
+        import bar_store
+
+        frames = bar_store.load(interval, symbols=list(symbols), start=start,
+                                end=end)
+    except Exception as exc:
+        logger.info("No consolidated %s store (%s); fetching per symbol",
+                    interval, exc)
         return {}
+    if not frames:
+        return {}
+
+    newest = None
+    for frame in frames.values():
+        if frame is None or frame.empty:
+            continue
+        last = frame.index.max()
+        if newest is None or last > newest:
+            newest = last
+    if newest is None:
+        return {}
+
+    behind = (end - newest.date()).days
+    if behind > STORE_MAX_STALE_DAYS:
+        logger.info("Consolidated %s store reaches %s, %d days behind the "
+                    "window ending %s - fetching per symbol instead",
+                    interval, newest.date(), behind, end)
+        return {}
+
+    # Per symbol: it must reach the same freshest session the store does.
+    # A name that stopped trading a week ago is not "covered" merely
+    # because the file contains it.
+    cutoff = newest.date()
+    out = {}
+    for symbol, frame in frames.items():
+        if frame is None or frame.empty:
+            continue
+        if frame.index.max().date() >= cutoff:
+            out[symbol] = frame
+    logger.info("Prior sessions for %d/%d symbols from the consolidated "
+                "%s store (newest %s)", len(out), len(symbols), interval,
+                cutoff)
+    return out
 
 
 def backfill_today(symbols: list, interval: "str | None" = None) -> dict:
@@ -528,10 +682,15 @@ def combined(symbols: list, tokens: "dict[str, int] | None" = None,
     return out
 
 
+def seed_name(when: "date | None" = None) -> str:
+    """The bare file name for today's pre-stream backfill."""
+    day = when or datetime.now(IST).date()
+    return f"seed_{day:%Y%m%d}.parquet"
+
+
 def seed_path(when: "date | None" = None) -> Path:
     """Where today's pre-stream backfill is kept."""
-    day = when or datetime.now(IST).date()
-    return STORE / f"seed_{day:%Y%m%d}.parquet"
+    return STORE / seed_name(when)
 
 
 def write_seed(frames: dict, when: "date | None" = None) -> int:
@@ -548,30 +707,17 @@ def write_seed(frames: dict, when: "date | None" = None) -> int:
         rows.append(block)
     if not rows:
         return 0
-    STORE.mkdir(parents=True, exist_ok=True)
     joined = pd.concat(rows, ignore_index=True)
-    target = seed_path(when)
-    temporary = target.with_suffix(".tmp")
-    try:
-        joined.to_parquet(temporary)
-        os.replace(temporary, target)
-    except Exception as exc:
-        logger.warning("Could not write today's seed: %s", exc)
+    if not _write_frame(joined, seed_name(when), seed_path(when),
+                        "today's seed"):
         return 0
     return len(joined)
 
 
 def load_seed(when: "date | None" = None) -> dict:
     """Today's pre-stream bars per symbol, or {} when there is no seed."""
-    path = seed_path(when)
-    if not path.exists():
-        return {}
-    try:
-        frame = pd.read_parquet(path)
-    except Exception as exc:
-        logger.warning("Unreadable seed %s: %s", path.name, exc)
-        return {}
-    if frame.empty or "symbol" not in frame.columns:
+    frame = _read_frame(seed_name(when), seed_path(when), "seed")
+    if frame is None or frame.empty or "symbol" not in frame.columns:
         return {}
     stamp = "Date" if "Date" in frame.columns else frame.columns[0]
     out = {}
@@ -584,27 +730,180 @@ def load_seed(when: "date | None" = None) -> dict:
     return out
 
 
-def status(when: "date | None" = None) -> dict:
-    """What the live store currently holds, for a UI line."""
-    path = store_path(when)
-    if not path.exists():
-        return {"present": False}
+# A SHORT CACHE, because status() is called three times per scan cycle -
+# once in app.py as a CACHE KEY, once by the feed panel, once by the scan's
+# own freshness gate. The feed flushes every 20 seconds, so anything
+# fresher than that is reporting a number that has not changed. Measured
+# 2026-09-16: 4.0s per call over S3 against a 4.98 MB session object, so
+# the three calls cost twelve seconds a cycle to learn nothing new twice.
+#
+# Two seconds is deliberately far below the flush interval: it collapses
+# the duplicate calls within one render without letting the panel lag the
+# feed by anything a human would notice, and it is negligible against the
+# 420s staleness limit the scan actually gates on.
+_STATUS_TTL_SECONDS = 2.0
+_status_cache: dict = {}
+
+
+def clear_status_cache() -> None:
+    """Drop the memoised status. For tests and for a forced refresh."""
+    _status_cache.clear()
+
+
+def status_name(when: "date | None" = None) -> str:
+    """The tiny status sidecar for one session."""
+    day = when or datetime.now(IST).date()
+    return f"status_{day:%Y%m%d}.json"
+
+
+def write_status(frame, when: "date | None" = None) -> bool:
+    """Publish the four numbers a status panel needs, as ~200 bytes.
+
+    WHY THIS EXISTS. status() used to read the whole session object to
+    report a bar count and a newest timestamp. That object GROWS all day -
+    352 KB at 09:32 on 2026-09-16 and 4.98 MB by 15:58 - and over S3 the
+    read measured 4 seconds. app.py calls status() three times per scan
+    cycle, one of them as a CACHE KEY, so a 20-second autoscan was pulling
+    roughly 15 MB and spending twelve seconds a cycle to learn how many
+    bars there were. That is the whole "it gets slower during market
+    hours" complaint: the cost scales with the session, not with the work.
+
+    The feed already holds these numbers in memory when it flushes, so
+    publishing them costs nothing and the reader stops paying by the
+    megabyte.
+
+    IT CANNOT GO STALE UNNOTICED. age_seconds is derived from the newest
+    bar's own timestamp, so a feed that dies leaves a sidecar whose age
+    grows exactly as it should - which is the signal the panel wants.
+    """
+    if frame is None or frame.empty:
+        return False
     try:
-        frame = pd.read_parquet(path)
-    except Exception:
-        return {"present": False}
-    if frame.empty:
-        return {"present": True, "bars": 0, "instruments": 0}
-    latest = pd.DatetimeIndex(frame["Date"]).max()
+        latest = pd.DatetimeIndex(frame["Date"]).max()
+        payload = {
+            "bars": len(frame),
+            "instruments": int(frame["instrument_token"].nunique()),
+            "latest_bar": latest.isoformat(),
+            "partial": int(frame.get("partial", pd.Series(dtype=bool)).sum()),
+        }
+    except Exception as exc:
+        logger.warning("Could not build the status sidecar: %s", exc)
+        return False
+
+    body = json.dumps(payload).encode("utf-8")
+    name = status_name(when)
+    if object_store.enabled():
+        try:
+            object_store.put(name, body)
+            return True
+        except Exception as exc:
+            logger.warning("Could not publish %s: %s", name, exc)
+            return False
+    try:
+        STORE.mkdir(parents=True, exist_ok=True)
+        (STORE / name).write_bytes(body)
+        return True
+    except OSError as exc:
+        logger.warning("Could not write %s: %s", name, exc)
+        return False
+
+
+def read_status(when: "date | None" = None) -> "dict | None":
+    """The sidecar's numbers, or None when there is no readable sidecar."""
+    name = status_name(when)
+    try:
+        if object_store.enabled():
+            payload = object_store.get(name)
+        else:
+            path = STORE / name
+            payload = path.read_bytes() if path.exists() else None
+    except object_store.StorageError:
+        # Let a fault reach the caller through the usual path rather than
+        # silently falling back to a 5 MB download that will also fail.
+        raise
+    except OSError:
+        return None
+    if not payload:
+        return None
+    try:
+        found = json.loads(payload)
+    except ValueError:
+        return None
+    return found if isinstance(found, dict) and "latest_bar" in found else None
+
+
+def _aged(payload: dict) -> dict:
+    """Turn a sidecar payload into the dict status() promises."""
+    latest = pd.Timestamp(payload["latest_bar"])
+    age = float("nan")
+    if latest.tzinfo:
+        age = max(0.0, (datetime.now(IST) - latest.tz_convert(IST))
+                  .total_seconds())
     return {
         "present": True,
-        "bars": int(len(frame)),
-        "instruments": int(frame["instrument_token"].nunique()),
+        "bars": int(payload.get("bars", 0)),
+        "instruments": int(payload.get("instruments", 0)),
         "latest_bar": latest,
-        "partial": int(frame.get("partial", pd.Series(dtype=bool)).sum()),
-        # float("nan") rather than None when the age is unknowable, so a
-        # caller's NaN check behaves and a format string cannot blow up.
-        "age_seconds": (max(0.0, (datetime.now(IST)
-                                 - latest.tz_convert(IST)).total_seconds())
-                        if latest.tzinfo else float("nan")),
+        "partial": int(payload.get("partial", 0)),
+        "age_seconds": age,
     }
+
+
+def status(when: "date | None" = None) -> dict:
+    """What the live store currently holds, for a UI line."""
+    import time as _time
+
+    key = str(when)
+    cached = _status_cache.get(key)
+    if cached is not None and _time.monotonic() - cached[0] < _STATUS_TTL_SECONDS:
+        return dict(cached[1])
+
+    # THE SIDECAR FIRST. Four numbers out of ~200 bytes rather than out of
+    # a session object that reached 4.98 MB by mid-afternoon. Falls
+    # through to the full read when no sidecar exists, so a feed running
+    # an older image still works.
+    try:
+        brief = read_status(when)
+        if brief is not None:
+            answer = _aged(brief)
+            _status_cache[key] = (_time.monotonic(), answer)
+            return dict(answer)
+    except object_store.StorageError as exc:
+        return {"present": False, "error": str(exc)}
+    except Exception as exc:
+        logger.warning("Unusable status sidecar, falling back: %s", exc)
+
+    # Unlike load_today this is a DISPLAY path, rendered on every page
+    # load, so a storage fault is reported rather than raised. It is
+    # carried in the result so a caller can say "unreachable" instead of
+    # the flatly wrong "the feed has not started".
+    try:
+        frame = _read_frame(store_name(when), store_path(when),
+                            "live bar store")
+    except object_store.StorageError as exc:
+        return {"present": False, "error": str(exc)}
+    if frame is None:
+        answer = {"present": False}
+    elif frame.empty:
+        answer = {"present": True, "bars": 0, "instruments": 0}
+    else:
+        latest = pd.DatetimeIndex(frame["Date"]).max()
+        answer = {
+            "present": True,
+            "bars": len(frame),
+            "instruments": int(frame["instrument_token"].nunique()),
+            "latest_bar": latest,
+            "partial": int(frame.get("partial", pd.Series(dtype=bool)).sum()),
+            # float("nan") rather than None when the age is unknowable, so
+            # a caller's NaN check behaves and a format string cannot
+            # blow up.
+            "age_seconds": (max(0.0, (datetime.now(IST)
+                                     - latest.tz_convert(IST)).total_seconds())
+                            if latest.tzinfo else float("nan")),
+        }
+    # THE FALLBACK IS MEMOISED TOO, and it is the one that matters until
+    # the container runs an image that publishes the sidecar - it is the
+    # 4-second read, and caching it is what collapses three calls a cycle
+    # into one.
+    _status_cache[key] = (_time.monotonic(), answer)
+    return dict(answer)
