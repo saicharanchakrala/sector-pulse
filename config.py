@@ -214,6 +214,12 @@ SCAN_COST_MULTIPLE = 3.0          # target must clear round-trip cost this many 
 # is not headroom, it is a window in which a dead feed still passes -
 # which is why this is derived and not typed.
 SCAN_LIVE_MAX_AGE_SECONDS = 2 * SCAN_BAR_SECONDS + 60
+# How old a PUBLISHED scan may be before the UI refuses it and offers to
+# compute one. Tied to the bar size on purpose: a table older than one bar
+# describes a bar that has since closed, so its levels were computed
+# against a price the market has already left behind. The feed scans every
+# 30 seconds, so this tolerates several missed passes before complaining.
+SCAN_PUBLISHED_MAX_AGE_SECONDS = SCAN_BAR_SECONDS
 
 # How often a tab waiting for the first automatic scan re-checks whether it
 # may run yet. The gate is only evaluated on a full script run, and its

@@ -45,6 +45,7 @@ import options_chain
 import position_watch
 import premarket
 import scan_data
+import scan_publish
 import instruments
 import option_history
 import filings
@@ -1101,6 +1102,69 @@ def render_premarket_panel() -> None:
             "trade. **filing_18h** is context only: a material filing "
             "measured 29.6% here against a 30.6% control, so it is not a "
             "reason to take a trade.")
+
+
+def render_published_scan() -> bool:
+    """Show the scan the feed published. True when it rendered one.
+
+    WHY READ RATHER THAN COMPUTE. Measured 2026-09-16, computing this here
+    cost 48 seconds for the 216 F&O underlyings - and only 5.8 of those
+    were the scan. The rest was fetching bars the feed already held in
+    memory: 5.6s counting rows in a 5 MB object, 7.6s looking up tokens,
+    29.4s reassembling bars over the network. The feed now does the scan
+    where the bars are and publishes a 56 KB table; this reads it.
+
+    IT REFUSES A STALE ONE. A table older than one bar describes a bar
+    that has since closed, so its levels were computed against a price the
+    market has left behind. Past that age this returns False and the
+    caller falls back to computing, which is slow but current - the same
+    trade the live-bar staleness gate already makes.
+    """
+    try:
+        found = scan_publish.load()
+    except Exception as exc:
+        st.caption(f"Published scan unavailable ({exc}).")
+        return False
+    if found is None:
+        return False
+    table, age = found
+    if table.empty:
+        st.info("The feed scanned and found nothing that cleared its gates.")
+        return True
+    if age == age and age > config.SCAN_PUBLISHED_MAX_AGE_SECONDS:
+        st.warning(
+            f"The published scan is {age:.0f}s old, past the "
+            f"{config.SCAN_PUBLISHED_MAX_AGE_SECONDS}s limit - the feed has "
+            f"most likely stopped. Run a scan below to compute a fresh one.",
+            icon=":material/schedule:")
+        return False
+
+    actionable = int(table["actionable"].sum()) if "actionable" in table else 0
+    directional = int((table["direction"] != setups.NO_SETUP).sum()) \
+        if "direction" in table else 0
+    left, mid, right = st.columns(3)
+    left.metric("Symbols scanned", f"{len(table):,}")
+    mid.metric("Got a direction", f"{directional:,}")
+    right.metric("Cleared every gate", f"{actionable:,}")
+    st.caption(f"Computed by the feed {age:.0f}s ago, where the bars "
+               f"already are. Nothing here was calculated in this page.")
+
+    # Cleared trades first, then the ones that got a direction and were
+    # blocked - the second group is the useful half, since the gates are
+    # the part of this scanner the measurements support.
+    show = table.sort_values(["actionable", "score"], ascending=[False, False])
+    columns = [c for c in ("symbol", "direction", "actionable", "score",
+                           "entry", "stop", "target", "quantity",
+                           "required_win_rate", "breakeven_pct", "rvol",
+                           "relative_strength", "turnover_20d")
+               if c in show.columns]
+    st.dataframe(show[columns], width="stretch", hide_index=True)
+
+    with st.expander("Why each one passed or was blocked"):
+        reasons = show[["symbol", "direction", "reasons"]] \
+            if "reasons" in show.columns else show[["symbol"]]
+        st.dataframe(reasons, width="stretch", hide_index=True)
+    return True
 
 
 def render_scan_controls() -> tuple[str, bool, "datetime | None", bool]:
@@ -2658,6 +2722,11 @@ def render_scan_tab() -> None:
     """Intraday scanner tab: controls, then the last scan's results."""
     render_live_feed_panel()
     render_premarket_panel()
+    # READ FIRST. When the feed has published a fresh scan the page shows
+    # it without computing anything. The controls below stay available so
+    # a deliberate local run is still one click away - the fallback is not
+    # removed, only demoted, because a dead feed must not mean a dead UI.
+    published = render_published_scan()
     scope, want_options, as_of, run = render_scan_controls()
     # AUTO-RUN THE FIRST SCAN when the session is live and the feed is
     # carrying it. Requiring a button press meant the table was simply
@@ -2666,7 +2735,12 @@ def render_scan_tab() -> None:
     # restart is gone too. Only the FIRST scan is automatic; refreshing
     # after that stays opt-in, because each one re-scores every symbol.
     auto = False
-    if not run and st.session_state.get("scan") is None:
+    if published:
+        # The feed's table is already on screen. Auto-running a local scan
+        # here would spend 48 seconds recomputing what the reader is
+        # looking at, on a machine that has other things to do.
+        pass
+    elif not run and st.session_state.get("scan") is None:
         why_not = autoscan_blocked(as_of, want_options, scope)
         if why_not:
             if autoscan_will_clear(as_of, want_options, scope):
