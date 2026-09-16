@@ -1,15 +1,13 @@
 """Attention chimes for the position watch, generated rather than shipped.
 
-WHY A CHIME AT ALL, when the watch also speaks. Speech goes through the
-Web Speech API inside a component iframe, and Chrome has refused
-speechSynthesis.speak() in a document that has never been clicked since
-M71. A component iframe is rebuilt on the rerun that carries the alert, so
-it may well be such a document, and a stop going through is exactly the
-case where "the browser suppressed it" is not an acceptable outcome. The
-chime plays in the page itself, which by the time an alert can fire has
-usually been clicked - though not certainly, since a page left open from
-before the open has had no interaction either. Neither channel is
-guaranteed, which is why there are two of them plus a toast and a table.
+WHY A CHIME AT ALL. It is now the only audible channel - the spoken
+sentence that used to accompany it went through the Web Speech API in a
+component iframe, and has been removed. The chime plays in the page
+itself, which by the time an alert can fire has usually been clicked,
+though not certainly: a page left open from before the open has had no
+interaction either and Chrome may suppress its audio. So the chime is
+backed by a toast and by a standing alert that stays on screen until
+acknowledged, which is the channel nothing can suppress.
 
 WHY GENERATED. These are sine tones with a fade - a few dozen lines of
 stdlib rather than four binary blobs nobody can review or diff. The

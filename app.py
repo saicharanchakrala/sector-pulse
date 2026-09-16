@@ -30,7 +30,6 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from streamlit.components.v1 import html as component_html
 
 import analyzer
 import claude_insights
@@ -44,6 +43,7 @@ import market_data
 import news_fetcher
 import options_chain
 import position_watch
+import premarket
 import scan_data
 import instruments
 import option_history
@@ -695,9 +695,6 @@ def watch_table(frame, key: str, target=None, symbol: "str | None" = None,
         on_select="rerun", selection_mode="single-row", key=key)
     rows = list(getattr(picked, "selection", {}).get("rows", []))
     if not rows:
-        surface.caption(
-            "Tick a row to add it to Positions - the levels arrive "
-            "prefilled and editable.")
         return
     index = rows[0]
     if index >= len(frame):
@@ -982,8 +979,7 @@ def refresh_scan_fragment() -> None:
         return
     started = time.monotonic()
     with st.spinner("refreshing from the live feed..."):
-        ranked, bars, benchmark, now, past = run_scan(
-            params["capital"], params["risk_pct"], params["scope"], None)
+        ranked, bars, benchmark, now, past = run_scan(params["scope"], None)
     st.session_state["scan_seconds"] = time.monotonic() - started
     st.session_state["scan"] = (ranked, bars, benchmark, now,
                                 params["want_options"], past)
@@ -1002,24 +998,124 @@ def refresh_scan_fragment() -> None:
         st.rerun()
 
 
-def render_scan_controls() -> tuple[float, float, str, bool, "datetime | None", bool]:
-    """Scan inputs; returns (capital, risk_pct, scope, want_options, as_of, run)."""
-    left, mid, right = st.columns(3)
+@st.cache_data(ttl=1800, show_spinner=False)
+def _watchlist(stamp: str):
+    """The PUBLISHED pre-open list. Never builds one.
+
+    Building it costs 19.4 seconds - 3.98M rows across 2,520 symbols, then
+    a per-symbol loop - and Streamlit re-executes this whole file on every
+    interaction. So the page reads what run_nightly.cmd wrote and offers
+    the slow path as a button rather than making every visitor pay for it.
+
+    `stamp` is the published file's own timestamp, used as a cache key so
+    the memo invalidates exactly when the file is rewritten.
+    """
+    return premarket.load_published()
+
+
+def render_premarket_panel() -> None:
+    """What is computable before an opening range exists.
+
+    WHY IT IS HERE. choose_direction needs an opening-range break, so the
+    scan below can say nothing until about 09:30 - the tab was honestly
+    empty from 08:00 until fifteen minutes after the bell. This fills that
+    window with the only thing settled daily bars can support.
+
+    Expanded while the scan cannot answer and collapsed once it can, so it
+    does not push the live table down the page during the session.
+    """
+    now = datetime.now(IST_ZONE)
+    try:
+        folded = premarket.store_written_at()
+        through = premarket.settled_through(now, written_at=folded)
+    except Exception as exc:
+        st.caption(f"Pre-open watchlist unavailable ({exc}).")
+        return
+
+    open_at = now.replace(hour=config.SCAN_SESSION_OPEN[0],
+                          minute=config.SCAN_SESSION_OPEN[1],
+                          second=0, microsecond=0)
+    close_at = now.replace(hour=config.SCAN_SESSION_CLOSE[0],
+                           minute=config.SCAN_SESSION_CLOSE[1],
+                           second=0, microsecond=0)
+    range_ends = open_at + timedelta(
+        minutes=config.SCAN_OPENING_RANGE_MINUTES)
+    scan_can_answer = range_ends <= now <= close_at
+
+    with st.expander("Pre-open watchlist - what settled bars can tell you",
+                     expanded=not scan_can_answer):
+        stamp = f"Daily store folded {folded:%d %b %H:%M}. " if folded else ""
+        # ON OR BEFORE, not "up to and including". 2026-09-14 was a
+        # holiday and the 12th and 13th a weekend, so the cutoff read
+        # 14 September while the newest bar in it was the 11th. Stating a
+        # date the data does not reach is how a stale list passes for a
+        # fresh one.
+        st.caption(f"Every figure describes sessions **on or before "
+                   f"{through}** - the newest may be earlier if that was "
+                   f"a holiday. {stamp}Needs no live feed and no scan.")
+        # SAID FIRST AND PLAINLY. Ranked on how far a name usually moves,
+        # which is the effect that replicated out of sample here - 2.03x
+        # in training, 1.22x in holdout. Direction did not: 0.5121 AUC
+        # against a 0.4990 null. So nothing here is a view on which way
+        # anything goes, and a caption that implied otherwise would be
+        # asserting the thing the measurements rejected.
+        st.info("Ranked by **how far a name usually moves**, not by which "
+                "way it might go. A wide range is as likely to go against "
+                "you as for you. This is what to watch, not what to buy.")
+        try:
+            mtime = (premarket.PUBLISHED.stat().st_mtime
+                     if premarket.PUBLISHED.exists() else 0)
+            published = _watchlist(str(mtime))
+        except Exception as exc:
+            st.warning(f"Could not read the watchlist ({exc}).")
+            return
+
+        if published is None:
+            # NOT built on demand. That is twenty seconds with the page
+            # frozen, and it would happen on every cold cache - which is
+            # every restart and every first load of a morning.
+            st.caption("No watchlist published yet. run_nightly.cmd writes "
+                       "one after the close; it takes about 20 seconds.")
+            if st.button("Build it now (~20s)"):
+                with st.spinner("Building from the daily store..."):
+                    premarket.publish()
+                st.rerun()
+            return
+
+        table, built_at = published
+        limit = st.slider("How many names", 10, 100, 25, step=5,
+                          key="premarket_limit")
+        st.caption(f"Published {built_at:%d %b %H:%M}. Nothing in it "
+                   f"changes intraday - every input is a settled session.")
+        st.dataframe(table.head(limit), use_container_width=True,
+                     hide_index=True)
+        st.caption(
+            "**atr_pct** is the average daily range as a share of price. "
+            "**expected_low/high** is one ATR either side of the last "
+            "close: a stop inside that band sits inside ordinary movement "
+            "and gets hit by noise rather than by being wrong. "
+            "**cost_in_atr** is the round-trip breakeven as a share of a "
+            "typical day - above about 0.15 the charges eat most of what "
+            "an ordinary session offers. **spike_ratio** above ~2 means "
+            "the turnover rests on a few big days rather than steady "
+            "trade. **filing_18h** is context only: a material filing "
+            "measured 29.6% here against a 30.6% control, so it is not a "
+            "reason to take a trade.")
+
+
+def render_scan_controls() -> tuple[str, bool, "datetime | None", bool]:
+    """Scan inputs; returns (scope, want_options, as_of, run).
+
+    CAPITAL AND RISK ARE NOT INPUTS ANY MORE. They only ever fed position
+    sizing - how many shares fit - and never changed which setups appeared
+    or how they ranked. Two number boxes at the top of the tab implied
+    otherwise, and they came before the one control that does change the
+    answer. Sizing now reads config.SCAN_CAPITAL and
+    config.SCAN_RISK_PCT_PER_TRADE, which is what setups.evaluate already
+    defaulted to when nothing was passed.
+    """
+    left, _ = st.columns([1, 2])
     with left:
-        capital = st.number_input(
-            "Money available today", min_value=1_000.0,
-            value=config.SCAN_CAPITAL, step=10_000.0,
-            help="How much you have to trade with. Used only to work out "
-                 "how many shares would fit - it is not a suggestion to "
-                 "use all of it.")
-    with mid:
-        risk_pct = st.number_input(
-            "Most you would lose per trade (%)", min_value=0.1,
-            max_value=10.0, value=config.SCAN_RISK_PCT_PER_TRADE, step=0.25,
-            help="If the trade goes wrong and you exit at the stop, this "
-                 "is the share of your money you lose. 1% of Rs 1,00,000 "
-                 "is Rs 1,000. It decides how many shares fit.")
-    with right:
         # index= AND key=, both deliberately. Without index the selectbox
         # defaults to item 0 - the ~2,570 full universe, nine minutes of
         # downloading - while the help text below claimed the default was
@@ -1038,13 +1134,15 @@ def render_scan_controls() -> tuple[float, float, str, bool, "datetime | None", 
         "Also pick an option contract for each setup",
         help="Adds one NSE chain request per setup, so it is slower. Live "
              "scans only: a past session has no chain to read.")
-    return (capital, risk_pct, scope, want_options, as_of,
-            st.button("Run intraday scan"))
+    return (scope, want_options, as_of, st.button("Run intraday scan"))
 
 
-def run_scan(capital: float, risk_pct: float, scope: str,
-             as_of: "datetime | None" = None):
-    """Fetch bars and evaluate every symbol in scope, live or replayed."""
+def run_scan(scope: str, as_of: "datetime | None" = None):
+    """Fetch bars and evaluate every symbol in scope, live or replayed.
+
+    Sizing comes from config rather than from arguments: it affects only
+    the share count on a setup, never whether the setup exists.
+    """
     discovered = instruments.load_latest()
     if discovered is None:
         discovered = instruments.discover()
@@ -1090,8 +1188,9 @@ def run_scan(capital: float, risk_pct: float, scope: str,
         reading = setups.measure(symbol, ticker, frame, bars.daily.get(ticker),
                                  benchmark, now, fo_state=states.get(symbol))
         if reading is not None:
-            evaluated.append(setups.evaluate(reading, capital=capital,
-                                             risk_pct=risk_pct))
+            evaluated.append(setups.evaluate(
+                reading, capital=config.SCAN_CAPITAL,
+                risk_pct=config.SCAN_RISK_PCT_PER_TRADE))
     return setups.rank(evaluated), bars, benchmark, now, replaying
 
 
@@ -1414,7 +1513,36 @@ def live_feed_state() -> dict:
     except Exception as exc:
         return {"available": False, "why": str(exc)}
     state = dict(live_bars.status())
+    # A storage fault reuses the panel's existing "unavailable, and here is
+    # why" shape rather than rendering as a feed that has not started.
+    if state.get("error"):
+        return {"available": False, "why": state["error"]}
     state["available"] = True
+
+    # A REMOTE FEED HAS NO LOCAL PID. live_feed.take_lock() deliberately
+    # writes no lock file on Fargate - a lock guards a shared disk, and a
+    # container's disk is neither shared nor durable, so ECS's
+    # desiredCount 1 is the singleton guarantee instead. The consequence
+    # was this panel: it derived "running" purely from that lock file, so
+    # with the feed on ECS it read "stopped" forever while 14,242 bars
+    # across 2,489 symbols arrived in S3 behind it.
+    #
+    # The honest signal for a feed you cannot see the process of is
+    # whether its BARS are arriving. Same threshold the scan itself uses
+    # to decide a file is too stale to trade on, so the panel and the
+    # scanner cannot disagree about whether the feed is alive.
+    import object_store
+
+    age = state.get("age_seconds")
+    fresh = (isinstance(age, (int, float)) and age == age
+             and age <= config.SCAN_LIVE_MAX_AGE_SECONDS)
+    if object_store.enabled():
+        state["remote"] = object_store.describe()
+        state["pid"] = None
+        state["running"] = bool(state.get("bars")) and fresh
+        return state
+
+    state["remote"] = ""
     lock = live_feed.LOCK
     holder = None
     if lock.exists():
@@ -1469,6 +1597,10 @@ def render_live_feed_panel() -> None:
             f"Kite's 3 requests a second. Prior sessions come from a cached "
             f"window ending yesterday; only today comes from the stream."
         )
+        if state.get("remote"):
+            st.caption(f"Reading bars published by the container at "
+                       f"**{state['remote']}** - there is no local process "
+                       f"to start or stop.")
         left, mid, right = st.columns(3)
         left.metric("Feed", "running" if state.get("running") else "stopped")
         mid.metric("Instruments", state.get("instruments", 0))
@@ -1476,6 +1608,15 @@ def render_live_feed_panel() -> None:
         right.metric("Newest bar",
                      f"{age:.0f}s ago" if isinstance(age, float) and age == age
                      else "none yet")
+        if (state.get("remote") and state.get("bars")
+                and not state.get("running")):
+            st.warning(
+                f"Bars are present but the newest is "
+                f"{state.get('age_seconds', 0):.0f}s old, past the "
+                f"{config.SCAN_LIVE_MAX_AGE_SECONDS}s limit - so the "
+                f"container has most likely stopped. Check it with: "
+                f"aws ecs describe-services --cluster avsp-cluster "
+                f"--services zone-pulse --profile innomesh-dev")
         if state.get("running") and not state.get("bars"):
             st.info(
                 "Streaming, but no completed bar yet. Bars are stamped at "
@@ -1489,11 +1630,10 @@ def render_live_feed_panel() -> None:
                 f"part-way through their bucket, so their volume is measured "
                 f"from an unknown baseline and the scan skips them."
             )
-        if not state.get("running"):
-            if st.button("Start live feed"):
-                st.info(start_live_feed())
-            st.code(".venv\\Scripts\\python -m live_feed", language="text")
-        else:
+        # Only for a LOCAL feed. A remote one has no PID and nothing on
+        # this machine to taskkill, so the line rendered as the frankly
+        # useless "PID None - stop it from the terminal that owns it".
+        if state.get("running") and not state.get("remote"):
             st.caption(f"PID {state.get('pid')} - stop it from the terminal "
                        f"that owns it, or with taskkill.")
 
@@ -1529,8 +1669,7 @@ def horizon_anchor() -> tuple:
 
     bucket = int(time.time() // HORIZON_ANCHOR_SECONDS)
     if not live_bars_in_hours():
-        return False, 0, ("market closed, so these are anchored on the last "
-                          "daily close - which is where they last traded")
+        return False, 0, ""
     try:
         import market_source
         if not market_source.session_available():
@@ -1548,14 +1687,6 @@ def render_horizon_tables(symbols: list, top: int = 20) -> None:
     the first table is readable while the rest are still being scored.
     """
     st.subheader("Longer horizons")
-    st.caption(
-        "Assessed from the consolidated daily store, with NO session-time "
-        "gate - whether minutes remain today is irrelevant to a position "
-        "held for weeks. Intraday above keeps its own gates."
-    )
-    st.warning(horizons.HONESTY)
-    with st.expander("The exact figures, if you want them"):
-        st.caption(horizons.HONESTY_DETAIL)
     slots = {}
     for name in ("short", "mid", "long"):
         sessions = horizons.HORIZONS[name]["sessions"]
@@ -2110,46 +2241,8 @@ def watch_dialog() -> None:
 
 # --- the alert ------------------------------------------------------------
 
-def speech_html(phrases: list, speak_now: bool = True) -> str:
-    """A component iframe that speaks the alert, and can be asked again.
-
-    The replay button is not a nicety. Chrome refuses
-    speechSynthesis.speak() in a document that has never been clicked, and
-    this iframe is rebuilt on the rerun that carries the alert, so the
-    first attempt may be dropped with no error anywhere. Clicking the
-    button both gives that document its activation and says the sentence.
-    """
-    # "</" escaped: json.dumps does not, and a symbol containing it would
-    # close the script block. Self-inflicted only, and one line to prevent.
-    lines = json.dumps([p for p in phrases if p]).replace("</", "<\\/")
-    return f"""
-<div style="font:13px system-ui,-apple-system,sans-serif;color:#555;
-            display:flex;align-items:center;gap:.6rem">
-  <button id="again" style="font:13px system-ui;padding:.3rem .7rem;
-          border:1px solid #bbb;border-radius:.4rem;background:#fff;
-          cursor:pointer">&#128266; Say it again</button>
-  <span id="said"></span>
-</div>
-<script>
-const lines = {lines};
-document.getElementById("said").textContent = lines.join("  ");
-function say() {{
-  if (!("speechSynthesis" in window)) return;
-  window.speechSynthesis.cancel();
-  for (const line of lines) {{
-    const u = new SpeechSynthesisUtterance(line);
-    u.rate = 0.95;
-    window.speechSynthesis.speak(u);
-  }}
-}}
-document.getElementById("again").addEventListener("click", say);
-if ({'true' if speak_now else 'false'}) say();
-</script>
-"""
-
-
 def announce(statuses: list) -> bool:
-    """Chime and speak any alert not already announced. True if it fired.
+    """Chime any alert not already announced. True if one fired.
 
     The dedupe rule lives in position_watch.alerts_to_announce, tested
     there: one alert per position and STATE, and the key forgotten as soon
@@ -2176,11 +2269,9 @@ def announce(statuses: list) -> bool:
     if chime:
         st.audio(chime, format="audio/wav", autoplay=True)
     phrases = [s.spoken for s in fresh]
-    component_html(speech_html(phrases), height=40)
-    # Kept, because both channels can be suppressed by the browser and
-    # this panel is redrawn every twenty seconds - the alert itself would
-    # scroll into history within one tick, taking its replay button with
-    # it.
+    # Kept, and now the ONLY place the sentence survives: this panel is
+    # redrawn every twenty seconds, so the toast scrolls into history
+    # within one tick. The chime says something happened; this says what.
     st.session_state["standing_alert"] = {
         "phrases": phrases,
         "worst": fresh[0].state,
@@ -2192,10 +2283,10 @@ def announce(statuses: list) -> bool:
 def render_standing_alert() -> None:
     """The last alert, until it is acknowledged.
 
-    Neither channel is guaranteed to arrive: Chrome can suppress the
-    utterance, and a page nobody has clicked can suppress the chime too.
-    So the sentence stays on screen with a button that says it again -
-    which the alert itself cannot do, since the fragment redraws over it.
+    The chime is not guaranteed to arrive - a page nobody has clicked can
+    have its audio suppressed - and the fragment redraws over the toast
+    within one tick. So the sentence stays on screen until acknowledged,
+    which is the channel that cannot be suppressed or scrolled away.
     """
     standing = st.session_state.get("standing_alert")
     if not standing:
@@ -2207,8 +2298,6 @@ def render_standing_alert() -> None:
         if st.button("Acknowledge", key="ack_alert", width="stretch"):
             st.session_state.pop("standing_alert", None)
             st.rerun()
-    component_html(speech_html(standing["phrases"], speak_now=False),
-                   height=40)
 
 
 # --- the tab --------------------------------------------------------------
@@ -2331,10 +2420,11 @@ def render_positions_tab() -> None:
     )
     left, right = st.columns([1, 2], vertical_alignment="center")
     speak = left.toggle(
-        "Announce out loud", value=True, key="watch_speak",
-        help="A chime plus a spoken sentence when a stop or target is hit, "
-             "a target is neared, or the scan flips against you. Each alert "
-             "sounds once, not on every refresh.")
+        "Chime on alerts", value=True, key="watch_speak",
+        help="A chime when a stop or target is hit, a target is neared, or "
+             "the scan flips against you - falling for a stop, rising for a "
+             "target. Each alert sounds once, not on every refresh. The "
+             "sentence itself stays on screen until you acknowledge it.")
     if right.button("Test the sound", key="watch_sound_test"):
         # Its own nonce, for the same reason a real alert has one: the
         # frontend will not autoplay an audio id it has already seen, so a
@@ -2345,9 +2435,6 @@ def render_positions_tab() -> None:
         st.session_state["alert_nonce"] = nonce
         st.audio(sound.chime_for(position_watch.TARGET_REACHED, nonce),
                  format="audio/wav", autoplay=True)
-        component_html(speech_html(
-            ["Sector Pulse. This is what a target reached sounds like."]),
-            height=40)
     # UNCONDITIONAL, and that is the fix for the worst bug review found.
     # This used to pass run_every=None unless the market was open AND
     # something was already watched - both evaluated on a full app run.
@@ -2569,68 +2656,9 @@ def render_instrument_search() -> None:
 
 def render_scan_tab() -> None:
     """Intraday scanner tab: controls, then the last scan's results."""
-    # ONE line of the honesty text stays visible; the rest moved into the
-    # expander below. Three stacked warning blocks before any data meant
-    # the page opened with nothing on it but caveats, and a warning nobody
-    # reads is worse than a shorter one they do.
-    st.warning(
-        "**Not a forecast.** Tested over 760,458 past moments and it picked "
-        "winners no better than the same method fed scrambled answers. The "
-        "cost columns are arithmetic and do hold up - use this to rule "
-        "trades OUT.",
-        icon=":material/science:")
-    with st.expander("What was measured, and what this is good for"):
-        st.markdown(
-            "**What it is genuinely good for.** The money columns are just "
-            "arithmetic, and those hold up: what a trade costs you in fees, "
-            "how often it would have to work to break even, and which "
-            "setups cannot pay for themselves however right you are about "
-            "direction. Used to say no to trades, this saves money. Used to "
-            "pick them, it does not."
-        )
-        st.caption(
-            "A separate system from the positional signal: it holds for "
-            "hours, not weeks, so it has its own data, thresholds and cost "
-            "model, and no threshold is shared between the two."
-        )
-        st.caption(
-            f"Measured on 14 September 2026 against the code as it stands, "
-            f"not transcribed from an older run: gradient-boosted model, "
-            f"{_forecast_feature_count()} features, 760,458 samples across "
-            f"210 stocks and 228 sessions, purged walk-forward with an "
-            f"embargo. Ranking accuracy (AUC) 0.5121, against 0.4990 for "
-            f"the same model on shuffled labels, where 0.50 is a coin "
-            f"flip. Chosen geometry net -0.391 R per trade. Exact "
-            f"permutation p 0.871 over {_forecast_permutations()} "
-            f"shuffles - 26 of them beat the real model. 0 of 12 "
-            f"geometries profitable, and every confidence interval but "
-            f"one sits entirely below zero."
-        )
-        st.caption(
-            "That AUC is the mean of the three folds - 0.4863, 0.5143, "
-            "0.5357 - rather than one score over the folds pooled "
-            "together. The distinction is not pedantic: pooling ranks "
-            "three separately calibrated models against each other, which "
-            "reported 0.5176 against 0.4859 and inflated the model's edge "
-            "over chance from 0.013 to 0.032, roughly 2.4x, in the "
-            "direction that flatters it. Note also that on the first fold "
-            "the model ranked WORSE than chance."
-        )
-        st.caption(
-            "Why a better model cannot close the gap: at the chosen "
-            "geometry the base hit rate is 27.9% and the rate needed to "
-            "clear costs is 42.0%, a gap of 14 points. The model's whole "
-            "edge over a coin flip is about 1 point of AUC. The arithmetic "
-            "is the binding constraint, not the learning."
-        )
-        st.caption(
-            "One limitation still open, stated rather than buried: the "
-            "shuffled null selects 357 trades against the real model's "
-            "2,137, so their mean R figures are not strictly comparable "
-            "and the permutation p inherits that."
-        )
     render_live_feed_panel()
-    capital, risk_pct, scope, want_options, as_of, run = render_scan_controls()
+    render_premarket_panel()
+    scope, want_options, as_of, run = render_scan_controls()
     # AUTO-RUN THE FIRST SCAN when the session is live and the feed is
     # carrying it. Requiring a button press meant the table was simply
     # absent for anyone who opened the tab during market hours - and a
@@ -2683,8 +2711,7 @@ def render_scan_tab() -> None:
         st.session_state["scan_running"] = True
         try:
             with st.spinner(label):
-                ranked, bars, benchmark, now, past = run_scan(
-                    capital, risk_pct, scope, as_of)
+                ranked, bars, benchmark, now, past = run_scan(scope, as_of)
         except Exception as exc:
             # An automatic scan must not take the tab down. A manual one
             # still raises, because the user asked for it and wants to see
@@ -2708,13 +2735,9 @@ def render_scan_tab() -> None:
             # The inputs are kept beside the results so a timed refresh can
             # reproduce the same scan without the widgets being on screen.
             st.session_state["scan_params"] = {
-                "capital": capital, "risk_pct": risk_pct, "scope": scope,
-                "want_options": want_options}
+                "scope": scope, "want_options": want_options}
     stored = st.session_state.get("scan")
-    if stored is None:
-        st.info("Set your capital and risk, then hit Run intraday scan. "
-                "The longer horizons below need no scan and no live feed.")
-    else:
+    if stored is not None:
         every = render_scan_refresh_controls(replaying=bool(stored[5]),
                                              want_options=stored[4])
         if every:
@@ -2835,7 +2858,3 @@ with tab_positional:
 with tab_positions:
     render_positions_tab()
 
-st.caption(
-    "Educational tool only. Data comes from free public sources and may be delayed "
-    "or incomplete. Nothing here is financial advice."
-)
