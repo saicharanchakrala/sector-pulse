@@ -37,6 +37,20 @@ def _clean(frame: pd.DataFrame, columns: tuple[str, ...] = _REQUIRED
     missing = [name for name in columns if name not in frame.columns]
     if missing:
         return None
+    # CHECK BEFORE COPYING. dropna always builds a new frame, and it is
+    # called three times per measure() - from session_bars, vwap and
+    # true_range_by_session - on overlapping data that almost never has a
+    # gap. Profiled 2026-09-16 that was 540 calls and the largest single
+    # cost left in the evaluation. Three numpy reductions are far cheaper
+    # than a copy, so the copy now only happens when there is something to
+    # drop.
+    #
+    # The frame is returned AS IS in that case rather than as a copy.
+    # Every caller here reads it - slices it, or computes over it - and
+    # none mutates, so sharing is safe; a caller that starts mutating
+    # would need a copy of its own regardless.
+    if not any(frame[name].isna().any() for name in columns):
+        return frame
     usable = frame.dropna(subset=list(columns))
     return None if usable.empty else usable
 
@@ -447,6 +461,104 @@ def relative_volume(frame: pd.DataFrame, asof: "time | None" = None
     participation by this point. The median is taken across prior sessions
     rather than the mean so one frenzied day does not set the baseline.
     """
+    # ONE VALUE PER DAY, not one Series per day. cumulative_volume_by_time
+    # builds a full curve of ~125 points for every session in the window,
+    # and this function then reads a single point out of each. Profiled
+    # 2026-09-16 it was 1.64s of a 4.37s evaluation - 38% of the whole
+    # thing - to produce twelve numbers.
+    #
+    # The arithmetic below is the same: volume filled with zero, cumulative
+    # within each session, read at the last bar whose time is at or before
+    # `clock`, median across prior sessions. cumulative_volume_by_time is
+    # kept because it is the readable statement of what this computes, and
+    # test_indicators_fast asserts the two agree.
+    if frame is None or frame.empty or "Volume" not in frame.columns:
+        return None
+    index = frame.index
+    if not isinstance(index, pd.DatetimeIndex) or len(index) == 0:
+        return None
+
+    dates = index.date
+    times = index.time
+    volumes = frame["Volume"].fillna(0.0).to_numpy(dtype=float)
+    # One vectorised group-wise cumulative sum rather than a Python loop
+    # building Series. Sessions are contiguous in a sorted frame, so the
+    # boundaries are where the date changes.
+    if not index.is_monotonic_increasing:
+        # SORT, do not delegate. A running cumulative sum over shuffled
+        # rows would add volume across sessions, so this has to be
+        # handled - but handing it to the curve version is no answer
+        # either: that one calls Series.asof, which raises "asof requires
+        # a sorted index" on exactly this input. Unsorted frames never
+        # worked. Sorting costs a few microseconds and makes the function
+        # correct where it previously raised.
+        frame = frame.sort_index()
+        index = frame.index
+        dates = index.date
+        times = index.time
+        volumes = frame["Volume"].fillna(0.0).to_numpy(dtype=float)
+    starts = np.flatnonzero(np.r_[True, dates[1:] != dates[:-1]])
+    running = np.cumsum(volumes)
+    offsets = np.r_[0.0, running[starts[1:] - 1]] if len(starts) > 1 else \
+        np.array([0.0])
+    session_of = np.searchsorted(starts, np.arange(len(dates)), side="right") - 1
+    cumulative = running - offsets[session_of]
+
+    days = dates[starts]
+    if len(days) < 2:
+        return None
+    today = days.max()
+    today_rows = np.flatnonzero(dates == today)
+    if today_rows.size == 0:
+        return None
+    clock = times[today_rows[-1]] if asof is None else asof
+
+    def at(rows):
+        """Cumulative volume at the last bar on or before `clock`, or None."""
+        if rows.size == 0:
+            return None
+        eligible = rows[np.array([times[i] <= clock for i in rows])]
+        if eligible.size == 0:
+            return None
+        return _finite(float(cumulative[eligible[-1]]))
+
+    done = at(today_rows)
+    if done is None or done <= 0.0:
+        return None
+
+    baseline: list[float] = []
+    for day in days:
+        if day == today:
+            continue
+        rows = np.flatnonzero(dates == day)
+        # A short session's final total reads as "quiet at this hour" and
+        # inflates today's ratio. Measured: one prior session truncated to
+        # 20 of 75 bars pushed rvol from 2.0 to 3.16, through the 1.2
+        # floor on nothing but missing data.
+        if rows.size == 0 or times[rows[-1]] < clock:
+            continue
+        value = at(rows)
+        if value is not None and value > 0.0:
+            baseline.append(value)
+    if not baseline:
+        return None
+    median = float(np.median(baseline))
+    if median <= 0.0:
+        return None
+    return _finite(done / median)
+
+
+def _relative_volume_from_curves(frame: pd.DataFrame,
+                                 asof: "time | None" = None
+                                 ) -> "float | None":
+    """The readable implementation, kept as the reference.
+
+    NOT a fallback: Series.asof raises "asof requires a sorted index", so
+    this is strictly less capable than the fast path, which sorts. It
+    exists because it states the arithmetic plainly - cumulative volume
+    per session, read at a clock time, median across prior sessions - and
+    because test_indicators_fast holds the fast path to it on random data.
+    """
     curves = cumulative_volume_by_time(frame)
     usable = {day: series for day, series in curves.items() if series is not None}
     if len(usable) < 2:
@@ -461,10 +573,6 @@ def relative_volume(frame: pd.DataFrame, asof: "time | None" = None
     for day, series in usable.items():
         if day == today:
             continue
-        # asof() returns a short session's final total, which reads as "quiet
-        # at this hour" and inflates today's ratio. Measured: one prior
-        # session truncated to 20 of 75 bars pushed rvol from 2.0 to 3.16,
-        # through the 1.2 floor on nothing but missing data.
         if len(series) == 0 or series.index[-1] < clock:
             continue
         at_time = _finite(series.asof(clock))
