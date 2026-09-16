@@ -1,0 +1,15 @@
+{
+  "Version": "2012-10-17",
+  "Id": "zone-pulse-feed-access",
+  "Statement": [
+    {
+      "Sid": "TheSharedEcsRoleMayReadTheZonePulsePrefix",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::322535271012:role/Innomesh-ecs-task-execution-role"
+      },
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::original-image-test/zone-pulse/*"
+    }
+  ]
+}

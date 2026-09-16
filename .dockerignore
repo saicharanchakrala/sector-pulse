@@ -1,0 +1,42 @@
+# ALLOWLIST, NOT A DENYLIST. This file used to name what to leave out, and
+# an independent review found eight gitignored paths it had missed - two of
+# which (scan_universe.csv, scan_log.csv.superseded) were shipping into a
+# registry already, with .streamlit/secrets.toml and calls.csv latent the
+# moment those files existed.
+#
+# That is the wrong default for a repository that holds holdings, targets,
+# a broking session token and a scan log. `COPY . .` means anything not
+# excluded ships, so the exclusion list has to be exhaustive - and it will
+# not stay exhaustive, because personal files arrive without anyone
+# remembering to come back here.
+#
+# So: exclude everything, then name the few things the feed needs. A new
+# CSV of positions is now excluded because nobody added it, rather than
+# included because nobody removed it.
+#
+# The cost is that a genuinely new dependency must be added below. That is
+# a build failure, which is loud, rather than a data leak, which is not.
+
+**
+
+# Every Python module, at any depth. Broad on purpose: the feed's import
+# chain is config, instruments, kite_client, kite_ticker, live_bars,
+# market_source, bar_store and object_store today, but hand-listing those
+# would mean a future import produces an image that builds and then dies
+# on start. Source is a few hundred KB; the risk is not worth the saving.
+!**/*.py
+
+# The feed's dependency list, installed before the source is copied.
+!requirements-feed.txt
+
+# The instrument snapshot: tokens and the F&O set that universe() needs.
+# Named as one file rather than the directory so a stray .tmp beside it
+# cannot ride along.
+!instruments/universe.json
+
+# Tests are source, and are the one kind of source this image never runs.
+test_*.py
+
+# Not secret, but it describes the account, subnets and security group,
+# and it has no business inside a container with outbound network access.
+deploy/**

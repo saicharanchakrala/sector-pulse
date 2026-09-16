@@ -1,0 +1,30 @@
+# Dependencies for the CONTAINERISED FEED only, not the app.
+#
+# The feed's whole import chain is config, instruments, kite_client,
+# kite_ticker, live_bars, market_source, bar_store and object_store. None
+# of them touches streamlit, plotly, anthropic, feedparser or
+# vaderSentiment, so the image does not carry them - that is most of the
+# difference between a ~180 MB image and a ~600 MB one, and it is pulled
+# fresh every time the service scales up from zero.
+#
+# Kept as its own file rather than a marker in requirements.txt because
+# the app and the feed now genuinely run in different places, and one list
+# describing both would grow the image every time the UI gained a chart.
+
+pandas>=2.2
+numpy>=1.26
+pyarrow>=17.0
+requests>=2.32
+
+# kite_ticker imports this lazily, inside the live path only.
+websockets>=13.0
+
+# The object store the feed publishes bars to.
+boto3>=1.35
+
+# NOT OPTIONAL ON SLIM IMAGES. Every timestamp in this project is built
+# with ZoneInfo("Asia/Kolkata"), and python:*-slim ships no zoneinfo
+# database, so without this the feed raises ZoneInfoNotFoundError on the
+# first bar it tries to stamp. The system tzdata package would do as well;
+# this keeps it in the dependency list where it can be seen.
+tzdata>=2024.1

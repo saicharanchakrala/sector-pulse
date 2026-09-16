@@ -1,0 +1,36 @@
+{
+  "family": "zone-pulse",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "1024",
+  "memory": "2048",
+  "executionRoleArn": "arn:aws:iam::322535271012:role/Innomesh-ecs-task-execution-role",
+  "taskRoleArn": "arn:aws:iam::322535271012:role/Innomesh-ecs-task-execution-role",
+  "containerDefinitions": [
+    {
+      "name": "zone-pulse",
+      "image": "322535271012.dkr.ecr.ap-southeast-2.amazonaws.com/zone-pulse:latest",
+      "essential": true,
+      "environment": [
+        { "name": "SECTOR_PULSE_S3_BUCKET", "value": "original-image-test" },
+        { "name": "SECTOR_PULSE_S3_PREFIX", "value": "zone-pulse" },
+        { "name": "SECTOR_PULSE_S3_REGION", "value": "ap-southeast-2" },
+        { "name": "KITE_API_KEY", "value": "__KITE_API_KEY__" }
+      ],
+      "secrets": [
+        {
+          "name": "KITE_ACCESS_TOKEN",
+          "valueFrom": "arn:aws:ssm:ap-southeast-2:322535271012:parameter/zone-pulse/kite-access-token"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/zone-pulse",
+          "awslogs-region": "ap-southeast-2",
+          "awslogs-stream-prefix": "ecs"
+        }
+      }
+    }
+  ]
+}
