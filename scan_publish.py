@@ -46,15 +46,24 @@ IST = ZoneInfo("Asia/Kolkata")
 OBJECT_PREFIX = "setups_"
 
 # Seconds between scans. Measured 2026-09-16 on the 216 F&O underlyings, a
-# FULL loop iteration - splitting the stream frame, splicing, measuring,
-# evaluating, ranking and publishing - took 14.0 seconds. The scan alone
-# is 6.1 of that; the rest is turning one flat frame of every streamed
-# symbol into per-symbol frames.
+# STEADY-STATE loop iteration is about 5.3 seconds:
 #
-# Thirty therefore runs at roughly a 47% duty cycle, which leaves the CPU
-# for the tick stream - this process's actual job. Do not lower it without
-# measuring: a scan that overruns its own interval simply runs
-# continuously, and the socket is what suffers.
+#     0.80s  frames_from   splitting one flat frame of 2,497 streamed
+#                          symbols into the 216 wanted
+#     0.15s  assemble      splicing history, seed and today
+#     3.73s  evaluate      measure, evaluate, rank
+#     0.60s  publish       a 56 KB table to S3
+#
+# An earlier version of this comment said 14 seconds, measured on the
+# FIRST iteration in a fresh process. That is misleading: the first S3
+# put costs 7.2s against 0.6s for every one after it, because it pays the
+# TLS handshake and credential resolution. A long-running feed pays that
+# once at startup and never again.
+#
+# So thirty seconds runs at roughly an 18% duty cycle, leaving the CPU for
+# the tick stream - this process's actual job. Do not lower it without
+# measuring on a warm process: a scan that overruns its own interval
+# simply runs continuously, and the socket is what suffers.
 DEFAULT_EVERY = 30
 
 
