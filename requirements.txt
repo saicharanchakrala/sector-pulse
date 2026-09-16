@@ -9,4 +9,9 @@ requests>=2.32
 anthropic>=0.69
 pytest>=8.0
 pyarrow>=17.0
+
+# Reading the live bars the containerised feed publishes. Only needed when
+# SECTOR_PULSE_S3_BUCKET is set; object_store imports it lazily so a purely
+# local run never touches it.
+boto3>=1.35
 ruff==0.16.7
