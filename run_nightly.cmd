@@ -17,6 +17,11 @@ REM                 data as separate per-symbol files. live_bars.prewarm
 REM                 REFUSES a store more than one session behind, so if
 REM                 this step does not run the scan is correct and slow
 REM                 rather than fast and wrong.
+REM   daily_context - the twenty-five daily bars per symbol that the
+REM                 intraday scan actually reads. About 1.4 MB against the
+REM                 559 MB store it comes from, so a container can compute
+REM                 prev_close, the pivot range and turnover without one.
+REM                 Verified drop-in: 216 symbols, every reading identical.
 REM   outcomes    - resolves every setup in scan_log.csv against what the
 REM                 market actually did, turning the log from a record of
 REM                 intentions into a track record. Idempotent, and only
@@ -34,3 +39,4 @@ cd /d "C:\Users\Sai Charan Chakrala\PycharmProjects\sector-pulse"
 "C:\Users\Sai Charan Chakrala\PycharmProjects\sector-pulse\.venv\Scripts\python.exe" -m bar_store --intervals 3minute >> run\nightly.log 2>&1
 "C:\Users\Sai Charan Chakrala\PycharmProjects\sector-pulse\.venv\Scripts\python.exe" outcomes.py             >> run\nightly.log 2>&1
 "C:\Users\Sai Charan Chakrala\PycharmProjects\sector-pulse\.venv\Scripts\python.exe" -c "import premarket; print('watchlist:', premarket.publish(), 'names')" >> run\nightly.log 2>&1
+"C:\Users\Sai Charan Chakrala\PycharmProjects\sector-pulse\.venv\Scripts\python.exe" daily_context.py     >> run\nightly.log 2>&1
