@@ -1,4 +1,5 @@
 @echo off
+setlocal
 REM Nightly maintenance for sector-pulse. Runs AFTER the close on purpose:
 REM every Kite request here competes with the live feed for the same
 REM 3-a-second budget, and during a session that budget is what keeps the
@@ -33,6 +34,21 @@ REM                 instead of ~2,500. Runs after fetch_tail because the
 REM                 ranking is only as current as the store it reads, and
 REM                 is a no-op when SECTOR_PULSE_S3_BUCKET is unset.
 cd /d "C:\Users\Sai Charan Chakrala\PycharmProjects\sector-pulse"
+
+REM THE OBJECT STORE VARIABLES, read from the same file deploy\env.ps1
+REM reads. Without them publish_turnover.py and daily_context.py refuse
+REM outright and this job silently accomplishes five of its seven steps -
+REM leaving the feed to stream ~216 names instead of ~2,500 and the scan
+REM with no previous close, pivot range or turnover. cmd cannot
+REM dot-source a PowerShell script, so both parse one plain KEY=VALUE
+REM file rather than each carrying a copy that can drift.
+if not exist "deploy\env.vars" (
+    echo MISSING deploy\env.vars - the publishing steps will be skipped>>run\nightly.log
+) else (
+    for /f "usebackq eol=# tokens=1,* delims==" %%a in ("deploy\env.vars") do (
+        if not "%%a"=="" set "%%a=%%b"
+    )
+)
 "C:\Users\Sai Charan Chakrala\PycharmProjects\sector-pulse\.venv\Scripts\python.exe" fetch_tail.py           >> run\nightly.log 2>&1
 "C:\Users\Sai Charan Chakrala\PycharmProjects\sector-pulse\.venv\Scripts\python.exe" fetch_announcements.py 2 >> run\nightly.log 2>&1
 "C:\Users\Sai Charan Chakrala\PycharmProjects\sector-pulse\.venv\Scripts\python.exe" publish_turnover.py     >> run\nightly.log 2>&1

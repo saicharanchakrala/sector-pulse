@@ -27,7 +27,11 @@ powershell -ExecutionPolicy Bypass -File deploy\push_image.ps1   # needs Docker 
 .venv\Scripts\python publish_turnover.py
 ```
 
-`env.ps1` is **dot-sourced** - the leading `. ` matters. It sets the three
+`env.ps1` is **dot-sourced** - the leading `. ` matters. It reads
+`deploy/env.vars`, a plain KEY=VALUE file that `run_nightly.cmd` parses
+too: cmd cannot dot-source a PowerShell script, and two copies of the
+same four values is how the nightly job came to run with the bucket
+unset, silently skipping the two steps that publish to S3. It sets the three
 `SECTOR_PULSE_S3_*` variables plus `AWS_PROFILE` in your own session.
 Setting them inline instead is easy to get wrong, and getting it wrong is
 not loud: `publish_turnover.py` refuses outright, but the app just carries
