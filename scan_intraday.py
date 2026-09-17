@@ -49,12 +49,38 @@ DISCLAIMER = (
 
 _CSV_FIELDS = [
     "run_date", "run_time", "replayed", "symbol", "direction", "score",
+    # TAKEN AND BLOCKED_BY ARE WHAT MAKE THIS A DATASET rather than a
+    # diary. The log used to hold only setups that cleared every gate, so
+    # every row was a survivor and there were no negatives at all - you
+    # cannot learn which setups are worth taking from a file containing
+    # only the ones you took. Recording the blocked ones alongside, with
+    # the gate that stopped each, supplies the counterfactual: the bars to
+    # resolve them against already exist, so "would it have worked?" is
+    # answerable for the ones you passed over.
+    # Measured 2026-09-17: one pass gave a direction to 637 of 2,492
+    # symbols and cleared 48. The old log kept 48; this keeps 637.
+    "taken", "blocked_by",
     "entry", "stop",
     "target", "quantity", "risk_rupees", "stop_pct", "target_pct",
     "breakeven_pct", "cost_rupees", "required_win_rate", "rvol",
     "relative_strength", "oi_change_pct", "futures_share", "vwap",
     "turnover_20d",
 ]
+
+
+def first_blocker(setup) -> str:
+    """The first gate that failed, or "" when none did.
+
+    The reasons carry a [PASS]/[FAIL] marker each, and the FIRST failure
+    is the informative one: gates are evaluated in order and a setup
+    blocked early may not have been assessed on the later ones at all, so
+    counting every failure would overstate how often the last gate binds.
+    """
+    for reason in getattr(setup, "reasons", None) or []:
+        text = str(reason)
+        if "[FAIL]" in text:
+            return text.split(" [")[0][:120]
+    return ""
 
 
 def _parse_args(argv: "list[str] | None" = None) -> argparse.Namespace:
@@ -204,11 +230,17 @@ def build_setups(symbols: list[str], bars: scan_data.BarSet,
 
 def _row(setup: setups.Setup, now: datetime,
          replayed: bool = False) -> dict[str, object]:
-    """Flatten one actionable setup into a scan_log.csv row.
+    """Flatten one setup - taken or blocked - into a scan_log.csv row.
 
     `replayed` is recorded because the log is meant to become a track
     record, and a replayed row stamped with a past time is otherwise
     indistinguishable from a live scan made at that time.
+
+    REQUIRES LEVELS, and the caller filters on that. A setup with no
+    direction has no entry, stop or target, so there is nothing for
+    outcomes.py to resolve it against - logging it would add a row that
+    can never be scored and would be counted as malformed on every
+    nightly pass.
     """
     trade = setup.levels
     reading = setup.readings
@@ -219,6 +251,8 @@ def _row(setup: setups.Setup, now: datetime,
         "symbol": reading.symbol,
         "direction": setup.direction,
         "score": setup.rank_score,
+        "taken": bool(setup.actionable),
+        "blocked_by": first_blocker(setup),
         "entry": round(trade.entry, 2),
         "stop": round(trade.stop, 2),
         "target": round(trade.target, 2),
@@ -532,7 +566,12 @@ def run(args: argparse.Namespace) -> int:
     ranked = setups.rank(evaluated)
     shown = print_report(ranked, bars, source, benchmark, now, args.top,
                          capital=args.capital)
-    append_log([_row(s, now, replayed=replaying) for s in shown])
+    # EVERY SETUP WITH LEVELS, not just the ones printed. `shown` is the
+    # actionable subset - the trades worth taking - and logging only those
+    # gave a file with no negatives in it. The blocked ones cost nothing
+    # extra to record and are the half that makes the log learnable.
+    loggable = [s for s in ranked if s.levels is not None]
+    append_log([_row(s, now, replayed=replaying) for s in loggable])
     if args.options and shown:
         if replaying:
             print()

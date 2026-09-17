@@ -76,8 +76,13 @@ FIELDS = [
     # presented as real. `score` is carried because calibration (does 0.68
     # beat 0.52?) is the main thing this file exists to make answerable,
     # and breakeven/stop let gross R be netted without a rejoin.
+    # `taken` and `blocked_by` are the label and the treatment. Without
+    # them this file records what happened but not whether the scanner
+    # would have acted, so the one question worth asking of it - did the
+    # gates select the winners - cannot be asked at all.
     "row_id", "run_date", "run_time", "symbol", "direction",
-    "replayed", "control", "score", "entry", "stop", "target",
+    "replayed", "control", "taken", "blocked_by",
+    "score", "entry", "stop", "target",
     "stop_pct", "breakeven_pct",
     "outcome", "exit_time", "exit_price", "r_multiple",
     "bars_held", "mfe_r", "mae_r", "resolved_at",
@@ -205,25 +210,73 @@ def resolve_one(entry: float, stop: float, target: float, long: bool,
                    move / stop_distance, len(stamps), mfe, mae)
 
 
+def outcome_files(path: "Path | None" = None) -> list:
+    """The live outcomes file plus every rotated one beside it.
+
+    The same rule log_files applies to the scan log, for the same reason:
+    append() rotates this file whenever FIELDS changes, and a rotated file
+    still holds resolutions. Reading only the live one would re-resolve
+    everything written before the rotation and double-count it in every
+    hit rate computed afterwards.
+    """
+    live = path or STORE
+    found = [live] if live.exists() else []
+    found.extend(sorted(live.parent.glob(f"{live.name}.superseded*")))
+    return found
+
+
 def load_resolved(path: "Path | None" = None) -> set:
     """row_ids already resolved, so a re-run is cheap and idempotent."""
-    target = path or STORE
-    if not target.exists():
-        return set()
+    seen: set = set()
+    for target in outcome_files(path):
+        try:
+            with target.open(newline="", encoding="utf-8") as handle:
+                seen.update(row["row_id"] for row in csv.DictReader(handle)
+                            if row.get("row_id"))
+        except (OSError, csv.Error) as exc:
+            logger.warning("Could not read %s: %s", target.name, exc)
+    return seen
+
+
+def _existing_header(path) -> "list[str] | None":
+    """The header already in the outcomes file, or None when there is none."""
     try:
-        with target.open(newline="", encoding="utf-8") as handle:
-            return {row["row_id"] for row in csv.DictReader(handle)
-                    if row.get("row_id")}
-    except (OSError, csv.Error) as exc:
-        logger.warning("Could not read %s: %s", target.name, exc)
-        return set()
+        with path.open(newline="", encoding="utf-8") as handle:
+            first = next(csv.reader(handle), None)
+    except (OSError, csv.Error, StopIteration):
+        return None
+    return first or None
 
 
 def append(rows: list, path: "Path | None" = None) -> int:
-    """Append resolved outcomes, writing the header on first use."""
+    """Append resolved outcomes, writing the header on first use.
+
+    ROTATES A FILE WHOSE HEADER PREDATES A CHANGE TO FIELDS, exactly as
+    scan_intraday.append_log does and for the same reason it learned to.
+    DictWriter writes values in FIELDS order regardless of what the header
+    on disk says, so appending new columns to an old file writes the new
+    order under the old names and silently misaligns every row from that
+    point on. Adding `replayed` to the scan log did that once, putting
+    True under `symbol`.
+    """
     if not rows:
         return 0
     target = path or STORE
+    header = _existing_header(target) if target.exists() else None
+    if header is not None and header != FIELDS:
+        retired = target.with_suffix(".csv.superseded")
+        counter = 1
+        while retired.exists():
+            counter += 1
+            retired = target.with_suffix(f".csv.superseded{counter}")
+        try:
+            target.rename(retired)
+            logger.warning("Outcome columns changed; retired the old file to "
+                           "%s. It is still read when resolving, so nothing "
+                           "is re-scored.", retired.name)
+        except OSError as exc:
+            logger.warning("Could not rotate %s: %s", target.name, exc)
+            return 0
     # size check too: a crashed write leaves a zero-byte file, and
     # without a header DictReader reads the first outcome as one.
     fresh = not target.exists() or target.stat().st_size == 0
@@ -250,6 +303,15 @@ def to_row(logged: dict, result: Outcome) -> dict:
         "direction": logged.get("direction", ""),
         "replayed": logged.get("replayed", ""),
         "control": logged.get("control", ""),
+        # CARRIED THROUGH, because the outcome is useless for learning
+        # without knowing whether the setup was taken and, if not, which
+        # gate stopped it. Those are the label and the treatment: "did the
+        # gates pick the winners" is a comparison between taken and
+        # blocked rows, and it cannot be made from a file holding only the
+        # outcome. Rows logged before these columns existed read "", which
+        # is distinguishable from both True and False.
+        "taken": logged.get("taken", ""),
+        "blocked_by": logged.get("blocked_by", ""),
         "score": logged.get("score", ""),
         "entry": logged.get("entry", ""),
         "stop": logged.get("stop", ""),
