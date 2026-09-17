@@ -41,6 +41,7 @@ import indicators
 import intraday
 import market_data
 import news_fetcher
+import object_store
 import options_chain
 import position_watch
 import premarket
@@ -63,6 +64,32 @@ from profiles import PROFILES, MarketProfile, get_profile
 logger = logging.getLogger(__name__)
 
 st.set_page_config(page_title="Sector Pulse", page_icon="📈", layout="wide")
+
+
+@st.cache_resource(show_spinner=False)
+def warm_object_store() -> bool:
+    """Build the S3 client once, in a thread, before a render needs it.
+
+    Measured 2026-09-17 from India against ap-southeast-2: the first read
+    of the published scan cost 7.65 seconds and every later one 0.29, so
+    almost all of it is boto3 import, credential resolution and the TLS
+    handshake. cache_resource runs this once per process rather than once
+    per session, and the thread keeps even that off the first render.
+
+    CALLED FROM THE RENDER, NOT AT IMPORT. Importing this module at import
+    time started a real boto3 client against the real bucket during test
+    COLLECTION, before conftest's autouse fixture had cleared
+    SECTOR_PULSE_S3_BUCKET, and raced object_store.reset().
+
+    Failures are the warm-up's problem, not the page's - object_store.warm
+    swallows them and the real call reports properly.
+    """
+    import threading
+
+    threading.Thread(target=object_store.warm, name="warm-object-store",
+                     daemon=True).start()
+    return True
+
 
 IST_ZONE = ZoneInfo("Asia/Kolkata")
 
@@ -607,6 +634,39 @@ _AUTOSCAN_SCOPES = frozenset({
     "All listed equities, first 300",
     "F&O single stocks (fastest)",
 })
+
+# The scope that reaches past the live feed's universe, named once so the
+# gate below and the tests both refer to the same string.
+_UNBOUNDED_SCAN_SCOPE = "All listed equities (~2,570 - downloads the illiquid tail)"
+
+
+def offered_scopes() -> dict:
+    """The scopes a user may actually pick, honouring SCAN_UI_MAY_DOWNLOAD.
+
+    NOT the same dict as _SCAN_SCOPES, which stays the full catalogue so
+    run_scan can still resolve a scope arriving from stale session state.
+    Hiding the widest choice is the point: its own label said it downloads
+    the illiquid tail, and on 2026-09-17 picking it took the machine down
+    - 31,537 cache files, an unresponsive tab, and Kite requests competing
+    with the live feed. A warning in a label is not a guard.
+    """
+    if getattr(config, "SCAN_UI_MAY_DOWNLOAD", False):
+        return dict(_SCAN_SCOPES)
+    return {name: limit for name, limit in _SCAN_SCOPES.items()
+            if name != _UNBOUNDED_SCAN_SCOPE}
+
+
+def resolve_scope(scope: "str | None") -> tuple:
+    """(scope, limit), falling back when the asked-for scope is not allowed.
+
+    Streamlit persists the selectbox choice under its key, so a session
+    that picked the unbounded scope before the gate existed would arrive
+    here with it still selected. Falling back beats honouring it.
+    """
+    allowed = offered_scopes()
+    if scope in allowed:
+        return scope, allowed[scope]
+    return _DEFAULT_SCAN_SCOPE, _SCAN_SCOPES[_DEFAULT_SCAN_SCOPE]
 
 
 @st.cache_resource(ttl=config.CACHE_TTL_SECONDS, show_spinner=False)
@@ -1186,13 +1246,27 @@ def render_scan_controls() -> tuple[str, bool, "datetime | None", bool]:
         # the F&O list. Without key the choice is lost on every Streamlit
         # restart, which silently put a live session back on the slow
         # scope at 09:06 on 2026-09-15.
-        scope = st.selectbox(
-            "Which stocks to look at", list(_SCAN_SCOPES),
-            index=list(_SCAN_SCOPES).index(_DEFAULT_SCAN_SCOPE),
+        choices = list(offered_scopes())
+        picked = st.selectbox(
+            "Which stocks to look at", choices,
+            index=choices.index(_DEFAULT_SCAN_SCOPE),
             key="scan_scope",
             help="The default is the ~210 large, heavily traded names that "
                  "have futures and options. The wider choices include "
                  "smaller stocks and take much longer.")
+        # RESOLVED HERE, AND SAID OUT LOUD. Streamlit's selectbox returns a
+        # persisted choice unchanged even when it is no longer among the
+        # options, so a session that picked the unbounded scope before it
+        # was withdrawn still arrives with it. run_scan would substitute
+        # the default silently, and the spinner would go on promising a
+        # sweep of ~2,570 names while 210 were scanned.
+        scope, _ = resolve_scope(picked)
+        if scope != picked:
+            st.info(f"'{picked}' is no longer offered, so this scans "
+                    f"{scope} instead. It fetched bars for about 2,570 "
+                    f"symbols inside this page, which is what made the app "
+                    f"unusable on 17 Sep. Set SCAN_UI_MAY_DOWNLOAD to "
+                    f"bring it back.", icon=":material/info:")
     as_of = render_replay_controls()
     want_options = st.checkbox(
         "Also pick an option contract for each setup",
@@ -1211,7 +1285,7 @@ def run_scan(scope: str, as_of: "datetime | None" = None):
     if discovered is None:
         discovered = instruments.discover()
         instruments.save(discovered)
-    limit = _SCAN_SCOPES[scope]
+    scope, limit = resolve_scope(scope)
     if limit is None:
         equity = [inst.symbol for inst in discovered.fo_stocks]
     else:
@@ -2720,6 +2794,7 @@ def render_instrument_search() -> None:
 
 def render_scan_tab() -> None:
     """Intraday scanner tab: controls, then the last scan's results."""
+    warm_object_store()
     render_live_feed_panel()
     render_premarket_panel()
     # READ FIRST. When the feed has published a fresh scan the page shows

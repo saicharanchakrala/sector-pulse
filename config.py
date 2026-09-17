@@ -154,6 +154,25 @@ SCAN_DAILY_LOOKBACK = "3mo"       # daily bars for ATR and previous-session leve
 SCAN_BATCH_SIZE = 40
 SCAN_BENCHMARK = "NIFTY 50"       # relative-strength benchmark, as Kite names it
 
+# MAY THE UI PROCESS DOWNLOAD BARS? Default no, and the default is the
+# point.
+#
+# The app renders in Streamlit, which re-executes its whole script on
+# every interaction, and a scope wider than the live feed's universe used
+# to answer a cache miss by fetching per symbol from Kite inside that
+# process. On 2026-09-17 the widest scope did exactly that during market
+# hours: bar_cache went from about 12,000 files to 31,537, a plain
+# directory listing of it timed out at two minutes, the browser tab
+# stopped answering, and the machine ran out of CPU and memory. The same
+# requests also competed with the live feed for Kite's three-a-second
+# budget, which is what the SSLEOFError drops in the console were.
+#
+# With this False the UI serves what the consolidated store can PROVE it
+# holds and reports the rest as uncovered. That is a smaller answer, and a
+# smaller answer that arrives is worth more than a complete one that takes
+# the machine down with it. The nightly job is where bars get fetched.
+SCAN_UI_MAY_DOWNLOAD = False
+
 SCAN_OPENING_RANGE_MINUTES = 15   # opening range = first N minutes of the session
 # ATR period in BARS, so its window in minutes follows the bar size: 14
 # bars is 42 minutes at 3m where it was 70 at 5m. Left at the conventional

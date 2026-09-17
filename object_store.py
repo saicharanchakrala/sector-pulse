@@ -118,6 +118,58 @@ def get(name: str) -> "bytes | None":
         raise StorageError(f"Could not read {key_for(name)}: {exc}") from exc
 
 
+def version(name: str) -> "str | None":
+    """The object's ETag, or None when it does not exist.
+
+    A HEAD, so it moves a few hundred bytes rather than the body. Lets a
+    caller skip re-downloading and re-parsing something it already holds:
+    the published scan is republished every half minute or so, while a
+    Streamlit page re-executes its whole script on every interaction, so
+    most reads are of bytes the process already has.
+
+    Same contract as get(): None means genuinely absent, and anything else
+    raises. A denied HEAD read as "no object" would make a caller throw
+    away a good cached table and go and fetch it again.
+    """
+    if not enabled():
+        return None
+    try:
+        answer = client().head_object(Bucket=bucket(), Key=key_for(name))
+    except Exception as exc:
+        if _is_missing(exc):
+            return None
+        raise StorageError(f"Could not stat {key_for(name)}: {exc}") from exc
+    tag = answer.get("ETag")
+    if tag is None:
+        return None
+    # S3 quotes ETags; the quoting is not part of the identity.
+    return str(tag).strip('"')
+
+
+def warm() -> None:
+    """Build the client and resolve credentials, off the critical path.
+
+    Measured 2026-09-17 from India against ap-southeast-2: the first read
+    of the published scan cost 7.65 seconds and the second 0.29, so nearly
+    all of it is boto3 import, credential resolution and the TLS
+    handshake. The client is already cached per process - this only moves
+    who pays for building it, which matters when the alternative is the
+    first page render.
+
+    Never raises. A failure here costs the warm-up and nothing else; the
+    real call will report it properly.
+    """
+    if not enabled():
+        return
+    try:
+        client()
+    except Exception as exc:
+        # WARNING, not INFO. INFO is below the default level, so a genuine
+        # credentials failure would be invisible here and then be
+        # rediscovered - at the full cost - by the first render.
+        logger.warning("Could not warm the object store client: %s", exc)
+
+
 def put(name: str, payload: bytes) -> None:
     """Write bytes under `name`. Raises StorageError on failure.
 

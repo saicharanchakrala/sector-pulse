@@ -284,26 +284,72 @@ def publish(table, when: "datetime | None" = None) -> int:
     return len(table)
 
 
+_PARSED_LOCK = threading.Lock()
+_PARSED: dict = {}
+
+
 def load(when: "datetime | None" = None):
     """The published table and its age in seconds, or None.
 
     Returns None rather than an empty frame when there is nothing, so a
     caller can tell "no scan yet" from "a scan that found nothing" - which
     are different facts and only one of them is a problem.
+
+    SKIPS THE DOWNLOAD WHEN THE OBJECT HAS NOT MOVED. The feed republishes
+    roughly every half minute while Streamlit re-executes its whole script
+    on every interaction, so most calls here are for bytes this process
+    already parsed. A HEAD decides it. The AGE is still recomputed every
+    time from the table's own stamp, because the caller refuses a table
+    past an age and a cached age would freeze that judgement.
     """
     import pandas as pd
 
+    name = object_name(when)
+    table = None
     try:
-        payload = object_store.get(object_name(when))
+        tag = object_store.version(name)
     except object_store.StorageError:
+        # A failed HEAD is a real fault and must surface, not silently
+        # downgrade to a full GET that will fail the same way.
         raise
-    if not payload:
-        return None
-    try:
-        table = pd.read_parquet(io.BytesIO(payload))
-    except Exception as exc:
-        logger.warning("Unreadable scan table: %s", exc)
-        return None
+    if tag is not None:
+        with _PARSED_LOCK:
+            remembered = _PARSED.get(name)
+        if remembered is not None and remembered[0] == tag:
+            table = remembered[1]
+
+    if table is None:
+        try:
+            payload = object_store.get(name)
+        except object_store.StorageError:
+            raise
+        if not payload:
+            return None
+        try:
+            table = pd.read_parquet(io.BytesIO(payload))
+        except Exception as exc:
+            logger.warning("Unreadable scan table: %s", exc)
+            return None
+        if tag is not None:
+            with _PARSED_LOCK:
+                # ONE ENTRY. The key is date-stamped, so keeping every one
+                # would grow a long-lived Streamlit process by a full
+                # table per trading day and never release any of them.
+                # Only the current day is ever read hot.
+                _PARSED.clear()
+                _PARSED[name] = (tag, table)
+    # A SHALLOW COPY PER CALLER. Every Streamlit session in this process
+    # would otherwise share one frame for as long as the object does not
+    # move, so anything mutating it in place would corrupt the others.
+    # Nothing does today - the reader sorts, which copies - but that is a
+    # property of today's caller, not a guarantee this function can make.
+    return _aged(table.copy(deep=False))
+
+
+def _aged(table):
+    """(table, seconds since it was scanned), or (table, nan) without a stamp."""
+    import pandas as pd
+
     if table.empty or "scanned_at" not in table.columns:
         return table, float("nan")
     stamp = pd.Timestamp(table["scanned_at"].iloc[0])

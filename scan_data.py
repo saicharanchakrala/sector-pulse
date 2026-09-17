@@ -15,7 +15,7 @@ either.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, timedelta
 
 import pandas as pd
@@ -44,6 +44,12 @@ class BarSet:
     # thing as a healthy stream, and the UI has to be able to tell.
     live_symbols: int = 0
     live_age_seconds: float = float("nan")
+    # Symbols that got intraday bars but no daily context. They are NOT in
+    # `failed` - they scan, and every gate needing a previous close, a
+    # pivot range or twenty-session turnover fails closed for them. Carried
+    # separately so a silent failed-closed gate can be told apart from a
+    # real refusal.
+    daily_failed: list = field(default_factory=list)
 
     @property
     def covered(self) -> int:
@@ -51,13 +57,82 @@ class BarSet:
         return len(self.intraday)
 
 
-def _fetch(symbols: list[str], start: date, end: date,
-           interval: str) -> dict[str, pd.DataFrame]:
+def _from_store(symbols: list[str], start: date, end: date,
+                interval: str) -> dict[str, pd.DataFrame]:
+    """Bars the consolidated store can PROVE it holds, or {}.
+
+    The nightly job folds every per-symbol cache file into one parquet per
+    interval, and reading it is a file-layout win rather than a different
+    answer - the store is folded FROM the same bars a download would
+    return. Measured 2026-09-16 on 2,302 symbols: 3.6 seconds from the
+    consolidated file against 33 from the same data as separate files, and
+    against minutes from Kite.
+
+    DELEGATES TO live_bars.from_store rather than reimplementing it, and
+    that matters: the proof is the hard part. It refuses the store outright
+    when its freshest session is more than STORE_MAX_STALE_DAYS behind the
+    window's end, and drops any symbol whose own last bar does not reach
+    that session.
+
+    Without those two guards a frame ending yesterday is served as today's.
+    setups.measure takes the LAST session present in the frame - it never
+    compares it to the clock - so every reading, the opening range, rvol,
+    ATR and the day's high and low, would be yesterday's, combined with a
+    live minutes_left, and ranked into the table as a current setup with
+    nothing anywhere reporting the shortfall. An earlier version of this
+    function promised that proof in its docstring and did not implement it.
+    """
+    # KITE'S SPELLING, NOT THE CONFIG'S. config.SCAN_BAR_INTERVAL is "3m"
+    # while the store is folded and named "3minute" by the nightly job, so
+    # passing the config value straight through finds no file, returns {},
+    # and every symbol silently falls through to the download path this
+    # function exists to avoid.
+    resolved = market_source.kite_interval(interval)
+    try:
+        import live_bars
+    except Exception as exc:                      # optional dependency path
+        logger.info("No consolidated store available (%s)", exc)
+        return {}
+    try:
+        usable = live_bars.from_store(list(symbols), start, end, resolved)
+    except Exception as exc:
+        logger.warning("Consolidated store unreadable at %s: %s",
+                       resolved, exc)
+        return {}
+    if usable:
+        logger.info("Served %d/%d %s frames from the consolidated store",
+                    len(usable), len(symbols), resolved)
+    return usable
+
+
+def _fetch(symbols: list[str], start: date, end: date, interval: str,
+           may_download: bool = True) -> dict[str, pd.DataFrame]:
     """Bars per symbol from Kite, or {} rather than raising.
+
+    `may_download` is the CALLER'S policy, passed in rather than read from
+    config here. It exists for the Streamlit UI, where on 2026-09-17 a
+    scope wider than the store answered its misses by fetching about 2,570
+    symbols one at a time: 31,537 cache files, an unresponsive tab, and a
+    machine out of CPU and memory, with the requests competing against the
+    live feed for Kite's three-a-second budget.
+
+    It defaults to True because most callers here are not the UI.
+    scan_intraday and instrument_report are command-line tools whose whole
+    job is to answer for a symbol, and silently refusing to fetch turns
+    that into "no intraday bars for this symbol" - which
+    instrument_report renders as a VERDICT rather than as an error.
 
     market_source returns one flat frame per symbol, so the MultiIndex
     unpacking the yfinance path needed is gone from this route entirely.
     """
+    if not may_download:
+        if symbols:
+            logger.warning(
+                "%d symbol(s) are not covered by the consolidated store at "
+                "%s and this caller may not download, so they are reported "
+                "uncovered. Run the nightly job to fold them in.",
+                len(symbols), interval)
+        return {}
     try:
         return market_source.bars(symbols, start, end, interval=interval)
     except market_source.NoSession as exc:
@@ -92,7 +167,8 @@ def _lookback_days(spec: str, default: int) -> int:
 
 
 def fetch_bars(tickers: list[str], batch_size: int = config.SCAN_BATCH_SIZE,
-               target: "date | None" = None) -> BarSet:
+               target: "date | None" = None,
+               may_download: "bool | None" = None) -> BarSet:
     """Fetch intraday and daily bars for every symbol from Kite.
 
     With `target` set, the window ends at that date instead of today, which
@@ -106,6 +182,17 @@ def fetch_bars(tickers: list[str], batch_size: int = config.SCAN_BATCH_SIZE,
     unique = list(dict.fromkeys(t for t in tickers if t))
     if not unique:
         return BarSet({}, {}, 0, [])
+    if may_download is None:
+        may_download = bool(getattr(config, "SCAN_UI_MAY_DOWNLOAD", False))
+    if target is not None:
+        # A REPLAY MAY ALWAYS DOWNLOAD. There is no other source for a past
+        # instant: the live feed holds today, and the consolidated store
+        # ends at the last nightly fold. Safe now in a way it was not
+        # before, because the scope gate bounds a replay at 300 symbols
+        # rather than the ~2,570 that took the machine down, and because
+        # _from_store refuses partial coverage rather than handing back a
+        # frame from the wrong session.
+        may_download = True
     end = target or date.today()
     fine_days = _lookback_days(config.SCAN_BAR_LOOKBACK, 10)
     coarse_days = _lookback_days(config.SCAN_DAILY_LOOKBACK, 92)
@@ -129,8 +216,28 @@ def fetch_bars(tickers: list[str], batch_size: int = config.SCAN_BATCH_SIZE,
         if intraday:
             source = "live feed"
     if not intraday:
-        intraday = _fetch(unique, end - timedelta(days=fine_days), end,
-                          config.SCAN_BAR_INTERVAL)
+        # THE STORE BEFORE THE NETWORK. Whatever it cannot prove goes to
+        # _fetch, which downloads only when the UI is allowed to.
+        fine_start = end - timedelta(days=fine_days)
+        intraday = _from_store(unique, fine_start, end,
+                               config.SCAN_BAR_INTERVAL)
+        from_store_count = len(intraday)
+        absent = [s for s in unique if s not in intraday]
+        downloaded = {}
+        if absent:
+            downloaded = _fetch(absent, fine_start, end,
+                                config.SCAN_BAR_INTERVAL,
+                                may_download=may_download)
+            intraday.update(downloaded)
+        # LABELLED ON WHAT ARRIVED, not on what was asked for. `absent` is
+        # computed before the fetch, so keying the label on it called a
+        # scan "download" when the fetch was refused and every bar came
+        # from the store - and the UI then warned that bars "can be
+        # several minutes old" when nothing had been downloaded at all.
+        if downloaded:
+            source = "download"
+        elif from_store_count:
+            source = "store"
     # ENDS THE DAY BEFORE `end`, so the span is stable for the whole
     # session and caches once instead of re-fetching every symbol every
     # time the today-ending cache goes stale.
@@ -147,16 +254,37 @@ def fetch_bars(tickers: list[str], batch_size: int = config.SCAN_BATCH_SIZE,
     # live_bars.history_window does the same thing for intraday, and says
     # so in the same words: a window that ends yesterday caches all day.
     daily_end = end - timedelta(days=1)
-    daily = _fetch(unique, daily_end - timedelta(days=coarse_days),
-                   daily_end, "day")
-    logger.info("Fetched %d/%d symbols", len(intraday), len(unique))
+    daily_start = daily_end - timedelta(days=coarse_days)
+    # The same store-first rule. This span is the one that cost the most:
+    # it ends yesterday and so is entirely settled history, yet a rolling
+    # window meant the cache key changed every morning and all of it was
+    # refetched on the first page load of each trading day - 222 spans on
+    # 2026-09-17 before the scan proper had begun.
+    daily = _from_store(unique, daily_start, daily_end, "day")
+    missing_daily = [s for s in unique if s not in daily]
+    if missing_daily:
+        daily.update(_fetch(missing_daily, daily_start, daily_end, "day",
+                            may_download=may_download))
+    logger.info("Intraday bars for %d/%d symbols (%s)",
+                len(intraday), len(unique), source)
     failed = [t for t in unique if t not in intraday]
     if failed:
         logger.warning("No intraday bars for %d symbol(s): %s",
                        len(failed), ", ".join(failed[:10]))
+    # DAILY GAPS ARE REPORTED SEPARATELY. A symbol with intraday bars but
+    # no daily context still reaches setups.measure, where prev_close,
+    # turnover_20d and the pivot range all come back None and every gate
+    # that needs them fails closed. That used to be rare because daily was
+    # always downloaded; with the store-first rule it is routine, and a
+    # silent failed-closed gate is indistinguishable from a real refusal.
+    daily_failed = [t for t in unique if t not in daily]
+    if daily_failed:
+        logger.warning("No daily context for %d symbol(s): %s",
+                       len(daily_failed), ", ".join(daily_failed[:10]))
     return BarSet(intraday=intraday, daily=daily,
                   requested=len(unique), failed=failed, source=source,
-                  live_symbols=streamed, live_age_seconds=age)
+                  live_symbols=streamed, live_age_seconds=age,
+                  daily_failed=daily_failed)
 
 
 def auto_refresh_interval(*, enabled: bool, requested: int,

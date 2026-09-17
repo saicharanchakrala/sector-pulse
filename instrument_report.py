@@ -227,7 +227,12 @@ def _intraday_verdict(symbol: str) -> HorizonVerdict:
 
     ticker = instruments.to_ticker(symbol)
     try:
-        bars = scan_data.fetch_bars([ticker, config.SCAN_BENCHMARK])
+        # Two symbols, and the answer is rendered as a VERDICT. Refusing to
+        # fetch here would turn a coverage gap into "no intraday bars for
+        # this symbol" and a NO_BUY, which reads as a judgement rather than
+        # as missing data.
+        bars = scan_data.fetch_bars([ticker, config.SCAN_BENCHMARK],
+                                    may_download=True)
     except Exception as exc:
         return HorizonVerdict(
             horizon="intraday", verdict=NO_BUY,

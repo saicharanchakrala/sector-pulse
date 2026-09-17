@@ -494,8 +494,14 @@ def run(args: argparse.Namespace) -> int:
         return 0
     logger.info("Scanning %d symbols (%s)", len(symbols), source)
     tickers = [instruments.to_ticker(s) for s in symbols] + [config.SCAN_BENCHMARK]
+    # A COMMAND-LINE RUN MAY DOWNLOAD. The refusal exists for the
+    # Streamlit UI, where a wide scope fetching per symbol took the machine
+    # down; here the whole point is to answer for the symbols asked for,
+    # and silently serving only what the store holds would report a
+    # holiday or a dead data source instead of a gap.
     bars = scan_data.fetch_bars(
-        tickers, target=now.date() if now.date() != actual_now.date() else None)
+        tickers, target=now.date() if now.date() != actual_now.date() else None,
+        may_download=True)
     if args.as_of.strip():
         bars = scan_data.truncate(bars, now)
         source += f", replayed as of {now.strftime('%Y-%m-%d %H:%M')} IST"
