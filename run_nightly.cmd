@@ -9,6 +9,17 @@ REM   fetch_tail  - daily bars for listed equities the store has never seen,
 REM                 then folds the per-symbol cache into the consolidated
 REM                 store so it stops drifting stale.
 REM   fetch_announcements - two years of NSE filings, resumable.
+REM   prune_cache - deletes intraday cache files another file already
+REM                 covers, and any past every reader's window. Runs
+REM                 BEFORE the fold on purpose: bar_store.rebuild folds
+REM                 the consolidated store from the per-symbol files
+REM                 ALONE and never reads the store it replaces, so
+REM                 pruning first is what makes the two agree. It never
+REM                 touches "day" - bars_day.parquet reaches back to about
+REM                 2001 and is rebuilt the same way, so pruning those
+REM                 would delete twenty-five years of daily bars.
+REM                 Measured 2026-09-17: 6,133 of 19,515 intraday files
+REM                 were spans another file already contained, 102 MB.
 REM   bar_store --intervals 3minute - folds the per-symbol intraday cache
 REM                 into one consolidated file. NOT optional for speed:
 REM                 a full-universe scan reads prior sessions for ~2,300
@@ -52,6 +63,7 @@ if not exist "deploy\env.vars" (
 "C:\Users\Sai Charan Chakrala\PycharmProjects\sector-pulse\.venv\Scripts\python.exe" fetch_tail.py           >> run\nightly.log 2>&1
 "C:\Users\Sai Charan Chakrala\PycharmProjects\sector-pulse\.venv\Scripts\python.exe" fetch_announcements.py 2 >> run\nightly.log 2>&1
 "C:\Users\Sai Charan Chakrala\PycharmProjects\sector-pulse\.venv\Scripts\python.exe" publish_turnover.py     >> run\nightly.log 2>&1
+"C:\Users\Sai Charan Chakrala\PycharmProjects\sector-pulse\.venv\Scripts\python.exe" prune_cache.py --apply   >> run\nightly.log 2>&1
 "C:\Users\Sai Charan Chakrala\PycharmProjects\sector-pulse\.venv\Scripts\python.exe" -m bar_store --intervals 3minute >> run\nightly.log 2>&1
 "C:\Users\Sai Charan Chakrala\PycharmProjects\sector-pulse\.venv\Scripts\python.exe" outcomes.py             >> run\nightly.log 2>&1
 "C:\Users\Sai Charan Chakrala\PycharmProjects\sector-pulse\.venv\Scripts\python.exe" -c "import premarket; print('watchlist:', premarket.publish(), 'names')" >> run\nightly.log 2>&1
