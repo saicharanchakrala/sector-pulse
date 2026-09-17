@@ -281,6 +281,158 @@ def _cache_path(symbol: str, interval: str, start: date, end: date,
                         f"{start:%Y%m%d}_{end:%Y%m%d}{suffix}.parquet")
 
 
+def _parse_cache_name(name: str):
+    """(symbol, interval, start, end, oi) from a cache filename, or None.
+
+    The inverse of _cache_path. Split rather than matched with a regex
+    because a safe symbol may itself contain underscores - "NIFTY 50"
+    becomes "NIFTY_50" and NIFTY_MEDIA is a real ETF - while a Kite
+    interval never does.
+    """
+    if not name.startswith("kite__") or not name.endswith(".parquet"):
+        return None
+    body = name[len("kite__"):-len(".parquet")]
+    oi = body.endswith("__oi")
+    if oi:
+        body = body[:-len("__oi")]
+    try:
+        symbol, interval, span = body.rsplit("__", 2)
+        start_text, end_text = span.split("_")
+        start = datetime.strptime(start_text, "%Y%m%d").date()
+        end = datetime.strptime(end_text, "%Y%m%d").date()
+    except ValueError:
+        return None
+    if not symbol:
+        return None
+    return symbol, interval, start, end, oi
+
+
+_SPANS_LOCK = threading.Lock()
+_SPANS_MEMO: dict = {}
+
+
+def _cache_spans(interval: str, oi: bool) -> dict:
+    """{safe symbol: [(start, end, path)]} already on disk for one interval.
+
+    ONE directory listing for the whole call, not one glob per symbol.
+    bar_cache holds over 12,000 files, and globbing per symbol across a
+    210-name scan would walk all of them 210 times.
+
+    MEMOISED ON THE DIRECTORY'S OWN mtime, because the listing costs 1.74
+    seconds at that size and bars() is called several times per render.
+    Adding or removing a file moves the directory's mtime, so a changed
+    cache rebuilds. If mtime is unavailable the memo is skipped rather
+    than trusted. A missed rebuild only costs a fetch that would have
+    happened anyway; it can never serve the wrong bars, because the file
+    a span points at is read and date-filtered on use.
+    """
+    try:
+        stamp = CACHE_DIR.stat().st_mtime
+    except OSError:
+        stamp = None
+    key = (interval, oi)
+    if stamp is not None:
+        with _SPANS_LOCK:
+            remembered = _SPANS_MEMO.get(key)
+        if remembered is not None and remembered[0] == stamp:
+            return remembered[1]
+
+    spans: dict = {}
+    try:
+        entries = list(CACHE_DIR.iterdir())
+    except OSError:
+        return spans
+    for path in entries:
+        parsed = _parse_cache_name(path.name)
+        if parsed is None:
+            continue
+        symbol, found_interval, start, end, found_oi = parsed
+        if found_interval != interval or found_oi != oi:
+            continue
+        spans.setdefault(symbol, []).append((start, end, path))
+    if stamp is not None:
+        with _SPANS_LOCK:
+            _SPANS_MEMO[key] = (stamp, spans)
+    return spans
+
+
+def _covering_span(spans: dict, symbol: str, start: date, end: date):
+    """A cached file whose span CONTAINS [start, end], or None.
+
+    WHY THIS EXISTS. The cache key is the exact span, and every horizon
+    the app offers is a window that rolls forward every day: the mid-term
+    table asked for 2026-06-16..2026-09-15 yesterday and
+    2026-06-17..2026-09-16 today. Same bars but for one session at each
+    end, different key, total miss. So the first page load of each trading
+    day refetched months of daily bars for the whole scope - measured
+    2026-09-17, 222 spans in one morning, a burst of Kite calls during the
+    session that showed up in the console as SSL drops.
+
+    The narrowest containing span wins, so the slice stays small, with the
+    most recently written breaking a tie - that is the one most likely to
+    reach the end of the range.
+
+    WHAT THIS DOES NOT PROVE, stated because it was raised in review and
+    accepted rather than missed: the span comes from the FILENAME, which
+    records what was asked for, not what Kite returned. A file named for a
+    year can hold a fraction of one - Kite truncates intraday history,
+    returns nothing before a listing date, and nothing across a
+    suspension.
+
+    Two things make that acceptable here. A capture cut short by being
+    written mid-session is already refused, because bars() runs
+    _cache_is_stale against the SOURCE file's mtime and a settled span is
+    only trusted when the file was written after that date's close. What
+    remains is a span Kite genuinely has less data for - and a fresh fetch
+    would return exactly the same short answer, at the cost of the request.
+
+    The tempting fix, requiring the slice to bracket [start, end], cannot
+    be written without a trading calendar: holidays, listing dates and
+    halts all make a legitimately short frame look truncated, and a
+    threshold picked by eye would refetch the whole universe on the first
+    holiday. The reason this cache exists at all is that refetching the
+    whole universe is what took the machine down.
+    """
+    found = spans.get(canonical(symbol).replace("/", "_")
+                      .replace(":", "_").replace(" ", "_"))
+    if not found:
+        return None
+    covering = [(s, e, p) for s, e, p in found if s <= start and e >= end]
+    if not covering:
+        return None
+
+    def rank(item):
+        span_start, span_end, path = item
+        try:
+            written = path.stat().st_mtime
+        except OSError:
+            written = 0.0
+        return ((span_end - span_start).days, -written)
+
+    return min(covering, key=rank)[2]
+
+
+def _slice_span(frame, start: date, end: date):
+    """The rows of a wider cached frame that fall inside [start, end].
+
+    Both ends inclusive, matching what Kite returns for the same request.
+    A frame whose index is not timestamped cannot be sliced by date and is
+    refused rather than served whole, which would hand the caller a wider
+    range than it asked for.
+    """
+    if frame is None or len(frame) == 0:
+        return None
+    index = frame.index
+    if not isinstance(index, pd.DatetimeIndex):
+        return None
+    try:
+        days = index.date
+    except (AttributeError, TypeError):
+        return None
+    keep = (days >= start) & (days <= end)
+    return frame[keep]
+
+
 def _interval_seconds(resolved: str) -> int:
     """Seconds in one candle of Kite's interval spelling."""
     text = (resolved or "").strip().lower()
@@ -382,47 +534,77 @@ def bars(symbols: list[str], start: date, end: date, interval: str = "5minute",
     # Only the READ is parallel. Staleness, the OpenInterest check and the
     # decision to refetch all stay in the sequential loop, so the logic
     # that decides what to serve is unchanged and reviewable in one place.
+    # Listed once, outside the pool, and ONLY when some exact key is
+    # missing. In the warm steady state every key hits and the directory
+    # is never listed at all, so the fallback costs nothing on the path it
+    # does not help.
+    spans: dict = {}
+    if not refresh and any(
+            not _cache_path(s, resolved, start, end, oi=oi).exists()
+            for s in symbols):
+        spans = _cache_spans(resolved, oi)
+
     def read_cached(symbol: str):
+        """(frame, the file it came from), or None when nothing serves.
+
+        Returns the SOURCE path as well as the frame because the staleness
+        rule is applied to the file's own mtime, and with a wider span
+        standing in for the requested one those are different files.
+        """
         path = _cache_path(symbol, resolved, start, end, oi=oi)
-        if not path.exists() or refresh:
+        if refresh:
+            return None
+        if path.exists():
+            try:
+                return pd.read_parquet(path), path
+            except Exception as exc:
+                logger.warning("Unreadable cache %s: %s", path.name, exc)
+                return None
+        wider = _covering_span(spans, symbol, start, end)
+        if wider is None:
             return None
         try:
-            return pd.read_parquet(path)
+            frame = pd.read_parquet(wider)
         except Exception as exc:
-            logger.warning("Unreadable cache %s: %s", path.name, exc)
+            logger.warning("Unreadable cache %s: %s", wider.name, exc)
             return None
+        sliced = _slice_span(frame, start, end)
+        if sliced is None or sliced.empty:
+            return None
+        return sliced, wider
 
     readers = max(1, int(getattr(config, "CACHE_READ_WORKERS", 1)))
     preread: dict = {}
     if readers > 1 and len(symbols) > 1 and not refresh:
         from concurrent.futures import ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=min(readers, len(symbols))) as pool:
-            for symbol, frame in zip(symbols,
+            for symbol, entry in zip(symbols,
                                      pool.map(read_cached, symbols)):
-                if frame is not None:
-                    preread[symbol] = frame
+                if entry is not None:
+                    preread[symbol] = entry
 
     for symbol in symbols:
-        path = _cache_path(symbol, resolved, start, end, oi=oi)
-        if path.exists() and not refresh:
-            cached = preread.get(symbol)
-            if cached is None and symbol not in preread:
-                cached = read_cached(symbol)
-            if cached is None:
-                pass
-            else:
-                # With oi=True the column must actually be there. A frame
-                # missing it is refused rather than served, because the
-                # absence is invisible downstream.
-                if not oi or "OpenInterest" in cached.columns:
-                    if not _cache_is_stale(path, cached, end, resolved):
-                        out[symbol] = cached
-                        continue
-                    logger.info("Cached %s ends at %s, refetching today's "
-                                "tail", path.name,
-                                cached.index[-1] if len(cached) else "nothing")
+        entry = preread.get(symbol)
+        if entry is None and symbol not in preread and not refresh:
+            entry = read_cached(symbol)
+        if entry is not None:
+            cached, source = entry
+            # With oi=True the column must actually be there. A frame
+            # missing it is refused rather than served, because the
+            # absence is invisible downstream.
+            if oi and "OpenInterest" not in cached.columns:
                 logger.warning("Cache %s has no OpenInterest; refetching",
-                               path.name)
+                               source.name)
+            elif _cache_is_stale(source, cached, end, resolved):
+                # Staleness is judged on the REQUESTED end against the
+                # source file's mtime, so a wider span is held to exactly
+                # the standard an exact-key file would have been.
+                logger.info("Cached %s ends at %s, refetching today's "
+                            "tail", source.name,
+                            cached.index[-1] if len(cached) else "nothing")
+            else:
+                out[symbol] = cached
+                continue
         token = token_for(symbol)
         if token is None:
             logger.warning("Not listed on Kite: %s", symbol)
