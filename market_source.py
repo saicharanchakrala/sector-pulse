@@ -342,6 +342,14 @@ def _cache_spans(interval: str, oi: bool) -> dict:
         entries = list(CACHE_DIR.iterdir())
     except OSError:
         return spans
+    # ONE INTERVAL REMEMBERED AT A TIME. Each index holds a parsed entry
+    # per file, and bar_cache reached 31,537 files on 2026-09-17 - so a
+    # memo per (interval, oi) keeps tens of thousands of dates and Path
+    # objects alive per key, for a hit rate that only ever helps the
+    # interval being scanned right now.
+    if stamp is not None:
+        with _SPANS_LOCK:
+            _SPANS_MEMO.clear()
     for path in entries:
         parsed = _parse_cache_name(path.name)
         if parsed is None:

@@ -669,7 +669,8 @@ def resolve_scope(scope: "str | None") -> tuple:
     return _DEFAULT_SCAN_SCOPE, _SCAN_SCOPES[_DEFAULT_SCAN_SCOPE]
 
 
-@st.cache_resource(ttl=config.CACHE_TTL_SECONDS, show_spinner=False)
+@st.cache_resource(ttl=config.CACHE_TTL_SECONDS, max_entries=2,
+                   show_spinner=False)
 def load_scan_bars(tickers: tuple[str, ...],
                    target: "date | None" = None,
                    live_stamp: str = "") -> scan_data.BarSet:
@@ -681,6 +682,19 @@ def load_scan_bars(tickers: tuple[str, ...],
     gates against whatever it first saw, which defeats the point of
     streaming. A past window is a different download, so the date belongs
     in the key too.
+
+    max_entries IS LOAD-BEARING, because that key churns far faster than
+    the TTL clears. live_bar_stamp is "{newest bar}|{total bar count}" and
+    the count rises with every bar the feed writes - measured 2026-09-17,
+    it moved every 20 seconds (2257, 2322, 2357, 2380, 2397, 2412 ...).
+    At a 900-second TTL and no cap that is about forty-five live BarSets,
+    each holding intraday AND daily frames for the whole scope, and
+    cache_resource keeps the objects themselves rather than sharing them.
+    At 210 F&O names it is merely wasteful; at 2,570 it is roughly 5,140
+    DataFrames times forty-five, which is how a scan that downloaded too
+    much also ran the machine out of memory rather than just being slow.
+    Two entries is what the work needs: the current one, and the one it is
+    replacing while a rerun is in flight.
 
     cache_RESOURCE, not cache_data, and the difference is not cosmetic.
     cache_data pickles whatever it returns so each caller gets its own
@@ -1776,7 +1790,8 @@ def render_live_feed_panel() -> None:
                        f"that owns it, or with taskkill.")
 
 
-@st.cache_data(ttl=config.CACHE_TTL_SECONDS, show_spinner=False)
+@st.cache_data(ttl=config.CACHE_TTL_SECONDS, max_entries=4,
+               show_spinner=False)
 def load_horizon_picks(symbols: tuple[str, ...], top: int,
                        bucket: int = 0, anchor_live: bool = False) -> dict:
     """Ranked assessments per daily horizon, cached on the universe.
@@ -1787,6 +1802,12 @@ def load_horizon_picks(symbols: tuple[str, ...], top: int,
     day, so caching on (symbols, top) alone would have served the first
     minute's levels until the TTL expired. A bucket in the key re-runs the
     sweep exactly as often as the anchor can move.
+
+    Which is exactly why max_entries is set: a bucket a minute against a
+    900-second TTL is fifteen live results, and cache_data PICKLES, so
+    they are fifteen independent copies rather than fifteen references.
+    Four covers the live bucket, the previous one, and the two scope sizes
+    a session realistically switches between.
     """
     live = horizons.live_prices_for(list(symbols)) if anchor_live else {}
     picks = horizons.assess_universe(list(symbols), top=top, live=live)
