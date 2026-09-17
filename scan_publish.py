@@ -35,6 +35,7 @@ import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+import config
 import object_store
 
 logger = logging.getLogger(__name__)
@@ -152,10 +153,78 @@ def row_for(setup, now) -> dict:
     return row
 
 
+def benchmark_change_pct(intraday, daily, now) -> "float | None":
+    """Today's percent change for the relative-strength benchmark.
+
+    WHY THIS EXISTS RATHER THAN A FRAME. setups.measure takes a FLOAT for
+    the benchmark, not a frame - it wants the day change, not the bars.
+    An earlier version of run_once handed it `combined.get("NIFTY 50")`
+    straight through, so the one code path that could have produced a
+    number never did.
+
+    None when either side is missing, which makes every relative-strength
+    gate fail closed rather than compare each symbol against zero and read
+    a falling market as strength. That is the safe direction, but it is
+    not a harmless one: it blocks the whole scan, so the caller logs it.
+
+    Anchored on the CLOCK, like measure's own daily cutoff. Anchoring on
+    the last surviving bar instead lets today's completed daily bar become
+    the previous close, which leaks the session's outcome into the gate
+    that is supposed to judge it.
+    """
+    import indicators
+    import pandas as pd
+
+    # NEVER RAISES. The per-symbol loop in run_once has its own handler;
+    # this call sits outside it, so a benchmark frame missing a Close
+    # column would take down every scan for the rest of the session at one
+    # bare "scan failed" a cycle.
+    try:
+        if now.tzinfo is None:
+            # Exchange-local, matching what indicators documents for a
+            # naive clock. astimezone() would read it as SYSTEM local and
+            # shift the cutoff day on any machine not set to IST.
+            now = now.replace(tzinfo=IST)
+        if intraday is None or daily is None or intraday.empty or daily.empty:
+            return None
+        cutoff_day = now.astimezone(IST).date()
+
+        # PINNED TO THE CLOCK'S DAY, not to the frame's last session.
+        # session_bars() defaults to whatever session ends the frame, and
+        # the daily cutoff below is anchored on the clock - so a benchmark
+        # holding only prior sessions would read its last intraday close
+        # against that same day's daily close and return 0.0. Not None:
+        # 0.0, which passes every None check, silences the warning in
+        # run_once, and makes each symbol's relative strength equal its own
+        # day change. In a rising market that marks every rising name as
+        # leading the index. This is reachable on every feed start before
+        # the index's first 3-minute bar closes.
+        session = indicators.session_bars(intraday, day=cutoff_day)
+        if session is None or session.empty:
+            return None
+        closes = session["Close"].dropna()
+        if closes.empty:
+            return None
+
+        prior = daily.dropna(subset=["Close"])
+        if not isinstance(prior.index, pd.DatetimeIndex):
+            logger.warning("Benchmark daily index is not timestamped; "
+                           "refusing to compare against a partial bar")
+            return None
+        prior = prior[prior.index.date < cutoff_day]
+        if prior.empty:
+            return None
+        return indicators.percent_change(float(closes.iloc[-1]),
+                                         float(prior["Close"].iloc[-1]))
+    except Exception as exc:
+        logger.warning("Benchmark comparison unusable: %s", exc)
+        return None
+
+
 def run_once(symbols: list, history: dict, today: dict, daily: dict,
              seed: "dict | None" = None,
              now: "datetime | None" = None,
-             benchmark_symbol: str = "NIFTY 50"):
+             benchmark_symbol: str = config.SCAN_BENCHMARK):
     """Scan and return (table, assembled_count). Table may be empty.
 
     Imports setups lazily so this module can be read, and its assembly
@@ -170,7 +239,17 @@ def run_once(symbols: list, history: dict, today: dict, daily: dict,
     if not combined:
         return pd.DataFrame(), 0
 
-    bench = combined.get(benchmark_symbol)
+    # A FLOAT, not the frame. Every relative-strength gate fails closed
+    # when this is None, so the whole scan reads "nothing cleared" - which
+    # is indistinguishable from a quiet market unless it says so here.
+    bench = benchmark_change_pct(combined.get(benchmark_symbol),
+                                 daily.get(benchmark_symbol), now)
+    if bench is None:
+        logger.warning("No %s comparison available, so every "
+                       "relative-strength gate will fail and nothing can be "
+                       "actionable. Is the benchmark in the streamed "
+                       "universe and the daily context?", benchmark_symbol)
+
     evaluated = []
     for symbol, frame in combined.items():
         if symbol == benchmark_symbol:

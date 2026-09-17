@@ -178,19 +178,62 @@ def universe(explicit: str, limit: "int | None" = None) -> list:
     The F&O set is unioned in unconditionally rather than left to the
     turnover rank, so the intraday scanner's own default scope cannot
     lose a name to a ranking change.
+
+    THE BENCHMARK IS NAMED CANONICALLY, and that is the whole point. Its
+    ticks were always arriving: the F&O master calls the index NIFTY, it
+    is in fo_underlyings, and token_for("NIFTY") is 256265 - the same
+    token as "NIFTY 50". What was missing was the NAME. live_bars.frames_from
+    inverts {symbol: token} into {token: symbol}, so an instrument reachable
+    under two names keeps only ONE of them, decided by insertion order,
+    while the scan and daily_context both key it "NIFTY 50". The bars
+    landed under "NIFTY", the scan asked for "NIFTY 50", and the
+    relative-strength gate therefore failed for EVERY symbol at every
+    hour, silently: measured 2026-09-17, 2,498 of 2,498 published rows had
+    a null relative_strength and nothing was actionable all morning.
+
+    So the aliases are collapsed to the canonical name rather than the
+    canonical name being added alongside them. Adding it would leave two
+    names on one token and let a sorted() tie-break decide which survives
+    - which happens to pick "NIFTY 50" today and would silently stop doing
+    so if SCAN_BENCHMARK were spelled "^NSEI".
+
+    Only the benchmark's own aliases are touched. BANKNIFTY and the rest
+    canonicalise too (to "NIFTY BANK"), but nothing reads them by a
+    canonical name, and renaming them here would change what is streamed
+    for no stated reason.
     """
+    # Lazily, like main() does: this module is imported by the scanner
+    # thread and by tests that never touch the instrument master.
+    import market_source
+
+    wanted_name = market_source.canonical(config.SCAN_BENCHMARK)
+
+    def is_benchmark(symbol: str) -> bool:
+        return market_source.canonical(symbol) == wanted_name
+
     if explicit.strip():
-        return [s.strip().upper() for s in explicit.split(",") if s.strip()]
+        named = [s.strip().upper() for s in explicit.split(",") if s.strip()]
+        # Compared canonically: "--symbols NIFTY" names the benchmark just
+        # as surely as "--symbols NIFTY 50" does, and appending the other
+        # spelling would put both on token 256265.
+        named = [s for s in named if not is_benchmark(s)]
+        named.append(wanted_name)
+        return named
     snapshot = instruments.load_latest()
     if snapshot is None:
         logger.warning("No instrument snapshot; run the sync first")
         return []
-    core = {inst.symbol for inst in snapshot.fo_underlyings}
+    fo_names = {inst.symbol for inst in snapshot.fo_underlyings}
+    fo_count = len(fo_names)
+    core = {s for s in fo_names if not is_benchmark(s)}
+    core.add(wanted_name)
     wanted = config.FEED_UNIVERSE_SIZE if limit is None else limit
-    liquid = set(by_turnover(wanted))
+    # Aliases stripped here too, so a ranking that ever carries the index
+    # under its own spelling cannot put a second name on its token.
+    liquid = {s for s in by_turnover(wanted) if not is_benchmark(s)}
     if not liquid:
-        logger.warning("Turnover ranking unavailable; streaming the %d F&O "
-                       "underlyings only", len(core))
+        logger.warning("Turnover ranking unavailable; streaming %d F&O "
+                       "underlyings and %s only", fo_count, wanted_name)
         return sorted(core)
     combined = core | liquid
     cap = kt.MAX_INSTRUMENTS_PER_CONNECTION
@@ -199,8 +242,9 @@ def universe(explicit: str, limit: "int | None" = None) -> list:
         room = max(0, cap - len(core))
         combined = core | set(sorted(liquid - core)[:room])
         logger.warning("Trimmed the streaming universe to Kite's %d cap", cap)
-    logger.info("Streaming %d symbols: %d F&O underlyings plus the top %d "
-                "by 20-session turnover", len(combined), len(core), wanted)
+    logger.info("Streaming %d symbols: %d F&O underlyings (the index among "
+                "them, as %s) plus the top %d by 20-session turnover",
+                len(combined), fo_count, wanted_name, wanted)
     return sorted(combined)
 
 
