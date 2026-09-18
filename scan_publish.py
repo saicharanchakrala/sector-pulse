@@ -178,13 +178,23 @@ def row_for(setup, now) -> dict:
     # scanner in. Guarded because a reading that predates the pre-trigger
     # fields - or a stand-in in a test - must publish "no approach
     # information" rather than take the whole table down.
+    # NARROW, AND LOUD. A blanket `except Exception` at DEBUG meant a real
+    # TypeError inside approach() produced all-None columns for every
+    # symbol, render_approaching then found an empty frame and returned
+    # silently, and the whole feature could be dead in production with no
+    # signal anywhere above DEBUG.
     try:
         import setups as setups_mod
-
-        near = setups_mod.approach(reading)
-    except Exception as exc:
-        logger.debug("No approach reading for %s: %s", reading.symbol, exc)
+    except ImportError as exc:                    # the caller already has it
+        logger.warning("setups unavailable, so no approach columns: %s", exc)
         near = None
+    else:
+        try:
+            near = setups_mod.approach(reading)
+        except (AttributeError, TypeError) as exc:
+            logger.warning("approach() failed for %s, so the approaching "
+                           "panel will be empty: %s", reading.symbol, exc)
+            near = None
     row.update({
         "approach_side": None if near is None else near.side,
         "approach_trigger": None if near is None else number(near.trigger),

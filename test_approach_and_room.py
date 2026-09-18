@@ -51,9 +51,12 @@ def _reading(**over):
         minutes_left=270, bars_left=90, range_closed=True,
         session_bar_count=40,
     )
+    # Passed straight through, so a mistyped override raises TypeError
+    # instead of silently testing the default. An earlier version filtered
+    # to the dataclass's own field names, which meant _reading(atr=0.0)
+    # tested atr_bar=2.0 and passed.
     base.update(over)
-    fields = {f.name for f in __import__("dataclasses").fields(setups.Readings)}
-    return setups.Readings(**{k: v for k, v in base.items() if k in fields})
+    return setups.Readings(**base)
 
 
 # --- approach: when it must stay silent ---------------------------------
@@ -130,6 +133,59 @@ def test_the_side_is_not_whichever_edge_is_closer() -> None:
 
 # --- approach: readiness uses the real gates ----------------------------
 
+def test_vwap_between_price_and_the_high_still_reports_the_long() -> None:
+    """THE REGRESSION TEST for the side rule.
+
+    Breaking the high CROSSES VWAP, so choose_direction accepts the long.
+    An earlier version read the current VWAP side, called it SHORT, and
+    pointed at the far edge - naming the wrong trigger and hiding the
+    right one on a geometry that is common mid-session.
+    """
+    reading = _reading(last=100.0, vwap=100.5)
+    near = setups.approach(reading)
+    assert near is not None
+    assert near.side == setups.LONG, "reported the edge VWAP does not agree with"
+    assert near.trigger == 101.0
+
+    # And the direction it names is the one choose_direction would give
+    # once the break happened.
+    broken = _reading(last=101.2, vwap=100.5)
+    assert setups.choose_direction(broken)[0] == setups.LONG
+
+
+def test_a_ready_name_would_not_immediately_fail_the_room_gate() -> None:
+    """THE CONTRADICTION the panel must not present as a promise.
+
+    Reaching the trigger is itself more move spent, so a name can look
+    clear at 0.6 ATR away and fail the room gate the instant it breaks.
+    Readiness is therefore judged on levels built AT THE TRIGGER, not at
+    the current price.
+    """
+    reading = _reading(last=103.0, prev_close=100.0, day_change_pct=3.0,
+                       vwap=102.0, atr_bar=0.25,
+                       opening_range=indicators.OpeningRange(
+                           high=103.15, low=101.0, bars=5, minutes=15),
+                       day_high=103.1, day_low=101.2,
+                       minutes_left=150, bars_left=50)
+    near = setups.approach(reading)
+    assert near is not None
+    assert near.side == setups.LONG
+
+    # Whatever it reported, breaking must not contradict it.
+    broke = setups.evaluate(_reading(
+        last=near.trigger + 0.05, prev_close=100.0, day_change_pct=3.05,
+        vwap=102.0, atr_bar=0.25,
+        opening_range=indicators.OpeningRange(high=103.15, low=101.0,
+                                              bars=5, minutes=15),
+        day_high=103.25, day_low=101.2, minutes_left=150, bars_left=50))
+    if near.ready:
+        assert broke.actionable, (
+            "reported ready, then refused on breaking: "
+            f"{[r for r in broke.reasons if '[FAIL]' in r]}")
+    else:
+        assert near.blockers, "not ready but named no blocker"
+
+
 def test_ready_when_only_the_break_is_missing() -> None:
     near = setups.approach(_reading())
     assert near is not None
@@ -172,8 +228,16 @@ def test_readiness_is_not_a_claim_the_break_happens() -> None:
 # --- room to move -------------------------------------------------------
 
 class _Trade:
-    def __init__(self, expected_range):
+    """Enough of TradeLevels for the room gate: the range and the SIDE.
+
+    The side is not optional - the gate measures move spent in the
+    trade's own direction, because an unsigned denominator refused longs
+    that had fallen and passed shorts that had risen.
+    """
+
+    def __init__(self, expected_range, direction=setups.LONG):
         self.expected_range = expected_range
+        self.direction = direction
 
 
 def test_a_setup_with_less_left_than_it_has_moved_is_refused(
@@ -233,20 +297,88 @@ def test_the_default_threshold_is_not_a_veto_on_most_output() -> None:
     assert 0.0 < config.SCAN_MIN_ROOM_RATIO <= 0.75
 
 
+def _broke_upward():
+    """A real break that clears every OTHER gate, so the room gate decides.
+
+    The ATR and bars are scaled to a plausible intraday setup on purpose.
+    An earlier fixture used atr_bar=2.0 with bars_left=90, which put
+    target_distance one ulp ABOVE expected_range - so _reach_reason
+    already failed and `actionable is False` held whether the room gate
+    was wired in or not. The test named for proving the wiring was the one
+    test that could not fail.
+    """
+    return _reading(last=101.5, prev_close=99.0, atr_bar=1.0, bars_left=25,
+                    minutes_left=150, day_high=101.6, day_low=98.5)
+
+
 def test_the_gate_is_wired_into_the_verdict(monkeypatch) -> None:
-    """Otherwise it reports a FAIL that does not bind on anything."""
+    """Otherwise it reports a FAIL that does not bind on anything.
+
+    Asserted as a DIFFERENCE between two thresholds on one fixture: with
+    the gate slack the setup is actionable, and with it strict the same
+    setup is not. Nothing else about the fixture changes, so only the gate
+    can account for the flip.
+    """
+    broke = _broke_upward()
+
+    monkeypatch.setattr(config, "SCAN_MIN_ROOM_RATIO", 0.01)
+    slack = setups.evaluate(broke)
+    assert slack.direction == setups.LONG
+    assert slack.actionable is True, slack.reasons
+    assert slack.rank_score > 0.0
+
     monkeypatch.setattr(config, "SCAN_MIN_ROOM_RATIO", 5.0)
-    broke = _reading(last=101.5, prev_close=99.0)
-    verdict = setups.evaluate(broke)
-    assert verdict.direction == setups.LONG
-    assert verdict.actionable is False
-    assert any("plausible move left" in r for r in verdict.reasons)
-    assert verdict.rank_score == 0.0
+    strict = setups.evaluate(broke)
+    assert strict.direction == setups.LONG
+    assert strict.actionable is False, "the gate does not bind on `passed`"
+    assert strict.rank_score == 0.0
+    assert any("plausible move left" in r and "[FAIL]" in r
+               for r in strict.reasons)
 
 
 def test_the_reason_appears_in_the_trail_even_when_it_passes(
         monkeypatch) -> None:
     monkeypatch.setattr(config, "SCAN_MIN_ROOM_RATIO", 0.01)
-    verdict = setups.evaluate(_reading(last=101.5, prev_close=99.0))
-    assert any("plausible move left" in r or "room to move" in r
+    verdict = setups.evaluate(_broke_upward())
+    assert any("plausible move left" in r and "[PASS]" in r
                for r in verdict.reasons)
+
+
+def test_the_room_failure_is_tagged_as_an_entry_gate(monkeypatch) -> None:
+    """A held position must not be told its setup "no longer clears".
+
+    The ratio falls monotonically as a trade works - further from the
+    previous close, fewer bars left - so without the tag the watch tab
+    headlines a failure on exactly the positions going well.
+    """
+    monkeypatch.setattr(config, "SCAN_MIN_ROOM_RATIO", 5.0)
+    verdict = setups.evaluate(_broke_upward())
+    room = [r for r in verdict.reasons if "plausible move left" in r]
+    assert room and "[ENTRY]" in room[0], room
+
+
+def test_a_short_is_measured_against_its_own_direction(
+        monkeypatch) -> None:
+    """The denominator must be signed.
+
+    Unsigned, a long sitting BELOW its previous close - the whole gap
+    above it as room - was refused as a chase, and a short carrying
+    adverse move was let through.
+    """
+    monkeypatch.setattr(config, "SCAN_MIN_ROOM_RATIO", 0.5)
+
+    class _Long:
+        expected_range = 1.5
+        direction = setups.LONG
+
+    class _Short:
+        expected_range = 1.5
+        direction = setups.SHORT
+
+    down = _reading(last=96.0, prev_close=100.0)
+    ok, line = setups._room_reason(down, _Long())
+    assert ok is True, line
+    assert "against this direction" in line
+
+    ok, _ = setups._room_reason(down, _Short())
+    assert ok is False, "4.00 spent downward with 1.50 left should refuse"

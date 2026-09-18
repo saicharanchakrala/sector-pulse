@@ -215,16 +215,24 @@ SCAN_REWARD_RISK = 2.0
 #
 # Why it exists: the relative-strength gate requires today's
 # outperformance, so a long can only pass once it is already up more than
-# the index. Measured 2026-09-18 on 78 cleared setups, the median had
-# moved 3.16% and asked for 3.10% more - and 46% of them needed the rest
-# of the session to travel further than the whole morning had.
+# the index. Measured on the 2026-09-18 10:43 scan, whose 78 directional
+# rows included 61 cleared setups carrying a previous close: the median
+# had moved 3.16% and asked for 3.10% more, and 46% needed the rest of
+# the session to travel further than the whole morning had.
 #
-# Why 0.5 and not 1.0: at 1.0 this cuts 56% of the output, and the rule
-# has no backtest behind it - promoting an unvalidated belief to that
-# large a veto is what SCAN_REQUIRE_OI_CONFIRMATION exists to warn
-# against. At 0.5 it cuts 20% (61 cleared setups on the same scan, 12
-# refused) and only where LESS move remains than has already happened.
-# Distribution that day: median ratio 0.92, 10th percentile 0.37.
+# What 0.5 MEANS: refuse when less than HALF the already-spent move
+# plausibly remains. Not "less remains than has happened" - that is 1.0.
+#
+# Why not 1.0: it cut 34 of those 61 (56%), and the rule has no backtest
+# behind it. Promoting an unvalidated belief to that large a veto is what
+# SCAN_REQUIRE_OI_CONFIRMATION's comment exists to warn against. 0.5 cut
+# 12 of 61 (20%). Distribution: median ratio 0.92, 10th percentile 0.37.
+#
+# KNOWN AND UNMEASURED: expected_range is atr_bar * sqrt(bars_left), so it
+# shrinks through the session while the spent move grows. The same 3% move
+# passes at 75 bars left and fails at 25, which means this gate tightens
+# as the day goes on and partly subsumes SCAN_SESSION_MIN_MINUTES_LEFT.
+# The 20% above is one instant, not a daily average.
 #
 # Set it to 0.0 to report the ratio without binding on it.
 SCAN_MIN_ROOM_RATIO = 0.5

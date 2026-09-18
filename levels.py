@@ -122,10 +122,28 @@ class TradeLevels:
             return 1.0
         return min(1.0, (self.lot_risk + self.cost_rupees) / denominator)
 
+    # Relative slack on the target-versus-range comparison. NOT a
+    # judgement about how much overshoot is acceptable: it exists because
+    # the two quantities are the SAME NUMBER by construction and floating
+    # point cannot be relied on to say so.
+    #
+    # With the default volatility stop at half a sigma and a 2:1 target,
+    # target_distance = 2 * 0.5 * sigma = sigma = expected_range exactly.
+    # Measured over 4,000 randomised volatility-stopped trades: 100% land
+    # mathematically on the line, and a bare `<=` refused 48.8% of them -
+    # a coin flip per symbol, silently suppressing about half of every
+    # scan's actionable setups. setups._reach_reason already documents the
+    # intent, that this "is an identity, not a test" and "can only fail
+    # when there is no remaining move at all".
+    _REACH_TOLERANCE = 1e-9
+
     @property
     def reachable(self) -> bool:
         """Whether the target sits inside the plausible remaining move."""
-        return self.expected_range > 0.0 and self.target_distance <= self.expected_range
+        if self.expected_range <= 0.0:
+            return False
+        slack = self.expected_range * (1.0 + self._REACH_TOLERANCE)
+        return self.target_distance <= slack
 
 
 def expected_remaining_range(atr_per_bar: float, bars_left: int) -> float:

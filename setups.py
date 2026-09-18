@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import math
+import dataclasses
 from dataclasses import dataclass, field
 
 import pandas as pd
@@ -364,6 +365,20 @@ def _reach_reason(trade: TradeLevels) -> tuple[bool, str]:
         f"[{'OK' if trade.reachable else 'FAIL'}]")
 
 
+def _price_reason(reading: Readings) -> tuple[bool, str]:
+    """The penny-stock floor. Extracted so approach() shares it.
+
+    It was the one gate with no helper, so approach() hand-rolled a copy -
+    directly against the rule stated beside it, that a second copy of a
+    rule which agrees today and drifts in a month is worse than not
+    reporting it at all.
+    """
+    ok = reading.last >= config.SCAN_MIN_PRICE
+    return ok, (f"price {reading.last:.2f} vs floor "
+                f"{config.SCAN_MIN_PRICE:.2f} "
+                f"[{'PASS' if ok else 'FAIL'}]")
+
+
 def _room_reason(reading: Readings,
                  trade: TradeLevels) -> tuple[bool, str]:
     """Is as much plausible move left as the day has already made?
@@ -385,21 +400,34 @@ def _room_reason(reading: Readings,
     value with its measurement recorded beside it rather than a literal.
     """
     prev = reading.prev_close
-    floor = float(getattr(config, "SCAN_MIN_ROOM_RATIO", 0.0))
+    floor = float(config.SCAN_MIN_ROOM_RATIO)
     if floor <= 0.0:
         return True, ("room to move not enforced (SCAN_MIN_ROOM_RATIO is "
                       "0) [INFO]")
-    if prev is None or prev <= 0.0:
+    if prev is None:
         return True, "no previous close, so room to move is unknown [INFO]"
-    moved = abs(reading.last - prev)
-    if moved <= 0.0:
-        return True, ("unmoved from the previous close, so the whole "
-                      "plausible range is still ahead [PASS]")
-    ratio = trade.expected_range / moved
+    if prev <= 0.0:
+        return True, ("previous close is not a usable price, so room to "
+                      "move is unknown [INFO]")
+
+    # SIGNED, in the trade's own direction. abs() conflated move made
+    # TOWARDS the target with move made against it, so a long sitting 4%
+    # BELOW its previous close - the entire gap above it as room, passing
+    # relative strength because the index fell further - was refused as a
+    # chase, and a short carrying adverse move was let through. The gate
+    # exists to stop chasing; unsigned it did the opposite on exactly the
+    # gap-down recoveries and reversal shorts it most needed to get right.
+    spent = ((reading.last - prev) if trade.direction == LONG
+             else (prev - reading.last))
+    if spent <= 0.0:
+        return True, ("the day's move so far is against this direction, so "
+                      "the whole plausible range is still ahead [PASS]")
+    ratio = trade.expected_range / spent
     ok = ratio >= floor
     return ok, (f"{trade.expected_range:.2f} plausible move left against "
-                f"{moved:.2f} already made today, ratio {ratio:.2f} vs floor "
-                f"{floor:.2f} [{'PASS' if ok else 'FAIL'}]")
+                f"{spent:.2f} already made in this direction today, ratio "
+                f"{ratio:.2f} vs floor {floor:.2f} "
+                f"[{'PASS' if ok else 'FAIL'}] [ENTRY]")
 
 
 @dataclass(frozen=True)
@@ -438,10 +466,19 @@ def approach(reading: Readings,
     closed, a range already broken, or no volatility to measure distance
     in. Each of those is a different fact from "far from its trigger".
 
-    THE SIDE COMES FROM VWAP, because that is what choose_direction will
-    demand agreement with. A name below VWAP approaching the range high
-    would break into a direction the scanner refuses, so it is not
-    approaching anything actionable and is left out.
+    THE SIDE COMES FROM WHERE THE BREAK LANDS, not from where price sits
+    now. An earlier version read the current VWAP side and justified it as
+    "a break the scanner would refuse anyway" - which is false whenever
+    VWAP sits between price and the range edge, because breaking that
+    edge CROSSES VWAP. Measured: last 100.0, VWAP 100.5, range 98-101 was
+    reported as a SHORT 1.00 ATR from 98.0, while choose_direction would
+    in fact have accepted the LONG that was 0.50 ATR away at 101.0 - the
+    panel named the wrong trigger and hid the right one, on a geometry
+    that is common mid-session.
+
+    So a break of the high qualifies when the high is at or above VWAP,
+    and a break of the low when the low is at or below VWAP. Both can
+    qualify; the nearer is reported.
     """
     orb = reading.opening_range
     if orb is None or reading.vwap is None or not reading.range_closed:
@@ -453,30 +490,58 @@ def approach(reading: Readings,
     if last > orb.high or last < orb.low:
         return None                      # already broken: evaluate() owns it
 
-    if last > reading.vwap:
-        side, trigger, distance = LONG, orb.high, orb.high - last
-    else:
-        side, trigger, distance = SHORT, orb.low, last - orb.low
-    if distance < 0.0:
+    candidates = []
+    if orb.high >= reading.vwap:        # breaking the high lands above VWAP
+        candidates.append((LONG, orb.high, orb.high - last))
+    if orb.low <= reading.vwap:         # breaking the low lands below VWAP
+        candidates.append((SHORT, orb.low, last - orb.low))
+    if not candidates:
         return None
+    side, trigger, distance = min(candidates, key=lambda c: c[2])
     ceiling = (config.SCAN_APPROACH_MAX_ATR if max_atr is None else max_atr)
     distance_atr = distance / atr
     if distance_atr > ceiling:
         return None
 
-    # THE SAME GATE FUNCTIONS evaluate() uses, given the side a break would
-    # produce. A second copy of these rules that agreed today and drifted
-    # in a month would be worse than not reporting readiness at all.
+    # EVERY GATE evaluate() WOULD RUN, against levels built AT THE
+    # TRIGGER. An earlier version checked five of the eleven inputs to
+    # `passed` and still called the result "every gate other than the
+    # break" - which made `ready` a promise the code did not test.
+    # Reproducible in the default config: a name 0.60 ATR from its trigger
+    # with no blockers, which on breaking failed the room gate at ratio
+    # 0.39, because reaching the trigger is itself more move spent. Those
+    # rows sorted to the TOP of the panel.
     blockers = []
-    if reading.last < config.SCAN_MIN_PRICE:
-        blockers.append(f"price {reading.last:.2f} below the "
-                        f"{config.SCAN_MIN_PRICE:.2f} floor")
+    price_ok, price_line = _price_reason(reading)
+    if not price_ok:
+        blockers.append(price_line.split(" [")[0])
     for ok, line in (_liquidity_reason(reading),
                      _time_reason(reading),
                      _rvol_reason(reading),
                      _strength_reason(reading, side)):
         if not ok:
             blockers.append(line.split(" [")[0])
+
+    # Provisional levels at the trigger, so the gates that need a trade -
+    # cost, win rate, reach, room - are judged on the setup that would
+    # actually exist rather than skipped.
+    at_trigger = dataclasses.replace(reading, last=trigger)
+    trade = levels_mod.build_levels(
+        direction=side, entry=trigger, atr_per_bar=atr,
+        bars_left=reading.bars_left,
+        opening_low=orb.low, opening_high=orb.high,
+        day_low=reading.day_low, day_high=reading.day_high)
+    if trade is None:
+        blockers.append("levels cannot be built at the trigger")
+    else:
+        for ok, line in (_oi_reason(at_trigger),
+                         _cost_reason(trade),
+                         _win_rate_reason(trade),
+                         _reach_reason(trade),
+                         _room_reason(at_trigger, trade)):
+            if not ok:
+                blockers.append(line.split(" [")[0])
+
     return Approach(symbol=reading.symbol, side=side, trigger=trigger,
                     last=last, distance=distance, distance_atr=distance_atr,
                     ready=not blockers, blockers=blockers)
@@ -513,10 +578,8 @@ def evaluate(reading: Readings, capital: float = config.SCAN_CAPITAL,
              risk_pct: float = config.SCAN_RISK_PCT_PER_TRADE) -> Setup:
     """Run every gate for one symbol and return its complete verdict."""
     reasons: list[str] = []
-    price_ok = reading.last >= config.SCAN_MIN_PRICE
-    reasons.append(f"price {reading.last:.2f} vs floor "
-                   f"{config.SCAN_MIN_PRICE:.2f} "
-                   f"[{'PASS' if price_ok else 'FAIL'}]")
+    price_ok, price_line = _price_reason(reading)
+    reasons.append(price_line)
     liquid_ok, liquid_line = _liquidity_reason(reading)
     reasons.append(liquid_line)
     direction, direction_line = choose_direction(reading)

@@ -1259,25 +1259,39 @@ def render_approaching(table) -> None:
     break comes, and most will not - being early costs precision, and
     saying so is the honest way to offer it.
     """
-    if "approach_atr" not in table.columns:
+    # BOTH columns, because both are used below. Guarding only on
+    # approach_atr left sort_values and the readiness count to raise a
+    # KeyError - and this runs inside render_published_scan, which has no
+    # error boundary, so that would have taken the metrics, the main table
+    # and the reasons expander down with it. The feed and the UI deploy
+    # separately, so a table written at one revision and read at another
+    # is a normal state rather than a corner case.
+    required = {"approach_atr", "approach_ready"}
+    if not required <= set(table.columns):
         return
     near = table[table["approach_atr"].notna()].copy()
     if near.empty:
         return
+    near["approach_ready"] = near["approach_ready"].fillna(False).astype(bool)
     near = near.sort_values(["approach_ready", "approach_atr"],
                             ascending=[False, True])
-    ready = int(near["approach_ready"].fillna(False).astype(bool).sum())
+    ready = int(near["approach_ready"].sum())
 
-    with st.expander(f"Approaching a trigger - {len(near):,} names, "
-                     f"{ready} with every other gate already passing"):
+    # A STATIC LABEL. Streamlit takes an expander's identity from its
+    # label, so embedding the counts made every 20-second fragment tick a
+    # different element - which remounts it and collapses the panel under
+    # anyone who had opened it. The counts belong in the body.
+    with st.expander("Approaching a trigger - names that have not broken yet"):
         st.caption(
-            "Inside the opening range, within "
-            f"{config.SCAN_APPROACH_MAX_ATR:g} ATR of the edge that would "
-            "put them on their VWAP side. `approach_ready` means only the "
-            "break is missing. Nothing here is a forecast that the break "
-            "happens - most will not - and a name that arrives having "
-            "spent its volatility getting there can still fail the "
-            "room-to-move gate."
+            f"**{len(near):,} names**, of which **{ready}** have every "
+            f"other gate already passing. Inside the opening range, within "
+            f"{config.SCAN_APPROACH_MAX_ATR:g} ATR of the edge whose break "
+            "would land them on the agreeing side of VWAP. "
+            "`approach_ready` means every gate the scanner would run - "
+            "including cost, win rate and room to move, judged on levels "
+            "built at the trigger - already passes, so only the break is "
+            "missing. It is NOT a forecast that the break happens, and "
+            "most will not."
         )
         columns = [c for c in ("symbol", "approach_side", "approach_ready",
                                "approach_atr", "last", "approach_trigger",
@@ -2338,14 +2352,26 @@ def scanner_view(symbol: str) -> tuple:
     for setup in ranked:
         if setup.symbol != symbol:
             continue
-        blocker = ""
-        if not setup.actionable:
-            failed = [r for r in setup.reasons if "[FAIL]" in r]
-            blocker = failed[0] if failed else ""
+        # ENTRY-ONLY GATES ARE IGNORED FOR A POSITION ALREADY HELD, and
+        # the room-to-move gate is the reason this distinction now exists.
+        # It refuses a setup with less plausible move left than the day has
+        # already spent, which is the right question when deciding whether
+        # to ENTER and the wrong one once you are in: a position that is
+        # working has moved further from the previous close and has fewer
+        # bars left, so its ratio falls monotonically as it wins. Left
+        # unfiltered the watch would headline "the setup no longer clears
+        # the gates" on precisely the trades going well, and a tab whose
+        # purpose is to break silence cannot afford to cry wolf.
+        failed = [r for r in setup.reasons
+                  if "[FAIL]" in r and "[ENTRY]" not in r]
+        blocker = failed[0] if failed else ""
+        # `actionable` is recomputed from the surviving failures for the
+        # same reason: setup.actionable already folded the entry gate in.
+        holds_up = not failed
         direction = (setup.direction
                      if setup.direction in (position_watch.LONG,
                                             position_watch.SHORT) else None)
-        return direction, bool(setup.actionable), blocker
+        return direction, holds_up, blocker
     return None, None, ""
 
 
