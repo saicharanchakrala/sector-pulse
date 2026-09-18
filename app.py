@@ -372,7 +372,7 @@ def render_signal_result(top: dict | None, signal_dicts: list[dict]) -> None:
         rationale = top.get("explanation")
         if rationale:
             st.markdown(f"**Why:** {rationale}")
-    show_table(signal_frame(signal_dicts))
+    show_table(signal_frame(signal_dicts), key="daily_signal")
 
 
 def load_stored_signal(profile_key: str) -> "dict | None":
@@ -733,14 +733,79 @@ def live_bar_stamp() -> str:
 BEST_OBSERVED_WIN_RATE = 0.58
 
 
-def show_table(frame, target=None) -> None:
+# Below this many rows a search box is clutter rather than help - the
+# whole table is already on screen.
+SEARCH_MIN_ROWS = 8
+
+# The column holding the instrument, whatever a given table calls it. The
+# scan publishes "symbol"; the horizon tables title-case it.
+_SYMBOL_COLUMNS = ("symbol", "Symbol", "ticker", "Ticker")
+
+
+def symbol_column(frame) -> "str | None":
+    """The name of the instrument column in `frame`, or None."""
+    if frame is None or not hasattr(frame, "columns"):
+        return None
+    for name in _SYMBOL_COLUMNS:
+        if name in frame.columns:
+            return name
+    return None
+
+
+def symbol_search(frame, key: str, target=None):
+    """Draw a search box above a table and return the filtered rows.
+
+    ONE HELPER, for the same reason show_table is one helper: a filter
+    present on some tables and missing on others is worse than none,
+    because you cannot tell which case you are looking at.
+
+    Matches a case-insensitive substring, and accepts several terms
+    separated by spaces or commas so a handful of names can be pulled up
+    at once. A query that matches nothing says so rather than rendering an
+    empty table, which reads as "no data" and is a different fact.
+
+    Skipped entirely on a short table and on one with no instrument
+    column - the lookup's four rows, one per horizon, need no search.
+    """
+    surface = target if target is not None else st
+    column = symbol_column(frame)
+    if column is None or frame is None or len(frame) < SEARCH_MIN_ROWS:
+        return frame
+    query = surface.text_input(
+        "Find a symbol", key=f"{key}_search", placeholder="e.g. COLPAL, HDFC",
+        help="Case-insensitive, matches part of a name. Separate several "
+             "with spaces or commas.")
+    terms = [t for t in str(query or "").replace(",", " ").split() if t]
+    if not terms:
+        return frame
+    text = frame[column].astype(str).str.upper()
+    keep = text.str.contains(terms[0].upper(), regex=False, na=False)
+    for term in terms[1:]:
+        keep = keep | text.str.contains(term.upper(), regex=False, na=False)
+    filtered = frame[keep]
+    if filtered.empty:
+        surface.caption(f"Nothing matching {', '.join(terms)} in these "
+                        f"{len(frame):,} rows.")
+        return filtered
+    if len(filtered) < len(frame):
+        surface.caption(f"{len(filtered):,} of {len(frame):,} rows.")
+    return filtered
+
+
+def show_table(frame, target=None, key: "str | None" = None) -> None:
     """Render a table with a plain-English tooltip on every column.
 
     Routed through one helper so a column cannot be explained in one table
     and left bare in another, and so improving a wording improves it
     everywhere. Columns with no glossary entry simply render untouched.
+
+    `key` opts the table into the symbol search. It is required rather
+    than derived because Streamlit identifies a widget by its key, and two
+    tables sharing one would share the other's query.
     """
     surface = target if target is not None else st
+    if key is not None:
+        frame = symbol_search(frame, key, target=surface)
     surface.dataframe(frame, width="stretch", hide_index=True,
                       column_config=glossary.config_for(frame, st))
 
@@ -764,6 +829,12 @@ def watch_table(frame, key: str, target=None, symbol: "str | None" = None,
     add a position nothing can be checked against.
     """
     surface = target if target is not None else st
+    # FILTERED FIRST, AND THE SAME FRAME THROUGHOUT. A selection index is
+    # positional within the frame that was RENDERED, so filtering for
+    # display while resolving the row against the unfiltered frame would
+    # add a different instrument than the one clicked - silently, and into
+    # Positions.
+    frame = symbol_search(frame, key, target=surface)
     picked = surface.dataframe(
         frame, width="stretch", hide_index=True,
         column_config=glossary.config_for(frame, st),
@@ -1162,8 +1233,12 @@ def render_premarket_panel() -> None:
                           key="premarket_limit")
         st.caption(f"Published {built_at:%d %b %H:%M}. Nothing in it "
                    f"changes intraday - every input is a settled session.")
-        st.dataframe(table.head(limit), use_container_width=True,
-                     hide_index=True)
+        # THE SEARCH SEES THE WHOLE PUBLISHED LIST, and the slider only
+        # caps what is shown when nothing is being searched for. Capping
+        # first would hide a name for ranking 30th when the slider sat at
+        # 25 - which is exactly the case someone types a symbol to answer.
+        found = symbol_search(table, "premarket")
+        show_table(found if len(found) < len(table) else found.head(limit))
         st.caption(
             "**atr_pct** is the average daily range as a share of price. "
             "**expected_low/high** is one ATR either side of the last "
@@ -1232,12 +1307,12 @@ def render_published_scan() -> bool:
                            "required_win_rate", "breakeven_pct", "rvol",
                            "relative_strength", "turnover_20d")
                if c in show.columns]
-    st.dataframe(show[columns], width="stretch", hide_index=True)
+    show_table(show[columns], key="published_scan")
 
     with st.expander("Why each one passed or was blocked"):
         reasons = show[["symbol", "direction", "reasons"]] \
             if "reasons" in show.columns else show[["symbol"]]
-        st.dataframe(reasons, width="stretch", hide_index=True)
+        show_table(reasons, key="published_reasons")
 
     render_approaching(table)
     return True
@@ -1299,7 +1374,7 @@ def render_approaching(table) -> None:
                                "relative_strength", "day_change_pct",
                                "approach_blockers")
                    if c in near.columns]
-        st.dataframe(near[columns], width="stretch", hide_index=True)
+        show_table(near[columns], key="approaching")
 
 
 def published_scan_fragment() -> None:
@@ -2070,6 +2145,8 @@ def render_pivot_levels(levels: "dict | None", price: float) -> None:
         # show_table, not st.dataframe: every table in this app gets its
         # tooltips from one helper, and bypassing it is how a column ends
         # up explained in one place and bare in another.
+        # No key, so no search box: this table's rows are pivot LEVELS,
+        # not instruments, and there are five of them.
         show_table(frame)
         show_terms("What the pivot levels are")
 
@@ -2661,7 +2738,7 @@ def positions_panel(speak: bool) -> None:
         (st.warning if trading else st.info)(note)
     if not (speak and announce(statuses)):
         render_standing_alert()
-    show_table(watch_frame(statuses))
+    show_table(watch_frame(statuses), key="positions")
     st.caption(
         "Every number in that table is YOURS - the fill, the stop and the "
         "exit you recorded. Nothing in it is a suggestion."
@@ -3089,7 +3166,7 @@ def render_positional_tab(profile_key: str, news_weight: float,
     render_signal_section(items, momentum, profile)
 
     st.subheader("Full ranking")
-    show_table(build_ranking_frame(scores))
+    show_table(build_ranking_frame(scores), key="full_ranking")
 
     render_sector_expanders(scores)
     render_ai_section(scores)
