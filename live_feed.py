@@ -420,6 +420,30 @@ def main(argv=None) -> int:
         return 1
     print(f"universe: {len(symbols)} symbols")
 
+    # THE CONSOLIDATED STORE FIRST, if one has been published. Without it
+    # prewarm refetches 17 days for every symbol from Kite at three
+    # requests a second - measured 2026-09-18 at 836 seconds, on every
+    # cold start, which made a mid-session redeploy cost twenty minutes of
+    # the session. The nightly job already folds this file; it just never
+    # left the laptop. A local store wins over the published copy, so this
+    # is a no-op on a developer machine.
+    try:
+        # market_source is imported further down in this function, so it is
+        # NOT in scope here - and without this line the NameError would be
+        # swallowed by the handler below and the hydrate would silently
+        # never run, which looks exactly like it working.
+        import bar_store
+        import market_source as ms
+
+        interval = ms.kite_interval(config.SCAN_BAR_INTERVAL)
+        if bar_store.hydrate(interval):
+            print(f"hydrated the {interval} store from the object store")
+    except Exception as exc:
+        # Never fatal: the cost of failing here is the slow path, which is
+        # exactly what happened before this existed.
+        logger.warning("Could not hydrate the consolidated store, so "
+                       "prewarm will refetch: %s", exc)
+
     history_days = args.history_days or live_bars.history_days()
     print(f"prewarming {history_days} prior days (once, cached)...")
     started = time.time()

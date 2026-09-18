@@ -50,6 +50,92 @@ def store_path(interval: str) -> Path:
     return STORE / f"bars_{interval}.parquet"
 
 
+def object_name(interval: str) -> str:
+    """The consolidated file's name in the object store."""
+    return store_path(interval).name
+
+
+def publish(interval: str) -> int:
+    """Upload one consolidated store. Returns bytes sent, 0 if it did not.
+
+    WHY. A container has no forecast_cache and never will, so
+    live_bars.from_store finds nothing and prewarm falls through to
+    fetching 17 days of history for ~2,500 symbols from Kite at three
+    requests a second. Measured 2026-09-18: 836 seconds, every cold
+    start. Three deploys that day cost about an hour of a trading session
+    in prewarm alone, and a redeploy at 11:38 threw away a seed that had
+    reached 795 of 2,486 symbols.
+
+    The daily store is deliberately NOT published: it is 191 MB and the
+    container reads daily_context.parquet, 1.4 MB, instead. Only the
+    intraday store the feed actually prewarms from is worth shipping.
+    """
+    import object_store
+
+    if not object_store.enabled():
+        logger.info("No object store configured, so %s stays local",
+                    object_name(interval))
+        return 0
+    path = store_path(interval)
+    if not path.exists():
+        logger.warning("No %s to publish - run the rebuild first", path.name)
+        return 0
+    payload = path.read_bytes()
+    object_store.put(object_name(interval), payload)
+    logger.info("Published %s (%.1f MB) to %s", path.name,
+                len(payload) / 1_048_576, object_store.describe())
+    return len(payload)
+
+
+def hydrate(interval: str) -> bool:
+    """Fetch the consolidated store from the object store if absent locally.
+
+    True when it materialised a file, False when there was nothing to do -
+    which includes the ordinary case of running on a machine that already
+    has one, because a local store is authoritative over a published copy.
+
+    Written to the real path rather than read into memory so every
+    existing reader works unchanged, keeps its parquet pushdown filters,
+    and pays the download once per container rather than once per call.
+
+    STALENESS IS NOT CHECKED HERE. live_bars.from_store already refuses a
+    store whose freshest session is more than STORE_MAX_STALE_DAYS behind
+    the window it was asked for, and that check belongs where the window
+    is known. A store too old to use is therefore downloaded and then
+    declined, which costs one transfer and keeps the rule in one place.
+    """
+    import object_store
+
+    path = store_path(interval)
+    if path.exists():
+        return False
+    if not object_store.enabled():
+        return False
+    try:
+        payload = object_store.get(object_name(interval))
+    except Exception as exc:
+        logger.warning("Could not fetch %s: %s", object_name(interval), exc)
+        return False
+    if not payload:
+        logger.info("No published %s to hydrate from",
+                    object_name(interval))
+        return False
+    try:
+        STORE.mkdir(parents=True, exist_ok=True)
+        # Written aside and renamed, so a reader cannot open a file that is
+        # still arriving. os.replace is atomic within a filesystem.
+        temporary = path.with_suffix(".tmp")
+        temporary.write_bytes(payload)
+        os.replace(temporary, path)
+    except OSError as exc:
+        logger.warning("Could not write %s: %s", path, exc)
+        return False
+    logger.info("Hydrated %s (%.1f MB) from the object store, so prewarm "
+                "reads it instead of refetching from Kite", path.name,
+                len(payload) / 1_048_576)
+    return True
+
+
 def _span_end(span: str) -> str:
     """The end date out of a cache filename's span, or "" if unparseable.
 
@@ -325,7 +411,16 @@ def main(argv=None) -> int:
     default = f"day,{config.HORIZON_SHORT_INTERVAL}"
     parser.add_argument("--intervals", default=default,
                         help=f"comma-separated intervals (default: {default})")
+    # The daily store is 191 MB and no container reads it - they read
+    # daily_context.parquet instead - so publishing is opt-in per run
+    # rather than automatic for every interval folded.
+    parser.add_argument("--publish", default="",
+                        help="comma-separated intervals to upload to the "
+                             "object store after folding, so a container "
+                             "can prewarm from them instead of refetching "
+                             "from Kite")
     args = parser.parse_args(argv)
+    wanted = {i.strip() for i in args.publish.split(",") if i.strip()}
     for interval in [i.strip() for i in args.intervals.split(",") if i.strip()]:
         started = time.time()
         rows = rebuild(interval)
@@ -335,6 +430,11 @@ def main(argv=None) -> int:
             loaded = load(interval)
             print(f"  reads back {len(loaded):,} symbols in "
                   f"{time.time() - check:.1f}s")
+        if interval in wanted:
+            sent = publish(interval)
+            if sent:
+                print(f"  published {sent / 1_048_576:.1f} MB for the feed "
+                      f"to prewarm from")
     return 0
 
 

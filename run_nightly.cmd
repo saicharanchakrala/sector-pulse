@@ -29,6 +29,13 @@ REM                 data as separate per-symbol files. live_bars.prewarm
 REM                 REFUSES a store more than one session behind, so if
 REM                 this step does not run the scan is correct and slow
 REM                 rather than fast and wrong.
+REM                 --publish uploads it, which is what lets a CONTAINER
+REM                 prewarm from it. Without that the feed refetches 17
+REM                 days for ~2,500 symbols from Kite on every cold
+REM                 start - measured 2026-09-18 at 836 seconds, so three
+REM                 deploys that day cost about an hour of the session.
+REM                 The daily store is NOT published: 191 MB, and the
+REM                 container reads daily_context.parquet instead.
 REM   daily_context - the twenty-five daily bars per symbol that the
 REM                 intraday scan actually reads. About 1.4 MB against the
 REM                 559 MB store it comes from, so a container can compute
@@ -64,7 +71,7 @@ if not exist "deploy\env.vars" (
 "C:\Users\Sai Charan Chakrala\PycharmProjects\sector-pulse\.venv\Scripts\python.exe" fetch_announcements.py 2 >> run\nightly.log 2>&1
 "C:\Users\Sai Charan Chakrala\PycharmProjects\sector-pulse\.venv\Scripts\python.exe" publish_turnover.py     >> run\nightly.log 2>&1
 "C:\Users\Sai Charan Chakrala\PycharmProjects\sector-pulse\.venv\Scripts\python.exe" prune_cache.py --apply   >> run\nightly.log 2>&1
-"C:\Users\Sai Charan Chakrala\PycharmProjects\sector-pulse\.venv\Scripts\python.exe" -m bar_store --intervals 3minute >> run\nightly.log 2>&1
+"C:\Users\Sai Charan Chakrala\PycharmProjects\sector-pulse\.venv\Scripts\python.exe" -m bar_store --intervals 3minute --publish 3minute >> run\nightly.log 2>&1
 "C:\Users\Sai Charan Chakrala\PycharmProjects\sector-pulse\.venv\Scripts\python.exe" outcomes.py             >> run\nightly.log 2>&1
 "C:\Users\Sai Charan Chakrala\PycharmProjects\sector-pulse\.venv\Scripts\python.exe" -c "import premarket; print('watchlist:', premarket.publish(), 'names')" >> run\nightly.log 2>&1
 "C:\Users\Sai Charan Chakrala\PycharmProjects\sector-pulse\.venv\Scripts\python.exe" daily_context.py     >> run\nightly.log 2>&1
