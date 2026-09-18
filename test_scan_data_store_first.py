@@ -36,6 +36,13 @@ import scan_data
 IST = ZoneInfo("Asia/Kolkata")
 
 # The window fetch_bars asks of the store for a live scan.
+#
+# THE CLOCK IS FROZEN TO IT, by the autouse fixture below. fetch_bars
+# takes `end` from date.today(), and an earlier version of this file
+# hardcoded END while letting the real clock run - so the fixtures were
+# exactly current on the day they were written and two days stale the day
+# after, which put every frame past STORE_MAX_STALE_DAYS and failed four
+# tests at midnight for no reason connected to the code.
 END = date(2026, 9, 16)
 
 
@@ -83,6 +90,17 @@ def _store(monkeypatch):
         monkeypatch.setattr(bar_store, "load", load)
         return asked
     return install
+
+
+@pytest.fixture(autouse=True)
+def _frozen_today(monkeypatch):
+    """Pin date.today() to END, so these tests do not rot overnight."""
+    class _Date(date):
+        @classmethod
+        def today(cls):
+            return END
+
+    monkeypatch.setattr(scan_data, "date", _Date)
 
 
 @pytest.fixture(autouse=True)

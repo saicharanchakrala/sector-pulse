@@ -282,6 +282,14 @@ CACHE_TODAY_MAX_AGE_SECONDS = 900
 FEED_UNIVERSE_SIZE = 2800
 
 SCAN_AUTO_REFRESH_SECONDS = 60
+# How often the page RE-READS the scan the feed published. Distinct from
+# SCAN_AUTO_REFRESH_SECONDS, which re-RUNS a local scan and costs a full
+# re-score of every symbol in scope. This is a read: a HEAD when the
+# object has not moved, and about 244 KB when it has. The feed publishes
+# every 30 seconds and takes about 36 to scan, so new bytes appear roughly
+# once a minute - polling faster than this buys nothing, and polling
+# slower leaves a table on screen that has been superseded.
+PUBLISHED_SCAN_POLL_SECONDS = 20
 SCAN_AUTO_REFRESH_CHOICES = (30, 60, 120, 300)
 
 # How often the position watch re-prices what you already hold. Faster than

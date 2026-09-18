@@ -561,7 +561,27 @@ def test_fewer_than_three_usable_sessions_is_nan_not_an_average() -> None:
 
 # --- one estimator per run, never two in one ranking ---------------------
 
-def test_the_intraday_store_is_used_only_if_it_covers_the_universe() -> None:
+@pytest.fixture
+def _clock_at_the_fixtures(monkeypatch):
+    """Pin horizons' today() to the sessions these tests build.
+
+    _usable_fine refuses a store whose newest bar is more than
+    FINE_MAX_STALE_DAYS old, measured against date.today(). The fixtures
+    below hardcode sessions in early September, so with the real clock
+    running these tests passed when they were written and started failing
+    once the calendar moved past the staleness window - which says nothing
+    about the code they are meant to be testing.
+    """
+    class _Date(date):
+        @classmethod
+        def today(cls):
+            return date(2026, 9, 11)
+
+    monkeypatch.setattr(horizons, "date", _Date)
+
+
+def test_the_intraday_store_is_used_only_if_it_covers_the_universe(
+        _clock_at_the_fixtures) -> None:
     # Realised volatility and the 60-session daily estimate do not share a
     # level, so mixing them inside one rank(pct=True) column would let
     # data availability move a symbol's position and flip its cost gate.
@@ -579,7 +599,8 @@ def test_the_intraday_store_is_used_only_if_it_covers_the_universe() -> None:
     assert horizons._usable_fine(full, []) == {}
 
 
-def test_a_symbol_with_one_session_does_not_count_as_covered() -> None:
+def test_a_symbol_with_one_session_does_not_count_as_covered(
+        _clock_at_the_fixtures) -> None:
     # The real case, from the day the 3-minute store was first built: 121
     # symbols with 14 sessions and one with a single session written by a
     # backfill. Not empty, so counting frames called it covered - and then

@@ -1241,6 +1241,45 @@ def render_published_scan() -> bool:
     return True
 
 
+def published_scan_fragment() -> None:
+    """Re-read and redraw the feed's published scan. The timer body.
+
+    WHY A FRAGMENT AND NOT THE EXISTING AUTO-REFRESH. That one
+    (refresh_scan_fragment) re-RUNS a local scan from session state and
+    says so - "Run a scan first; the timer refreshes an existing one". It
+    never touched the published table, so the panel most people actually
+    read only updated when the page happened to re-run for some other
+    reason: the count and the "computed Ns ago" caption sat frozen while
+    the feed published a new table every half minute.
+
+    Cheap enough to do on a timer because it is a READ. scan_publish.load
+    HEADs the object first and reuses the parsed table when the ETag has
+    not moved, so a tick with nothing new costs one small request rather
+    than 244 KB and a parquet parse.
+
+    The verdict goes through session state because a fragment cannot
+    return a value to the script that declared it. The body also runs
+    inline on that declaring run, so the caller reads a fresh answer
+    rather than a stale one.
+    """
+    st.session_state["published_scan_shown"] = render_published_scan()
+
+
+def published_poll_interval() -> "int | None":
+    """Seconds between re-reads, or None when there is nothing to poll.
+
+    Outside trading hours the feed is scaled to zero and the object cannot
+    change, so a timer would be pure waste. A page opened before the open
+    therefore starts untimed; autoscan_watch_fragment is what wakes it
+    once the session begins.
+    """
+    if not object_store.enabled():
+        return None
+    if not live_bars_in_hours():
+        return None
+    return max(5, int(getattr(config, "PUBLISHED_SCAN_POLL_SECONDS", 20)))
+
+
 def render_scan_controls() -> tuple[str, bool, "datetime | None", bool]:
     """Scan inputs; returns (scope, want_options, as_of, run).
 
@@ -2822,7 +2861,12 @@ def render_scan_tab() -> None:
     # it without computing anything. The controls below stay available so
     # a deliberate local run is still one click away - the fallback is not
     # removed, only demoted, because a dead feed must not mean a dead UI.
-    published = render_published_scan()
+    #
+    # ON A TIMER, because the feed republishes every half minute and this
+    # panel used to update only when something else re-ran the page.
+    st.fragment(published_scan_fragment,
+                run_every=published_poll_interval())()
+    published = bool(st.session_state.get("published_scan_shown"))
     scope, want_options, as_of, run = render_scan_controls()
     # AUTO-RUN THE FIRST SCAN when the session is live and the feed is
     # carrying it. Requiring a button press meant the table was simply
