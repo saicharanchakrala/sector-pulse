@@ -1238,7 +1238,54 @@ def render_published_scan() -> bool:
         reasons = show[["symbol", "direction", "reasons"]] \
             if "reasons" in show.columns else show[["symbol"]]
         st.dataframe(reasons, width="stretch", hide_index=True)
+
+    render_approaching(table)
     return True
+
+
+def render_approaching(table) -> None:
+    """Names near a trigger they have NOT broken yet.
+
+    WHY THIS PANEL EXISTS. Every gate above reports on a break that has
+    already happened, because choose_direction requires the opening range
+    to be broken before a symbol has a direction at all. So the table
+    answers "what has moved" and can never answer "what might". Measured
+    2026-09-18, the setups that cleared had already moved 3.16% at the
+    median while asking for 3.10% more.
+
+    This is the same scan read one step earlier: the level, the distance
+    to it in units of the symbol's own volatility, and the gates that
+    would still block it on arrival. It is NOT a prediction that the
+    break comes, and most will not - being early costs precision, and
+    saying so is the honest way to offer it.
+    """
+    if "approach_atr" not in table.columns:
+        return
+    near = table[table["approach_atr"].notna()].copy()
+    if near.empty:
+        return
+    near = near.sort_values(["approach_ready", "approach_atr"],
+                            ascending=[False, True])
+    ready = int(near["approach_ready"].fillna(False).astype(bool).sum())
+
+    with st.expander(f"Approaching a trigger - {len(near):,} names, "
+                     f"{ready} with every other gate already passing"):
+        st.caption(
+            "Inside the opening range, within "
+            f"{config.SCAN_APPROACH_MAX_ATR:g} ATR of the edge that would "
+            "put them on their VWAP side. `approach_ready` means only the "
+            "break is missing. Nothing here is a forecast that the break "
+            "happens - most will not - and a name that arrives having "
+            "spent its volatility getting there can still fail the "
+            "room-to-move gate."
+        )
+        columns = [c for c in ("symbol", "approach_side", "approach_ready",
+                               "approach_atr", "last", "approach_trigger",
+                               "approach_distance", "rvol",
+                               "relative_strength", "day_change_pct",
+                               "approach_blockers")
+                   if c in near.columns]
+        st.dataframe(near[columns], width="stretch", hide_index=True)
 
 
 def published_scan_fragment() -> None:

@@ -150,6 +150,52 @@ def row_for(setup, now) -> dict:
         "cost_rupees": number(getattr(trade, "cost_rupees", None)),
         "required_win_rate": number(getattr(trade, "required_win_rate", None), 4),
     })
+
+    # THE PRE-TRIGGER STATE, published for every row whether it broke or
+    # not. All of it was already computed and then thrown away, because
+    # the table only ever described setups that had triggered - so the
+    # page could report what had moved and nothing about what had not.
+    # getattr throughout, matching how the trade fields above are read: a
+    # reading that does not carry one of these publishes a null rather
+    # than taking the whole table down.
+    orb = getattr(reading, "opening_range", None)
+    last = getattr(reading, "last", None)
+    prev = getattr(reading, "prev_close", None)
+    moved = (None if last is None or not prev else last - prev)
+    row.update({
+        "last": number(last),
+        "prev_close": number(prev),
+        "day_change_pct": number(getattr(reading, "day_change_pct", None), 3),
+        "moved_today": number(None if moved is None else abs(moved)),
+        "or_high": number(getattr(orb, "high", None)),
+        "or_low": number(getattr(orb, "low", None)),
+        "atr_bar": number(getattr(reading, "atr_bar", None), 4),
+        "minutes_left": getattr(reading, "minutes_left", None),
+    })
+
+    # Imported here, not at module scope: this module keeps setups lazy so
+    # it can be read and its assembly tested without pulling the whole
+    # scanner in. Guarded because a reading that predates the pre-trigger
+    # fields - or a stand-in in a test - must publish "no approach
+    # information" rather than take the whole table down.
+    try:
+        import setups as setups_mod
+
+        near = setups_mod.approach(reading)
+    except Exception as exc:
+        logger.debug("No approach reading for %s: %s", reading.symbol, exc)
+        near = None
+    row.update({
+        "approach_side": None if near is None else near.side,
+        "approach_trigger": None if near is None else number(near.trigger),
+        "approach_distance": None if near is None else number(near.distance),
+        "approach_atr": None if near is None else number(near.distance_atr, 3),
+        # READY means every gate OTHER than the break already passes. It
+        # is not a forecast that the break happens, and most will not.
+        "approach_ready": None if near is None else bool(near.ready),
+        "approach_blockers": (None if near is None
+                              else " | ".join(near.blockers)),
+    })
     return row
 
 

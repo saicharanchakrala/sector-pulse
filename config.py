@@ -210,6 +210,29 @@ SCAN_MIN_OI_CHANGE_PCT = 0.0      # only consulted when the above is True
 # rejection threshold - nothing gates on reward:risk, because the target is
 # constructed from it rather than measured against it.
 SCAN_REWARD_RISK = 2.0
+# ROOM TO MOVE. The plausible remaining move, as a share of the move the
+# day has ALREADY made, below which a setup is refused as a chase.
+#
+# Why it exists: the relative-strength gate requires today's
+# outperformance, so a long can only pass once it is already up more than
+# the index. Measured 2026-09-18 on 78 cleared setups, the median had
+# moved 3.16% and asked for 3.10% more - and 46% of them needed the rest
+# of the session to travel further than the whole morning had.
+#
+# Why 0.5 and not 1.0: at 1.0 this cuts 56% of the output, and the rule
+# has no backtest behind it - promoting an unvalidated belief to that
+# large a veto is what SCAN_REQUIRE_OI_CONFIRMATION exists to warn
+# against. At 0.5 it cuts 20% (61 cleared setups on the same scan, 12
+# refused) and only where LESS move remains than has already happened.
+# Distribution that day: median ratio 0.92, 10th percentile 0.37.
+#
+# Set it to 0.0 to report the ratio without binding on it.
+SCAN_MIN_ROOM_RATIO = 0.5
+# How close to its untouched trigger a name counts as "approaching", in
+# ATR-per-bar units. The scanner reports on breaks that have happened; at
+# this distance it also names the ones that have not, so a setup can be
+# seen before the move rather than after it.
+SCAN_APPROACH_MAX_ATR = 1.0
 # Today's cumulative volume against the median of the PRIOR SESSIONS
 # PRESENT IN THE FRAME at the same clock time - which is however many
 # SCAN_BAR_LOOKBACK supplies, currently about a dozen, not twenty. The old

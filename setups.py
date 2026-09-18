@@ -364,6 +364,124 @@ def _reach_reason(trade: TradeLevels) -> tuple[bool, str]:
         f"[{'OK' if trade.reachable else 'FAIL'}]")
 
 
+def _room_reason(reading: Readings,
+                 trade: TradeLevels) -> tuple[bool, str]:
+    """Is as much plausible move left as the day has already made?
+
+    THE ONE GATE THAT IS NOT ABOUT EVIDENCE. Every other gate asks whether
+    the move is real; this one asks whether there is any of it left. The
+    relative-strength gate requires today's outperformance, so a long
+    cannot pass until it is already up more than the index - which means
+    the scanner reports moves in progress and the entry is always behind
+    the start. Measured 2026-09-18 across 78 cleared setups, the median
+    had moved 3.16% and asked for 3.10% more, and 46% needed the remaining
+    session to travel further than the whole morning had.
+
+    FAILS OPEN on a missing previous close. Without it the ratio is not
+    computable, and refusing a setup for want of a daily bar would turn a
+    data gap into a verdict - which is the opposite of what this is for.
+
+    The threshold has no backtest behind it, which is why it is a config
+    value with its measurement recorded beside it rather than a literal.
+    """
+    prev = reading.prev_close
+    floor = float(getattr(config, "SCAN_MIN_ROOM_RATIO", 0.0))
+    if floor <= 0.0:
+        return True, ("room to move not enforced (SCAN_MIN_ROOM_RATIO is "
+                      "0) [INFO]")
+    if prev is None or prev <= 0.0:
+        return True, "no previous close, so room to move is unknown [INFO]"
+    moved = abs(reading.last - prev)
+    if moved <= 0.0:
+        return True, ("unmoved from the previous close, so the whole "
+                      "plausible range is still ahead [PASS]")
+    ratio = trade.expected_range / moved
+    ok = ratio >= floor
+    return ok, (f"{trade.expected_range:.2f} plausible move left against "
+                f"{moved:.2f} already made today, ratio {ratio:.2f} vs floor "
+                f"{floor:.2f} [{'PASS' if ok else 'FAIL'}]")
+
+
+@dataclass(frozen=True)
+class Approach:
+    """A name sitting near a trigger it has NOT yet broken.
+
+    WHY THIS EXISTS. choose_direction requires the opening range to be
+    BROKEN, so a symbol still inside it is NO_SETUP with no levels and no
+    score - correctly, because nothing has happened yet. The consequence
+    is that the scanner can only ever report moves already under way, and
+    the only honest way to see a name earlier is to say so explicitly:
+    this is the level, this is how far away it is, and these are the gates
+    that would still block it if it got there.
+
+    `ready` means every gate OTHER than the break already passes. It is
+    not a prediction that the break will happen, and most will not - that
+    is the price of being early rather than a flaw in the measure.
+    """
+
+    symbol: str
+    side: str
+    trigger: float
+    last: float
+    distance: float
+    distance_atr: float
+    ready: bool
+    blockers: list = field(default_factory=list)
+
+
+def approach(reading: Readings,
+             max_atr: "float | None" = None) -> "Approach | None":
+    """The pre-break state of one symbol, or None when it does not apply.
+
+    None rather than a neutral Approach for every case where the question
+    is not yet defined: no VWAP, no opening range, a range that has not
+    closed, a range already broken, or no volatility to measure distance
+    in. Each of those is a different fact from "far from its trigger".
+
+    THE SIDE COMES FROM VWAP, because that is what choose_direction will
+    demand agreement with. A name below VWAP approaching the range high
+    would break into a direction the scanner refuses, so it is not
+    approaching anything actionable and is left out.
+    """
+    orb = reading.opening_range
+    if orb is None or reading.vwap is None or not reading.range_closed:
+        return None
+    atr = reading.atr_bar
+    if not atr or atr <= 0.0:
+        return None
+    last = reading.last
+    if last > orb.high or last < orb.low:
+        return None                      # already broken: evaluate() owns it
+
+    if last > reading.vwap:
+        side, trigger, distance = LONG, orb.high, orb.high - last
+    else:
+        side, trigger, distance = SHORT, orb.low, last - orb.low
+    if distance < 0.0:
+        return None
+    ceiling = (config.SCAN_APPROACH_MAX_ATR if max_atr is None else max_atr)
+    distance_atr = distance / atr
+    if distance_atr > ceiling:
+        return None
+
+    # THE SAME GATE FUNCTIONS evaluate() uses, given the side a break would
+    # produce. A second copy of these rules that agreed today and drifted
+    # in a month would be worse than not reporting readiness at all.
+    blockers = []
+    if reading.last < config.SCAN_MIN_PRICE:
+        blockers.append(f"price {reading.last:.2f} below the "
+                        f"{config.SCAN_MIN_PRICE:.2f} floor")
+    for ok, line in (_liquidity_reason(reading),
+                     _time_reason(reading),
+                     _rvol_reason(reading),
+                     _strength_reason(reading, side)):
+        if not ok:
+            blockers.append(line.split(" [")[0])
+    return Approach(symbol=reading.symbol, side=side, trigger=trigger,
+                    last=last, distance=distance, distance_atr=distance_atr,
+                    ready=not blockers, blockers=blockers)
+
+
 def score_setup(reading: Readings, trade: TradeLevels) -> float:
     """Bounded 0..1 rank score from five independent readings.
 
@@ -447,9 +565,11 @@ def evaluate(reading: Readings, capital: float = config.SCAN_CAPITAL,
     reasons.append(win_line)
     reach_ok, reach_line = _reach_reason(trade)
     reasons.append(reach_line)
+    room_ok, room_line = _room_reason(reading, trade)
+    reasons.append(room_line)
 
     passed = all((price_ok, liquid_ok, time_ok, rvol_ok, strength_ok,
-                  oi_ok, cost_ok, win_ok, reach_ok))
+                  oi_ok, cost_ok, win_ok, reach_ok, room_ok))
     score = score_setup(reading, trade) if passed else 0.0
     return Setup(reading, direction, trade, passed, score, reasons)
 
