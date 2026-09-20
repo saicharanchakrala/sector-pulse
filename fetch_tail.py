@@ -55,6 +55,119 @@ def missing_symbols() -> list:
     return sorted(listed - have)
 
 
+def settled_end(today: "date | None" = None) -> date:
+    """The last date a completed daily bar can exist for.
+
+    Yesterday, walked back off a weekend. Saturdays and Sundays are
+    certain; holidays are not, and a symbol whose newest bar is a holiday
+    behind simply gets one redundant request rather than a wrong answer.
+    """
+    end = (today or date.today()) - timedelta(days=1)
+    while end.weekday() >= 5:
+        end -= timedelta(days=1)
+    return end
+
+
+def newest_sessions() -> dict:
+    """{symbol: its newest session} from the consolidated daily store."""
+    try:
+        frames = bar_store.load("day")
+    except Exception as exc:
+        print(f"No daily store to read ({exc})")
+        return {}
+    out = {}
+    for symbol, frame in (frames or {}).items():
+        if frame is None or frame.empty:
+            continue
+        try:
+            out[symbol] = frame.index.max().date()
+        except (AttributeError, TypeError, ValueError):
+            continue
+    return out
+
+
+def stale_groups(newest: dict, end: date) -> dict:
+    """{newest session: [symbols]} for every symbol not reaching `end`.
+
+    WHY THIS EXISTS AT ALL. This script's original job was only to backfill
+    listed equities the store had NEVER seen - `listed - have`. Nothing
+    extended a symbol that was already present. What kept the store
+    current was an accident: the UI's longer-horizon tables re-downloaded
+    three months of daily bars every morning, refreshing the per-symbol
+    day files that the fold then consolidated. Switching that off on
+    2026-09-18, to stop the UI hammering Kite, removed the only thing
+    advancing the daily store - and four days later it looked like this:
+
+        2026-09-09   2,518 symbols
+        2026-09-11   2,315
+        2026-09-15   1,055
+        2026-09-16      12
+
+    So prev_close was a DIFFERENT DATE per symbol, which is worse than a
+    uniform lag: relative_strength compares a symbol's day change against
+    the index across a universe whose members were measuring from
+    different days.
+
+    GROUPED BY THE DATE THEY REACH, because market_source.bars takes one
+    span for a list of symbols. A handful of groups covers the universe
+    and each symbol is requested exactly once, over the short span it
+    actually needs rather than the two years a backfill would ask for.
+    """
+    groups: dict = {}
+    for symbol, last in newest.items():
+        if last >= end:
+            continue
+        groups.setdefault(last, []).append(symbol)
+    return {day: sorted(names) for day, names in groups.items()}
+
+
+def extend_stale(end: "date | None" = None) -> int:
+    """Fetch every symbol forward to `end`. Returns symbols refreshed."""
+    end = end or settled_end()
+    newest = newest_sessions()
+    if not newest:
+        return 0
+    groups = stale_groups(newest, end)
+    if not groups:
+        print(f"Every symbol in the daily store reaches {end}.")
+        return 0
+
+    behind = sum(len(names) for names in groups.values())
+    workers = getattr(config, "KITE_FETCH_WORKERS", 1)
+    print(f"{behind:,} of {len(newest):,} symbols are behind {end}:")
+    for day in sorted(groups):
+        print(f"  {day}  {len(groups[day]):,} symbols")
+    print(f"~{behind / max(1, workers * 1.8) / 60:.0f} min at "
+          f"{workers} in flight\n")
+
+    refreshed = 0
+    for day in sorted(groups):
+        names = groups[day]
+        # STARTS ON THE DAY IT ALREADY HAS, not the day after. The overlap
+        # costs one bar and means a symbol whose last stored session was
+        # itself partial gets it rewritten rather than built on.
+        started = time.time()
+        try:
+            got = market_source.bars(names, day, end, interval="day")
+        except market_source.NoSession as exc:
+            # AN EXPIRED TOKEN IS A DAILY CONDITION, NOT A CRASH. Kite
+            # tokens die about 06:00 and this job runs after the close, so
+            # a session that has not been refreshed is the ordinary case
+            # for a job run a day late. Letting it escape aborted the
+            # whole of fetch_tail - including the fold - and printed a
+            # traceback into the nightly log, where the one thing anybody
+            # needs to read is which action fixes it.
+            print(f"\n  CANNOT EXTEND: {exc}")
+            print("  The daily store stays where it is. Every symbol's "
+                  "prev_close remains older than one session until this "
+                  "is fixed and the job is re-run.")
+            return refreshed
+        refreshed += len(got)
+        print(f"  {day}: {len(got):,}/{len(names):,} in "
+              f"{time.time() - started:.0f}s", flush=True)
+    return refreshed
+
+
 def market_is_open(now=None) -> bool:
     """Whether a session is running, so the run can refuse to compete."""
     from datetime import datetime
@@ -80,6 +193,14 @@ def main(argv=None) -> int:
               "Run it after 15:30, or pass --now to override.")
         return 2
 
+    # TWO JOBS, and the second one is why the store went stale. Backfill
+    # only ever covered symbols the store had NEVER seen; nothing moved an
+    # existing symbol forward, because the UI's daily downloads were doing
+    # that by accident until they were switched off. Extending runs first
+    # and unconditionally: it is the one that has to happen every night.
+    print("Extending every symbol to the last settled session...")
+    extended = extend_stale()
+
     names = missing_symbols()
     if not names:
         # STILL REBUILD. On most days nothing is missing, and returning
@@ -87,12 +208,13 @@ def main(argv=None) -> int:
         # nightly run would leave it drifting stale exactly as it was
         # found on 2026-09-15, three sessions behind, while reporting
         # success. The fold is local and costs no Kite requests.
-        print("Nothing missing - every listed equity is in the daily store.")
-        print("Folding the cache anyway, so the store stays current...")
+        print("\nNothing missing - every listed equity is in the daily store.")
+        print("Folding the cache so the store picks up what was extended...")
         bar_store.main(["--intervals", "day"])
+        report_coverage()
         return 0
 
-    end = date.today() - timedelta(days=1)
+    end = settled_end()
     start = end - timedelta(days=int(YEARS * 365))
     workers = getattr(config, "KITE_FETCH_WORKERS", 1)
     print(f"{len(names):,} listed equities have no daily bars")
@@ -103,7 +225,14 @@ def main(argv=None) -> int:
     # One call: market_source.bars fetches concurrently under the shared
     # rate gate and caches each symbol as it lands, so an interrupted run
     # costs nothing - the next one skips whatever already cached.
-    got = market_source.bars(names, start, end, interval="day")
+    try:
+        got = market_source.bars(names, start, end, interval="day")
+    except market_source.NoSession as exc:
+        # Same reasoning as the extension above: report the one action
+        # that fixes it and let the fold run on whatever is already
+        # cached, rather than aborting the step with a traceback.
+        print(f"\nCANNOT BACKFILL: {exc}")
+        got = {}
     print(f"\nfetched {len(got):,}/{len(names):,} in "
           f"{time.time() - started:.0f}s")
     empty = [s for s in names if s not in got]
@@ -117,23 +246,53 @@ def main(argv=None) -> int:
               "equity data while the broker does not carry them, so no "
               "amount of fetching changes it.")
 
-    if not got:
-        # NOTHING WAS FETCHED, so the per-symbol cache is identical to
-        # the one already folded and the store cannot have changed.
+    if not got and not extended:
+        # NOTHING WAS FETCHED AT ALL, so the per-symbol cache is identical
+        # to the one already folded and the store cannot have changed.
         # Rebuilding anyway burned 370 seconds on the first real run of
         # this script - and would have done so every night, for nothing.
+        #
+        # `extended` is in the condition because skipping the fold after a
+        # successful extension is exactly how the store stayed four days
+        # behind while the job reported success.
         print("\nNothing new was fetched, so the store cannot have "
               "changed - skipping the fold.")
         return 0
 
     print("\nfolding the per-symbol cache into the consolidated store...")
     bar_store.main(["--intervals", "day"])
-
-    after = set(bar_store.load("day"))
-    print(f"\ndaily store now holds {len(after):,} symbols")
+    report_coverage()
     print("The feed picks these up on its NEXT START, once they rank on "
           "20-session turnover. Nothing streams differently until then.")
     return 0
+
+
+def report_coverage() -> None:
+    """How far the store now reaches, per session, and whether that is level.
+
+    Printed because a RAGGED store is the failure that hid for four days:
+    a single "now holds 2,521 symbols" line was true the whole time and
+    said nothing about prev_close being a different date for each of them.
+    """
+    newest = newest_sessions()
+    if not newest:
+        print("\ndaily store is empty")
+        return
+    end = settled_end()
+    counts: dict = {}
+    for day in newest.values():
+        counts[day] = counts.get(day, 0) + 1
+    reaching = counts.get(end, 0)
+    print(f"\ndaily store holds {len(newest):,} symbols; "
+          f"{reaching:,} reach {end}")
+    for day in sorted(counts, reverse=True)[:5]:
+        flag = "" if day >= end else "   BEHIND"
+        print(f"  {day}  {counts[day]:,}{flag}")
+    if reaching < len(newest):
+        print(f"  {len(newest) - reaching:,} symbols did not reach {end} - "
+              f"delisted, suspended, or absent from Kite's master. Their "
+              f"prev_close is older than one session and every reading "
+              f"derived from it is measured from a different day.")
 
 
 if __name__ == "__main__":
