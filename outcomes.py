@@ -384,6 +384,17 @@ def log_files(log_path: "Path | None" = None) -> list:
     live = log_path or config.SCAN_LOG_CSV
     found = [live] if live.exists() else []
     found.extend(sorted(live.parent.glob(f"{live.name}.superseded*")))
+    # AND THE FEED'S OWN LOGS. scan_intraday.append_log is called only by
+    # the command-line scanner, so for as long as the scanning happened in
+    # the UI and the container this file was the only record and it held 8
+    # rows from 9 September. fetch_scan_log downloads the feed's sessions
+    # as scan_log_YYYYMMDD.csv beside this one; they are separate files
+    # rather than merged because merging means matching headers, and a
+    # header mismatch rotates the file - which has already stranded rows
+    # once. row_id is derived from each row's own fields, so reading them
+    # all is safe and duplicates are skipped by key.
+    stem = live.name.replace(".csv", "")
+    found.extend(sorted(live.parent.glob(f"{stem}_[0-9]*.csv")))
     return found
 
 

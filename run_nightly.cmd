@@ -41,6 +41,14 @@ REM                 intraday scan actually reads. About 1.4 MB against the
 REM                 559 MB store it comes from, so a container can compute
 REM                 prev_close, the pivot range and turnover without one.
 REM                 Verified drop-in: 216 symbols, every reading identical.
+REM   fetch_scan_log - downloads the FEED's own scan logs. Needed because
+REM                 scan_intraday.append_log is called only by the
+REM                 command-line scanner: the UI evaluates setups without
+REM                 logging them and the feed publishes a parquet table
+REM                 instead, so scan_log.csv sat at 8 rows from 9 Sep
+REM                 while the feed scanned 2,485 symbols every 45 seconds
+REM                 for days. Runs BEFORE outcomes, which resolves
+REM                 whatever it finds.
 REM   outcomes    - resolves every setup in scan_log.csv against what the
 REM                 market actually did, turning the log from a record of
 REM                 intentions into a track record. Idempotent, and only
@@ -72,6 +80,7 @@ if not exist "deploy\env.vars" (
 "C:\Users\Sai Charan Chakrala\PycharmProjects\sector-pulse\.venv\Scripts\python.exe" publish_turnover.py     >> run\nightly.log 2>&1
 "C:\Users\Sai Charan Chakrala\PycharmProjects\sector-pulse\.venv\Scripts\python.exe" prune_cache.py --apply   >> run\nightly.log 2>&1
 "C:\Users\Sai Charan Chakrala\PycharmProjects\sector-pulse\.venv\Scripts\python.exe" -m bar_store --intervals 3minute --publish 3minute >> run\nightly.log 2>&1
+"C:\Users\Sai Charan Chakrala\PycharmProjects\sector-pulse\.venv\Scripts\python.exe" fetch_scan_log.py        >> run\nightly.log 2>&1
 "C:\Users\Sai Charan Chakrala\PycharmProjects\sector-pulse\.venv\Scripts\python.exe" outcomes.py             >> run\nightly.log 2>&1
 "C:\Users\Sai Charan Chakrala\PycharmProjects\sector-pulse\.venv\Scripts\python.exe" -c "import premarket; print('watchlist:', premarket.publish(), 'names')" >> run\nightly.log 2>&1
 "C:\Users\Sai Charan Chakrala\PycharmProjects\sector-pulse\.venv\Scripts\python.exe" daily_context.py     >> run\nightly.log 2>&1

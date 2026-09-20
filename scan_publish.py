@@ -28,6 +28,7 @@ have through SCAN_LIVE_MAX_AGE_SECONDS.
 """
 from __future__ import annotations
 
+import csv
 import io
 import logging
 import threading
@@ -415,6 +416,119 @@ def _aged(table):
     return table, max(0.0, age)
 
 
+_LOG_LOCK = threading.Lock()
+_SESSION_LOG: dict = {}
+_SESSION_LOG_DAY = None
+
+
+def log_object_name(when: "datetime | None" = None) -> str:
+    """The session's scan log in the object store, named by day."""
+    day = (when or datetime.now(IST)).date()
+    return f"scan_log_{day:%Y%m%d}.csv"
+
+
+def _log_fields() -> list:
+    """The scan log's columns, taken from the one place that defines them.
+
+    Imported rather than restated so a column added to the CLI's log
+    cannot silently go unrecorded here - a missing key raises when the row
+    is built instead of producing a file outcomes.py reads as malformed.
+    """
+    import scan_intraday
+
+    return list(scan_intraday._CSV_FIELDS)
+
+
+def log_row(published: dict) -> dict:
+    """One published scan row, reshaped into a scan_log row.
+
+    BUILT FROM WHAT WAS PUBLISHED, not from the Setup object, so the
+    logged row is by construction the row the UI was shown. The only
+    fields not in the published table are derived rather than guessed:
+    `risk_rupees` is quantity times the stop distance, which is how
+    levels.build_levels computes lot_risk in the first place, and
+    `blocked_by` is the first failing gate out of the audit trail.
+    """
+    quantity = published.get("quantity")
+    entry = published.get("entry")
+    stop = published.get("stop")
+    risk = None
+    if quantity and entry is not None and stop is not None:
+        risk = round(abs(float(entry) - float(stop)) * int(quantity), 2)
+
+    blocked = ""
+    for reason in str(published.get("reasons") or "").split(" | "):
+        if "[FAIL]" in reason:
+            blocked = reason.split(" [")[0][:120]
+            break
+
+    row = dict(published)
+    row.update({
+        # The feed only ever scans now. A replay is a local, deliberate act.
+        "replayed": False,
+        "risk_rupees": risk,
+        "taken": bool(published.get("actionable")),
+        "blocked_by": blocked,
+    })
+    return {name: row.get(name, "") for name in _log_fields()}
+
+
+def remember(table, when: "datetime | None" = None) -> int:
+    """Accumulate this scan into the session's log. Returns rows held.
+
+    ONE ROW PER SYMBOL AND DIRECTION PER SESSION, not one per scan. The
+    feed scans every 30 seconds, so logging each pass would record the
+    same setup four hundred times and every hit rate computed on it would
+    be weighted by how long a symbol happened to stay on screen.
+
+    WHICH observation is kept matters. A symbol blocked at 09:20 that
+    clears at 11:00 must be recorded as it was when it CLEARED - that is
+    the moment it would have been acted on. So an actionable observation
+    replaces a blocked one, and among actionable ones the first wins.
+    Among blocked ones the first also wins, which keeps the earliest
+    evidence of why it never qualified.
+    """
+    global _SESSION_LOG_DAY
+
+    if table is None or getattr(table, "empty", True):
+        return 0
+    now = when or datetime.now(IST)
+    with _LOG_LOCK:
+        if _SESSION_LOG_DAY != now.date():
+            _SESSION_LOG.clear()
+            _SESSION_LOG_DAY = now.date()
+        for published in table.to_dict("records"):
+            if published.get("entry") is None:
+                continue          # no levels, so nothing to resolve against
+            key = (published.get("symbol"), published.get("direction"))
+            row = log_row(published)
+            held = _SESSION_LOG.get(key)
+            if held is None or (row["taken"] and not held["taken"]):
+                _SESSION_LOG[key] = row
+        return len(_SESSION_LOG)
+
+
+def publish_log(when: "datetime | None" = None) -> int:
+    """Write the session's accumulated log. Returns rows written.
+
+    The whole day is rewritten each time because S3 has no append, and at
+    a few hundred KB that is cheaper than any scheme which would let a
+    crash lose the session.
+    """
+    with _LOG_LOCK:
+        rows = list(_SESSION_LOG.values())
+    if not rows:
+        return 0
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=_log_fields(),
+                            extrasaction="ignore")
+    writer.writeheader()
+    writer.writerows(rows)
+    object_store.put(log_object_name(when),
+                     buffer.getvalue().encode("utf-8"))
+    return len(rows)
+
+
 def loop(builder, symbols: list, history: dict, tokens: dict, daily: dict,
          stop: threading.Event, every: int = DEFAULT_EVERY,
          seed: "dict | None" = None) -> None:
@@ -440,3 +554,16 @@ def loop(builder, symbols: list, history: dict, tokens: dict, daily: dict,
         except Exception as exc:
             logger.warning("scan failed (%.1fs): %s",
                            time.monotonic() - started, exc)
+            continue
+        # SEPARATE FROM THE SCAN, and after it. The published table is what
+        # the UI reads and must not be delayed or lost because the log
+        # failed; the log is a record, and a record is worth less than the
+        # thing it records. Its own handler for the same reason.
+        try:
+            held = remember(table)
+            written = publish_log()
+            if written:
+                logger.info("scan log: %d distinct setups held, %d written",
+                            held, written)
+        except Exception as exc:
+            logger.warning("could not record the scan log: %s", exc)
