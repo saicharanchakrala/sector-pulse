@@ -27,7 +27,8 @@ is what let it hide.
 """
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pytest
@@ -46,20 +47,60 @@ def _frame(through, sessions=5):
 
 # --- the settled end -----------------------------------------------------
 
-def test_the_end_is_yesterday_on_a_weekday() -> None:
-    # 2026-09-17 is a Thursday, so yesterday is Wednesday the 16th.
-    assert fetch_tail.settled_end(date(2026, 9, 17)) == date(2026, 9, 16)
+def _at(year, month, day, hour, minute=0):
+    return datetime(year, month, day, hour, minute,
+                    tzinfo=ZoneInfo("Asia/Kolkata"))
 
 
-@pytest.mark.parametrize("today,expected", [
-    (date(2026, 9, 20), date(2026, 9, 18)),   # Sunday  -> Friday
-    (date(2026, 9, 21), date(2026, 9, 18)),   # Monday  -> Friday
-    (date(2026, 9, 19), date(2026, 9, 18)),   # Saturday-> Friday
+def test_todays_bar_counts_once_the_session_has_closed() -> None:
+    """THE REGRESSION TEST. This job runs AFTER the close.
+
+    Taking yesterday unconditionally meant that on Monday 2026-09-21 at
+    16:02 - half an hour past the 15:30 close - the end was Friday the
+    18th. Every symbol already reached it, so nothing was fetched and
+    prev_close stayed one session behind, for ever, every night.
+    """
+    assert fetch_tail.settled_end(_at(2026, 9, 21, 16, 2)) == \
+        date(2026, 9, 21)
+
+
+def test_during_the_session_todays_bar_does_not_count_yet() -> None:
+    """It is still being formed, and a partial daily bar as prev_close is
+    the leak setups.measure exists to prevent."""
+    assert fetch_tail.settled_end(_at(2026, 9, 21, 11, 0)) == \
+        date(2026, 9, 18)
+
+
+def test_right_on_the_close_counts() -> None:
+    assert fetch_tail.settled_end(_at(2026, 9, 21, 15, 30)) == \
+        date(2026, 9, 21)
+
+
+def test_a_minute_before_the_close_does_not() -> None:
+    assert fetch_tail.settled_end(_at(2026, 9, 21, 15, 29)) == \
+        date(2026, 9, 18)
+
+
+def test_a_weekday_evening_is_that_day() -> None:
+    # Thursday 2026-09-17, after the close.
+    assert fetch_tail.settled_end(_at(2026, 9, 17, 20, 0)) == \
+        date(2026, 9, 17)
+
+
+@pytest.mark.parametrize("when,expected", [
+    (_at(2026, 9, 19, 20, 0), date(2026, 9, 18)),   # Saturday -> Friday
+    (_at(2026, 9, 20, 20, 0), date(2026, 9, 18)),   # Sunday   -> Friday
+    (_at(2026, 9, 20, 9, 0), date(2026, 9, 18)),    # Sunday morning too
 ])
-def test_the_end_walks_back_off_a_weekend(today, expected) -> None:
-    """Otherwise every Sunday and Monday refetches the whole universe for
-    a session that never existed."""
-    assert fetch_tail.settled_end(today) == expected
+def test_a_weekend_walks_back_to_friday(when, expected) -> None:
+    """Otherwise every weekend run refetches the universe for a session
+    that never existed."""
+    assert fetch_tail.settled_end(when) == expected
+
+
+def test_monday_morning_before_the_open_is_friday() -> None:
+    assert fetch_tail.settled_end(_at(2026, 9, 21, 7, 0)) == \
+        date(2026, 9, 18)
 
 
 # --- which symbols are behind --------------------------------------------

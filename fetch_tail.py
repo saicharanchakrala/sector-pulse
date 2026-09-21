@@ -26,7 +26,9 @@ from __future__ import annotations
 
 import sys
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from datetime import time as dt_time
+from zoneinfo import ZoneInfo
 
 import bar_store
 import config
@@ -55,14 +57,29 @@ def missing_symbols() -> list:
     return sorted(listed - have)
 
 
-def settled_end(today: "date | None" = None) -> date:
+def settled_end(now: "datetime | None" = None) -> date:
     """The last date a completed daily bar can exist for.
 
-    Yesterday, walked back off a weekend. Saturdays and Sundays are
-    certain; holidays are not, and a symbol whose newest bar is a holiday
-    behind simply gets one redundant request rather than a wrong answer.
+    INCLUDES TODAY ONCE THE SESSION HAS CLOSED, and that is the whole
+    point. An earlier version took yesterday unconditionally, which is
+    right for a run during market hours and wrong for this job - which
+    exists to run AFTER the close. On Monday 2026-09-21 at 16:02, half an
+    hour after the 15:30 close, it returned Friday the 18th: every symbol
+    already reached that date, so the extension fetched nothing and
+    daily_context republished Friday's close as the previous close. The
+    store would have sat exactly one session behind for ever, every night,
+    while the coverage report said it was level.
+
+    Then walked back off a weekend. Saturdays and Sundays are certain;
+    holidays are not, and a symbol whose newest bar is a holiday behind
+    gets one redundant request rather than a wrong answer.
     """
-    end = (today or date.today()) - timedelta(days=1)
+    now = now or datetime.now(ZoneInfo("Asia/Kolkata"))
+    close = dt_time(*config.SCAN_SESSION_CLOSE)
+    end = now.date()
+    if end.weekday() >= 5 or now.time() < close:
+        # Nothing settled today: the weekend, or the session is still on.
+        end -= timedelta(days=1)
     while end.weekday() >= 5:
         end -= timedelta(days=1)
     return end
