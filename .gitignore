@@ -42,6 +42,12 @@ tick_store/
 # Rotated scan logs, kept when the column set changes
 scan_log.csv.superseded*
 
+# Per-session logs pulled down from the container. fetch_scan_log writes
+# one of these every night, beside SCAN_LOG_CSV, and only the undated
+# scan_log.csv above was ignored - so every nightly run left a file of
+# personal trading data untracked and stageable. Same data, same reason.
+scan_log_*.csv
+
 # Forecasting datasets: derived from bar_cache, large, regenerable.
 forecast_cache/
 
