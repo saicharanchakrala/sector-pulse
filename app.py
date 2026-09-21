@@ -1303,11 +1303,40 @@ def render_published_scan() -> bool:
     # the part of this scanner the measurements support.
     show = table.sort_values(["actionable", "score"], ascending=[False, False])
     columns = [c for c in ("symbol", "direction", "actionable", "score",
+                           # WHEN, next to WHAT. Every scan rebuilds the
+                           # table, so run_time is when the pass ran - a
+                           # row held since 09:45 was indistinguishable
+                           # from one that printed four seconds ago.
+                           "first_seen_at", "cleared_at", "exit_by",
                            "entry", "stop", "target", "quantity",
                            "required_win_rate", "breakeven_pct", "rvol",
                            "relative_strength", "turnover_20d")
                if c in show.columns]
     show_table(show[columns], key="published_scan")
+    if "first_seen_at" in show.columns:
+        st.caption(
+            "**first_seen_at** is when the symbol first showed this "
+            "direction today and **cleared_at** when it first passed every "
+            "gate - both first-wins, so a setup that cleared at 10:42 and "
+            "failed later still reads 10:42, because that is when it would "
+            "have been acted on.\n\n"
+            f"**exit_by** is the planned exit - a setup leaves on its "
+            f"target, its stop, or this time, whichever comes first, and "
+            f"this is the only one of the three knowable in advance. It is "
+            f"`config.SCAN_EXIT_BY`, currently "
+            f"{config.SCAN_EXIT_BY[0]:02d}:{config.SCAN_EXIT_BY[1]:02d}. "
+            f"If your broker squares off intraday positions earlier than "
+            f"that, set it - the target is sized on the bars remaining "
+            f"until this time, so counting bars you will not get to trade "
+            f"puts every target further away than it should be.\n\n"
+            f"There is deliberately no *expected* time for the target. It "
+            f"is placed at the plausible remaining move - volatility per "
+            f"bar times the square root of the bars left - so inverting it "
+            f"returns the bars left. Measured 2026-09-21: 49.0 bars left "
+            f"against 48.8 implied. Any ETA computed from the model would "
+            f"restate exit_by. A real one has to come from resolved "
+            f"outcomes, and none has reached a target yet."
+        )
 
     with st.expander("Why each one passed or was blocked"):
         reasons = show[["symbol", "direction", "reasons"]] \

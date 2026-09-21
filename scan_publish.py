@@ -420,6 +420,74 @@ _LOG_LOCK = threading.Lock()
 _SESSION_LOG: dict = {}
 _SESSION_LOG_DAY = None
 
+_SEEN_LOCK = threading.Lock()
+_FIRST_DIRECTION: dict = {}
+_FIRST_CLEARED: dict = {}
+_SEEN_DAY = None
+
+
+def stamp_first_seen(table, when: "datetime | None" = None):
+    """Add when each setup first appeared, and when it first cleared.
+
+    WHY THE TABLE CANNOT ANSWER THIS ALONE. Every scan rebuilds the whole
+    table from scratch, so `run_time` is when THIS pass ran - not when the
+    setup arrived. A row that has been on screen since 09:45 looked
+    identical to one that appeared four seconds ago, which is the
+    difference between a setup that has held for an hour and one that has
+    just printed.
+
+    Two stamps, because they answer different questions:
+      first_seen_at - when the symbol first showed this direction
+      cleared_at    - when it first passed every gate, or blank if never
+
+    First wins for both, and `cleared_at` is never overwritten by a later
+    block: the moment it qualified is the moment it would have been acted
+    on, and a setup that clears at 10:42 and fails at 11:30 was still
+    suggested at 10:42.
+    """
+    global _SEEN_DAY
+
+    import pandas as pd
+
+    if table is None or getattr(table, "empty", True):
+        return table
+    now = when or datetime.now(IST)
+    stamp = now.strftime("%H:%M:%S")
+    with _SEEN_LOCK:
+        if _SEEN_DAY != now.date():
+            _FIRST_DIRECTION.clear()
+            _FIRST_CLEARED.clear()
+            _SEEN_DAY = now.date()
+        first_seen, cleared = [], []
+        for row in table.to_dict("records"):
+            key = (row.get("symbol"), row.get("direction"))
+            if _missing(row.get("entry")):
+                # No levels, so nothing was ever suggested for this row.
+                first_seen.append(None)
+                cleared.append(None)
+                continue
+            first_seen.append(_FIRST_DIRECTION.setdefault(key, stamp))
+            if row.get("actionable"):
+                cleared.append(_FIRST_CLEARED.setdefault(key, stamp))
+            else:
+                cleared.append(_FIRST_CLEARED.get(key))
+        out = table.copy()
+        out["first_seen_at"] = pd.Series(first_seen, index=out.index,
+                                         dtype="object")
+        out["cleared_at"] = pd.Series(cleared, index=out.index,
+                                      dtype="object")
+        # THE PLANNED EXIT, as a clock time rather than a countdown.
+        # minutes_left answers "how long until the market shuts", which is
+        # not the same question as "when am I out of this" - and read as
+        # the latter it is the wrong number. There is no exit rule before
+        # SCAN_EXIT_BY: a setup leaves on its target, its stop, or this
+        # time, whichever comes first, so this is the only one of the
+        # three that can be known in advance.
+        hour, minute = getattr(config, "SCAN_EXIT_BY",
+                               config.SCAN_SESSION_CLOSE)
+        out["exit_by"] = f"{hour:02d}:{minute:02d}"
+        return out
+
 
 def log_object_name(when: "datetime | None" = None) -> str:
     """The session's scan log in the object store, named by day."""
@@ -562,8 +630,13 @@ def loop(builder, symbols: list, history: dict, tokens: dict, daily: dict,
         try:
             frame = builder.snapshot()
             today = live_bars.frames_from(frame, tokens)
+            now = datetime.now(IST)
             table, assembled = run_once(symbols, history, today, daily,
-                                        seed=seed)
+                                        seed=seed, now=now)
+            # BEFORE the publish, so the table the UI reads carries the
+            # stamps. It is also what remember() logs, so the scan log and
+            # the published table agree on when a setup arrived.
+            table = stamp_first_seen(table, now)
             rows = publish(table)
             logger.info("scan: %d setups from %d symbols in %.1fs",
                         rows, assembled, time.monotonic() - started)

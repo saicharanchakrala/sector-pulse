@@ -334,6 +334,23 @@ SCAN_LIVE_MIN_COVERAGE = 0.5
 
 SCAN_SESSION_OPEN = (9, 15)       # NSE equity session, IST
 SCAN_SESSION_CLOSE = (15, 30)
+# WHEN AN INTRADAY POSITION IS ACTUALLY OUT, as opposed to when the market
+# shuts. Defaults to the close, which is what the scanner has always
+# assumed - it sizes the target at atr * sqrt(bars_left) and counts those
+# bars to SCAN_SESSION_CLOSE.
+#
+# That assumption is worth checking against your own broker and product.
+# An Indian intraday (MIS-style) position is auto-squared-off by the
+# broker BEFORE the close, so if that applies here the scanner is
+# counting bars it will not get to trade - which makes expected_range,
+# and therefore every target, further away than it should be. Setting
+# this earlier both reports the real exit and tightens the sizing,
+# because minutes_left and bars_left are measured to it.
+#
+# Left at the close by default rather than guessed: changing it changes
+# which setups clear and where their targets sit, and that is a trading
+# decision rather than a configuration detail.
+SCAN_EXIT_BY = SCAN_SESSION_CLOSE
 
 # Zerodha intraday (MIS) equity charges. Rates change: verify against
 # zerodha.com/charges before trusting the breakeven figures downstream.
