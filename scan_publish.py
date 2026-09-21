@@ -555,6 +555,52 @@ def log_row(published: dict) -> dict:
     return {name: row.get(name, "") for name in _log_fields()}
 
 
+def adopt_published_log(when: "datetime | None" = None) -> dict:
+    """Read back the session's published log, keyed as _SESSION_LOG is.
+
+    WHY. publish_log writes the whole in-memory set, and that memory dies
+    with the process - so a restart mid-session republished only what the
+    NEW task had seen, over the top of everything recorded before it.
+    Observed 2026-09-21: a deploy at 13:21 replaced 3,450 setups spanning
+    09:20 to 13:19 with 1,352 stamped 13:26, including every one that had
+    cleared. The morning was not recoverable.
+
+    Adopting first makes a restart additive instead of destructive. Rows
+    already published win on first-seen by construction - they were
+    recorded earlier - and the actionable-beats-blocked rule in remember()
+    still applies on top of them.
+
+    Never raises. A log that cannot be read back is a reason to start a
+    fresh one, not a reason for the feed to fail.
+    """
+    rows: dict = {}
+    try:
+        payload = object_store.get(log_object_name(when))
+    except Exception as exc:
+        logger.warning("Could not read back the published scan log, so "
+                       "this session starts from empty: %s", exc)
+        return rows
+    if not payload:
+        return rows
+    try:
+        for row in csv.DictReader(io.StringIO(payload.decode("utf-8"))):
+            key = (row.get("symbol"), row.get("direction"))
+            if not key[0]:
+                continue
+            # The file stores booleans as text; remember() compares them.
+            row["taken"] = str(row.get("taken", "")).lower() == "true"
+            rows[key] = row
+    except Exception as exc:
+        logger.warning("Published scan log is unreadable, starting fresh: "
+                       "%s", exc)
+        return {}
+    if rows:
+        logger.info("Adopted %d setups already published today, so this "
+                    "restart adds to the session rather than replacing it",
+                    len(rows))
+    return rows
+
+
 def remember(table, when: "datetime | None" = None) -> int:
     """Accumulate this scan into the session's log. Returns rows held.
 
@@ -578,6 +624,12 @@ def remember(table, when: "datetime | None" = None) -> int:
     with _LOG_LOCK:
         if _SESSION_LOG_DAY != now.date():
             _SESSION_LOG.clear()
+            # ADOPT WHAT IS ALREADY PUBLISHED before adding to it. This
+            # fires on a genuine new day, where the object does not exist
+            # and it costs one missing read - and on a RESTART mid-session,
+            # where without it the next publish overwrites the whole
+            # morning with whatever this process has seen so far.
+            _SESSION_LOG.update(adopt_published_log(now))
             _SESSION_LOG_DAY = now.date()
         for published in table.to_dict("records"):
             # NaN, not just None - see _missing. A NO SETUP row reaches

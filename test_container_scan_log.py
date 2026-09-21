@@ -64,10 +64,17 @@ def _fresh(monkeypatch):
 
 @pytest.fixture
 def _bucket(monkeypatch):
+    """An in-memory object store.
+
+    `get` is stubbed as well as `put` because the log is now read BACK on
+    a restart - without it the adoption silently found nothing and the
+    restart tests passed for the wrong reason.
+    """
     held: dict = {}
     monkeypatch.setattr(object_store, "enabled", lambda: True)
     monkeypatch.setattr(object_store, "put",
                         lambda name, payload: held.__setitem__(name, payload))
+    monkeypatch.setattr(object_store, "get", lambda name: held.get(name))
     return held
 
 
@@ -304,6 +311,83 @@ def test_the_whole_session_is_rewritten_each_time(_bucket) -> None:
     payload = _bucket["scan_log_20260921.csv"].decode("utf-8")
     rows = list(csv.DictReader(io.StringIO(payload)))
     assert sorted(r["symbol"] for r in rows) == ["AAA", "BBB"]
+
+
+# --- surviving a restart -------------------------------------------------
+
+def test_a_restart_adds_to_the_session_rather_than_replacing_it(
+        _bucket, monkeypatch) -> None:
+    """THE REGRESSION TEST.
+
+    publish_log writes the whole in-memory set and that memory dies with
+    the process. Observed 2026-09-21: a deploy at 13:21 republished 1,352
+    setups stamped 13:26 over 3,450 spanning 09:20 to 13:19, including
+    every one that had cleared. Four hours of record, unrecoverable.
+    """
+    # The morning: two setups, one of which cleared.
+    scan_publish.remember(_table(
+        _published(symbol="EARLY", actionable=True),
+        _published(symbol="ALSOEARLY"),
+    ), when=NOW)
+    scan_publish.publish_log(NOW)
+    assert len(_bucket["scan_log_20260921.csv"].decode().splitlines()) == 3
+
+    # The restart: memory gone, a different symbol on screen.
+    monkeypatch.setattr(scan_publish, "_SESSION_LOG", {})
+    monkeypatch.setattr(scan_publish, "_SESSION_LOG_DAY", None)
+    scan_publish.remember(_table(_published(symbol="AFTER")),
+                          when=NOW + timedelta(hours=4))
+    scan_publish.publish_log(NOW)
+
+    rows = list(csv.DictReader(io.StringIO(
+        _bucket["scan_log_20260921.csv"].decode("utf-8"))))
+    assert sorted(r["symbol"] for r in rows) == ["AFTER", "ALSOEARLY", "EARLY"]
+
+
+def test_an_adopted_clearing_is_not_lost_to_a_later_block(
+        _bucket, monkeypatch) -> None:
+    """A setup that cleared this morning must stay cleared after a restart
+    even if it is blocked when the new process first sees it."""
+    scan_publish.remember(_table(_published(symbol="AAA", actionable=True)),
+                          when=NOW)
+    scan_publish.publish_log(NOW)
+
+    monkeypatch.setattr(scan_publish, "_SESSION_LOG", {})
+    monkeypatch.setattr(scan_publish, "_SESSION_LOG_DAY", None)
+    scan_publish.remember(_table(_published(symbol="AAA", actionable=False)),
+                          when=NOW + timedelta(hours=4))
+
+    row = list(scan_publish._SESSION_LOG.values())[0]
+    assert row["taken"] is True, "a restart downgraded a cleared setup"
+
+
+def test_adopting_reads_booleans_back_as_booleans(_bucket,
+                                                  monkeypatch) -> None:
+    """CSV stores True as text, and remember() compares them as bools."""
+    scan_publish.remember(_table(_published(symbol="AAA", actionable=True)),
+                          when=NOW)
+    scan_publish.publish_log(NOW)
+    adopted = scan_publish.adopt_published_log(NOW)
+    assert adopted[("AAA", "LONG")]["taken"] is True
+
+
+def test_nothing_published_yet_adopts_nothing(_bucket) -> None:
+    """A genuine new day, where the object does not exist."""
+    assert scan_publish.adopt_published_log(NOW) == {}
+
+
+def test_an_unreadable_log_starts_fresh_rather_than_failing(
+        monkeypatch) -> None:
+    """A log that cannot be read back is a reason to start a new one, not
+    a reason for the feed to fall over."""
+    monkeypatch.setattr(object_store, "get", lambda name: b"\x00 not a csv")
+    assert scan_publish.adopt_published_log(NOW) == {}
+
+    def boom(name):
+        raise object_store.StorageError("denied")
+
+    monkeypatch.setattr(object_store, "get", boom)
+    assert scan_publish.adopt_published_log(NOW) == {}
 
 
 # --- outcomes picks the fetched files up ---------------------------------
