@@ -59,11 +59,27 @@ REM                 so without this it streams the ~216 F&O underlyings
 REM                 instead of ~2,500. Runs after fetch_tail because the
 REM                 ranking is only as current as the store it reads, and
 REM                 is a no-op when SECTOR_PULSE_S3_BUCKET is unset.
+REM
+REM EVERY STEP IS CHECKED. It used to run all nine unconditionally and
+REM report nothing, which failed twice in three days in exactly the way
+REM that is hardest to notice:
+REM   2026-09-16..19  fetch_tail only ever backfilled symbols the store had
+REM                   never seen, so the store fell four days behind and
+REM                   prev_close became a different date per symbol while
+REM                   the log said "daily store now holds 2,521 symbols".
+REM   2026-09-20      fetch_tail died on an expired Kite token and the job
+REM                   carried on through eight more steps, finishing with
+REM                   no indication that the one step that mattered had
+REM                   aborted.
+REM Steps still all RUN rather than stopping at the first failure - the
+REM 3-minute fold is worth having even when the token is dead - but a
+REM failure is banner-marked in the log, listed in a summary at the end,
+REM and returned as the exit code.
 cd /d "C:\Users\Sai Charan Chakrala\PycharmProjects\sector-pulse"
 
 REM THE OBJECT STORE VARIABLES, read from the same file deploy\env.ps1
 REM reads. Without them publish_turnover.py and daily_context.py refuse
-REM outright and this job silently accomplishes five of its seven steps -
+REM outright and this job silently accomplishes most of its nine steps -
 REM leaving the feed to stream ~216 names instead of ~2,500 and the scan
 REM with no previous close, pivot range or turnover. cmd cannot
 REM dot-source a PowerShell script, so both parse one plain KEY=VALUE
@@ -75,12 +91,69 @@ if not exist "deploy\env.vars" (
         if not "%%a"=="" set "%%a=%%b"
     )
 )
-"C:\Users\Sai Charan Chakrala\PycharmProjects\sector-pulse\.venv\Scripts\python.exe" fetch_tail.py           >> run\nightly.log 2>&1
-"C:\Users\Sai Charan Chakrala\PycharmProjects\sector-pulse\.venv\Scripts\python.exe" fetch_announcements.py 2 >> run\nightly.log 2>&1
-"C:\Users\Sai Charan Chakrala\PycharmProjects\sector-pulse\.venv\Scripts\python.exe" publish_turnover.py     >> run\nightly.log 2>&1
-"C:\Users\Sai Charan Chakrala\PycharmProjects\sector-pulse\.venv\Scripts\python.exe" prune_cache.py --apply   >> run\nightly.log 2>&1
-"C:\Users\Sai Charan Chakrala\PycharmProjects\sector-pulse\.venv\Scripts\python.exe" -m bar_store --intervals 3minute --publish 3minute >> run\nightly.log 2>&1
-"C:\Users\Sai Charan Chakrala\PycharmProjects\sector-pulse\.venv\Scripts\python.exe" fetch_scan_log.py        >> run\nightly.log 2>&1
-"C:\Users\Sai Charan Chakrala\PycharmProjects\sector-pulse\.venv\Scripts\python.exe" outcomes.py             >> run\nightly.log 2>&1
-"C:\Users\Sai Charan Chakrala\PycharmProjects\sector-pulse\.venv\Scripts\python.exe" -c "import premarket; print('watchlist:', premarket.publish(), 'names')" >> run\nightly.log 2>&1
-"C:\Users\Sai Charan Chakrala\PycharmProjects\sector-pulse\.venv\Scripts\python.exe" daily_context.py     >> run\nightly.log 2>&1
+set "PY=C:\Users\Sai Charan Chakrala\PycharmProjects\sector-pulse\.venv\Scripts\python.exe"
+set "LOG=run\nightly.log"
+set /a FAILS=0
+set "BROKEN="
+
+REM A DATED BANNER PER RUN. Runs were concatenated with nothing between
+REM them, so the tail of a finished run and the tail of a running one look
+REM identical - which is how a stale run's final line was read as the
+REM current one's on 2026-09-20.
+>>%LOG% echo.
+>>%LOG% echo ================================================================
+>>%LOG% echo NIGHTLY RUN STARTED %DATE% %TIME%
+>>%LOG% echo ================================================================
+
+"%PY%" fetch_tail.py >> %LOG% 2>&1
+call :check fetch_tail
+"%PY%" fetch_announcements.py 2 >> %LOG% 2>&1
+call :check fetch_announcements
+"%PY%" publish_turnover.py >> %LOG% 2>&1
+call :check publish_turnover
+"%PY%" prune_cache.py --apply >> %LOG% 2>&1
+call :check prune_cache
+"%PY%" -m bar_store --intervals 3minute --publish 3minute >> %LOG% 2>&1
+call :check bar_store_3minute
+"%PY%" fetch_scan_log.py >> %LOG% 2>&1
+call :check fetch_scan_log
+"%PY%" outcomes.py >> %LOG% 2>&1
+call :check outcomes
+"%PY%" -c "import premarket; print('watchlist:', premarket.publish(), 'names')" >> %LOG% 2>&1
+call :check premarket
+"%PY%" daily_context.py >> %LOG% 2>&1
+call :check daily_context
+
+>>%LOG% echo.
+if %FAILS%==0 goto :allgood
+>>%LOG% echo ================================================================
+>>%LOG% echo NIGHTLY FINISHED WITH %FAILS% FAILED STEP^(S^):%BROKEN%
+>>%LOG% echo Anything downstream of a failed step worked from whatever was
+>>%LOG% echo already on disk, so its output is not wrong so much as UNCHANGED.
+>>%LOG% echo Fix the cause and re-run the whole job - every step is idempotent.
+>>%LOG% echo ================================================================
+echo.
+echo NIGHTLY FINISHED WITH %FAILS% FAILED STEP^(S^):%BROKEN%
+echo See run\nightly.log for the banner-marked failures.
+exit /b %FAILS%
+
+:allgood
+>>%LOG% echo NIGHTLY COMPLETE - all 9 steps succeeded %DATE% %TIME%
+echo.
+echo Nightly complete - all 9 steps succeeded.
+exit /b 0
+
+REM ---------------------------------------------------------------------
+REM Records a step's exit code. ERRORLEVEL IS CAPTURED FIRST, because
+REM `set /a` below resets it and the code would be lost before it was read.
+:check
+set "CODE=%ERRORLEVEL%"
+if "%CODE%"=="0" goto :eof
+set /a FAILS+=1
+set "BROKEN=%BROKEN% %1"
+>>%LOG% echo.
+>>%LOG% echo ***************************************************************
+>>%LOG% echo ***** STEP FAILED: %1 - exit code %CODE%
+>>%LOG% echo ***************************************************************
+>>%LOG% echo.
+goto :eof
