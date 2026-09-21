@@ -76,3 +76,6 @@ premarket.parquet
 # The daily slice the containerised scan reads. Derived nightly from
 # the daily store, which is itself gitignored.
 daily_context.parquet
+
+# Cygwin/MSYS crash dumps, written into the repo root by the Bash tool
+*.stackdump
