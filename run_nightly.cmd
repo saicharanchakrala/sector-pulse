@@ -20,6 +20,17 @@ REM                 2001 and is rebuilt the same way, so pruning those
 REM                 would delete twenty-five years of daily bars.
 REM                 Measured 2026-09-17: 6,133 of 19,515 intraday files
 REM                 were spans another file already contained, 102 MB.
+REM   refresh_intraday - fetches fresh intraday bars so the 3-minute store
+REM                 can advance. Nothing on this machine was doing it:
+REM                 the cache was filled as a SIDE EFFECT of the UI's own
+REM                 scans until SCAN_UI_MAY_DOWNLOAD went False on
+REM                 2026-09-18, and the only other caller of prewarm runs
+REM                 in a container whose disk is discarded. Measured
+REM                 2026-09-21, the store's newest session was 2026-09-17
+REM                 - it did not even hold Friday - so prewarm refused it
+REM                 and the feed refetched from Kite on every cold start.
+REM                 Same failure the daily store had, in the other store.
+REM                 Runs BEFORE the fold, which consolidates what it gets.
 REM   bar_store --intervals 3minute - folds the per-symbol intraday cache
 REM                 into one consolidated file. NOT optional for speed:
 REM                 a full-universe scan reads prior sessions for ~2,300
@@ -113,6 +124,8 @@ call :check fetch_announcements
 call :check publish_turnover
 "%PY%" prune_cache.py --apply >> %LOG% 2>&1
 call :check prune_cache
+"%PY%" refresh_intraday.py >> %LOG% 2>&1
+call :check refresh_intraday
 "%PY%" -m bar_store --intervals 3minute --publish 3minute >> %LOG% 2>&1
 call :check bar_store_3minute
 "%PY%" fetch_scan_log.py >> %LOG% 2>&1
@@ -138,9 +151,9 @@ echo See run\nightly.log for the banner-marked failures.
 exit /b %FAILS%
 
 :allgood
->>%LOG% echo NIGHTLY COMPLETE - all 9 steps succeeded %DATE% %TIME%
+>>%LOG% echo NIGHTLY COMPLETE - all 10 steps succeeded %DATE% %TIME%
 echo.
-echo Nightly complete - all 9 steps succeeded.
+echo Nightly complete - all 10 steps succeeded.
 exit /b 0
 
 REM ---------------------------------------------------------------------

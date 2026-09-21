@@ -553,6 +553,35 @@ def prewarm(symbols: list, days: "int | None" = None,
 STORE_MAX_STALE_DAYS = 1
 
 
+def sessions_behind(newest, end) -> int:
+    """Weekdays strictly after `newest`, up to and including `end`.
+
+    COUNTED IN WEEKDAYS, NOT CALENDAR DAYS, because the store is compared
+    against a window that ends today and the market does not trade at the
+    weekend. A store folded on Friday evening holds Friday's session and
+    is perfectly current on Monday - but calendar arithmetic made that
+    three days behind, past the one session of slack, so the store was
+    refused and the feed refetched 17 days for ~2,500 symbols from Kite.
+    Measured 2026-09-21, a Monday: the 3-minute store was declined for
+    being "3 days behind" while holding everything it should.
+
+    Holidays are not modelled. A store missing a holiday-shortened week
+    reads as one session further behind than it is, which costs a refetch
+    rather than a wrong answer - the safe direction.
+    """
+    from datetime import timedelta
+
+    if newest is None or end is None or newest >= end:
+        return 0
+    count = 0
+    day = newest + timedelta(days=1)
+    while day <= end:
+        if day.weekday() < 5:
+            count += 1
+        day += timedelta(days=1)
+    return count
+
+
 def from_store(symbols: list, start, end, interval: str) -> dict:
     """Prior sessions from the consolidated store, for symbols it covers.
 
@@ -589,10 +618,10 @@ def from_store(symbols: list, start, end, interval: str) -> dict:
     if newest is None:
         return {}
 
-    behind = (end - newest.date()).days
+    behind = sessions_behind(newest.date(), end)
     if behind > STORE_MAX_STALE_DAYS:
-        logger.info("Consolidated %s store reaches %s, %d days behind the "
-                    "window ending %s - fetching per symbol instead",
+        logger.info("Consolidated %s store reaches %s, %d session(s) behind "
+                    "the window ending %s - fetching per symbol instead",
                     interval, newest.date(), behind, end)
         return {}
 
