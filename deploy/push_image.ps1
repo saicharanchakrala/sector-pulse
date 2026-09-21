@@ -46,5 +46,19 @@ docker push "${Image}:latest"
 
 Write-Host ""
 Write-Host "Pushed ${Image}:$Tag and :latest" -ForegroundColor Green
-Write-Host "The service picks it up on its next start, or force one now with:"
+Write-Host ""
+# THIS USED TO SAY "the service picks it up on its next start", WHICH IS
+# WRONG and cost a morning. ECS resolves :latest to a digest when a
+# DEPLOYMENT is created, not when a task starts, so scaling 0 -> 1 runs
+# whatever digest that deployment resolved - however many images have been
+# pushed since. Observed 2026-09-21: this image was pushed at 07:48 and a
+# scale-up at 07:55 started the one from three days earlier, looking
+# entirely healthy while missing every feature the push was for.
+Write-Host "A SCALE-UP WILL NOT PICK THIS UP." -ForegroundColor Yellow
+Write-Host "ECS resolves :latest when a DEPLOYMENT is created, so starting" -ForegroundColor Yellow
+Write-Host "the service from zero reuses the digest of the last deployment." -ForegroundColor Yellow
+Write-Host "Force one - deploy\push_token.ps1 now does this for you, or:" -ForegroundColor Yellow
 Write-Host "  aws ecs update-service --cluster avsp-cluster --service $Name --force-new-deployment --profile $Profile_"
+Write-Host ""
+Write-Host "Then confirm the running task matches what you just pushed:" -ForegroundColor DarkGray
+Write-Host "  aws ecr describe-images --repository-name $Name --region $Region --image-ids imageTag=latest --query imageDetails[0].imageDigest --output text --profile $Profile_"

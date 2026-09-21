@@ -439,6 +439,20 @@ def _log_fields() -> list:
     return list(scan_intraday._CSV_FIELDS)
 
 
+def _missing(value) -> bool:
+    """Whether a published field carries no number.
+
+    NaN AS WELL AS None, because these rows come out of a DataFrame via
+    to_dict("records") and pandas represents a missing number as NaN. NaN
+    is TRUTHY and is not None, so `if quantity` and `entry is None` both
+    read it as present - which on 2026-09-21 made every scan log attempt
+    die with "cannot convert float NaN to integer", and would have logged
+    NO SETUP rows had it got past that. The unit tests passed because they
+    built rows as plain dicts holding None.
+    """
+    return value is None or value != value
+
+
 def log_row(published: dict) -> dict:
     """One published scan row, reshaped into a scan_log row.
 
@@ -453,7 +467,7 @@ def log_row(published: dict) -> dict:
     entry = published.get("entry")
     stop = published.get("stop")
     risk = None
-    if quantity and entry is not None and stop is not None:
+    if not (_missing(quantity) or _missing(entry) or _missing(stop)):
         risk = round(abs(float(entry) - float(stop)) * int(quantity), 2)
 
     blocked = ""
@@ -498,7 +512,9 @@ def remember(table, when: "datetime | None" = None) -> int:
             _SESSION_LOG.clear()
             _SESSION_LOG_DAY = now.date()
         for published in table.to_dict("records"):
-            if published.get("entry") is None:
+            # NaN, not just None - see _missing. A NO SETUP row reaches
+            # here with entry NaN, which `is None` reads as present.
+            if _missing(published.get("entry")):
                 continue          # no levels, so nothing to resolve against
             key = (published.get("symbol"), published.get("direction"))
             row = log_row(published)

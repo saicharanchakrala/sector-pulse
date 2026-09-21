@@ -21,6 +21,10 @@ $ErrorActionPreference = "Stop"
 $Profile_ = "innomesh-dev"
 $Cluster  = "avsp-cluster"
 $Name     = "zone-pulse"
+# Needed for the ECR lookup at the end. The ecs calls resolve it from the
+# profile; describe-images does not, and passing an empty --region fails
+# with a message about credentials rather than about the region.
+$Region   = "ap-southeast-2"
 $Session  = Join-Path (Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)) ".kite_session.json"
 
 if (-not (Test-Path $Session)) {
@@ -85,23 +89,63 @@ if (-not [string]::IsNullOrWhiteSpace($key)) {
 }
 
 Write-Host "[2] Starting the feed" -ForegroundColor Cyan
-# Secrets are read once, when the container starts, so an already-running
-# task would go on using yesterday's token. Scaling to 1 from 0 is what
-# makes it pick this one up; if it is already running, force a new
-# deployment instead.
-$running = aws ecs describe-services --cluster $Cluster --services $Name `
+# ALWAYS A FORCED DEPLOYMENT, even from zero, and that is the whole point
+# of this block rather than a plain scale-up.
+#
+# Two things have to happen here: the container must re-read the secret,
+# and it must run the CURRENT image. Scaling 0 -> 1 does the first and
+# NOT the second. ECS resolves the :latest tag to a digest when a
+# DEPLOYMENT is created, and a scale-up starts tasks from the existing
+# deployment - so it launches whatever digest was current when that
+# deployment was made, however many images have been pushed since.
+#
+# Observed 2026-09-21: an image pushed at 07:48 was ignored by a scale-up
+# at 07:55, which started Friday's code - no store hydrate, no scan
+# logging, none of that morning's work - and looked entirely healthy. It
+# took comparing the running task's digest against the one on :latest to
+# see it at all.
+#
+# --force-new-deployment re-resolves the tag, so the task that comes up is
+# built from the image actually in ECR. From zero it also raises the
+# desired count, so this single call covers both cases.
+$desired = aws ecs describe-services --cluster $Cluster --services $Name `
     --profile $Profile_ --query "services[0].desiredCount" --output text
-if ($running -eq "0") {
-    aws ecs update-service --cluster $Cluster --service $Name --desired-count 1 --profile $Profile_ | Out-Null
-    Write-Host "    scaled to 1" -ForegroundColor Green
+if ($LASTEXITCODE -ne 0) { throw "Could not read the service (exit $LASTEXITCODE)." }
+
+if ($desired -eq "0") {
+    aws ecs update-service --cluster $Cluster --service $Name `
+        --desired-count 1 --force-new-deployment --profile $Profile_ | Out-Null
 } else {
-    aws ecs update-service --cluster $Cluster --service $Name --force-new-deployment --profile $Profile_ | Out-Null
-    Write-Host "    already running, forced a restart so it reads the new token" -ForegroundColor Green
+    aws ecs update-service --cluster $Cluster --service $Name `
+        --force-new-deployment --profile $Profile_ | Out-Null
+}
+if ($LASTEXITCODE -ne 0) { throw "Could not update the service (exit $LASTEXITCODE)." }
+Write-Host "    forced a new deployment, so it reads the new token AND the current image" -ForegroundColor Green
+
+# WHICH IMAGE IT WILL ACTUALLY RUN, printed rather than assumed. The
+# failure above was invisible precisely because nothing ever said which
+# digest was running, and a wrong one behaves like a right one until you
+# look for a feature that is missing.
+$latest = aws ecr describe-images --repository-name $Name --region $Region `
+    --image-ids imageTag=latest --profile $Profile_ `
+    --query "imageDetails[0].imageDigest" --output text 2>$null
+if ($LASTEXITCODE -eq 0 -and $latest) {
+    Write-Host "    :latest is $latest" -ForegroundColor DarkGray
+    Write-Host "    confirm the running task matches it once it is up:" -ForegroundColor DarkGray
+    Write-Host "      aws ecs describe-tasks --cluster $Cluster --tasks (aws ecs list-tasks --cluster $Cluster --service-name $Name --query taskArns[0] --output text) --query tasks[0].containers[0].imageDigest --output text --profile $Profile_" -ForegroundColor DarkGray
 }
 
 Write-Host ""
-Write-Host "Give it 15-20 minutes before the open: it prewarms prior sessions" -ForegroundColor Yellow
-Write-Host "from Kite at 3 requests a second, and a container starts with none." -ForegroundColor Yellow
+# The old wording here said 15-20 minutes, which was true when a cold
+# start refetched 17 days for ~2,500 symbols from Kite - measured
+# 2026-09-18 at 836 seconds. The nightly job now publishes the folded
+# 3-minute store and the feed hydrates it: 93.2 MB in about a second on
+# 2026-09-21. What remains is whatever the store could not prove, so the
+# time depends on how complete last night's refresh was.
+Write-Host "Prewarm hydrates the published 3-minute store, then fetches only" -ForegroundColor Yellow
+Write-Host "what it does not cover - minutes, not the old 15-20. Watch for" -ForegroundColor Yellow
+Write-Host "'hydrated the 3minute store' followed by 'N/M symbols have prior bars'." -ForegroundColor Yellow
+Write-Host "If the hydrate line is missing, last night's job did not publish." -ForegroundColor Yellow
 Write-Host ""
 Write-Host "Watch it with:"
 Write-Host "  aws logs tail /ecs/$Name --follow --profile $Profile_"

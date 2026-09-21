@@ -182,6 +182,81 @@ def test_a_row_with_no_levels_is_not_logged() -> None:
     assert scan_publish._SESSION_LOG == {}
 
 
+# --- NaN, which is how a DataFrame says "missing" -----------------------
+
+def test_a_missing_number_from_a_dataframe_is_nan_not_none() -> None:
+    """The premise these next tests rest on, asserted so it is not lost.
+
+    NEEDS A MIXED COLUMN to reproduce, and that is why the original tests
+    missed the bug: a table whose entry column is entirely None stays
+    object dtype and None survives. Give it one real number - which every
+    real scan does, since some rows have levels - and the column becomes
+    float64, None becomes NaN, and NaN is TRUTHY and is not None. So
+    `if quantity` and `entry is None` both read it as present.
+    """
+    rows = _table(
+        _published(symbol="HASLEVELS", entry=100.0, quantity=10),
+        _published(symbol="NOSETUP", entry=None, quantity=None),
+    ).to_dict("records")
+    absent = rows[1]
+    assert absent["entry"] is not None
+    assert absent["entry"] != absent["entry"], "expected NaN"
+    assert bool(absent["entry"]) is True, "NaN is truthy - that is the trap"
+
+
+@pytest.mark.parametrize("value", [None, float("nan")])
+def test_missing_covers_both_spellings(value) -> None:
+    assert scan_publish._missing(value) is True
+
+
+@pytest.mark.parametrize("value", [0, 0.0, 1, 100.5, -3])
+def test_a_real_number_is_not_missing(value) -> None:
+    """Zero is a number. Treating it as absent would drop real rows."""
+    assert scan_publish._missing(value) is False
+
+
+def test_a_nan_quantity_does_not_raise() -> None:
+    """THE REGRESSION TEST.
+
+    Live on 2026-09-21: every scan logged "could not record the scan log:
+    cannot convert float NaN to integer", because int(NaN) raises and
+    `if quantity` let NaN through. Mixed column, so the NaN is real.
+    """
+    held = scan_publish.remember(_table(
+        _published(symbol="PRICED", entry=100.0, stop=98.0, quantity=10),
+        _published(symbol="NOQTY", entry=50.0, stop=49.0, quantity=None),
+    ), when=NOW)
+    assert held == 2
+    rows = {k[0]: v for k, v in scan_publish._SESSION_LOG.items()}
+    assert rows["PRICED"]["risk_rupees"] == pytest.approx(20.0)
+    assert rows["NOQTY"]["risk_rupees"] is None
+
+
+def test_a_no_setup_row_from_a_dataframe_is_still_skipped() -> None:
+    """The second half of the same bug: with entry NaN rather than None,
+    the skip never fired and NO SETUP rows would have been logged with
+    nothing for outcomes.py to resolve them against."""
+    scan_publish.remember(_table(
+        _published(symbol="HASLEVELS", entry=100.0, stop=98.0, quantity=10),
+        _published(symbol="NOSETUP", direction="NO SETUP", entry=None,
+                   stop=None, quantity=None),
+    ), when=NOW)
+    assert list(scan_publish._SESSION_LOG)[0][0] == "HASLEVELS"
+    assert len(scan_publish._SESSION_LOG) == 1
+
+
+def test_a_mixed_table_logs_only_the_rows_with_levels() -> None:
+    """The real shape: most rows are NO SETUP with everything NaN."""
+    scan_publish.remember(_table(
+        _published(symbol="GOOD", entry=100.0, stop=98.0, quantity=10),
+        _published(symbol="NOSETUP", direction="NO SETUP", entry=None,
+                   stop=None, quantity=None),
+        _published(symbol="ALSOGOOD", entry=50.0, stop=49.0, quantity=20),
+    ), when=NOW)
+    assert sorted(k[0] for k in scan_publish._SESSION_LOG) == \
+        ["ALSOGOOD", "GOOD"]
+
+
 def test_a_new_session_starts_a_new_log() -> None:
     scan_publish.remember(_table(_published()), when=NOW)
     scan_publish.remember(_table(_published(symbol="BBB")),
