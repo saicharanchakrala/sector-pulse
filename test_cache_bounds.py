@@ -12,9 +12,11 @@ holding intraday and daily frames for the whole scope, and cache_resource
 keeps the objects rather than sharing them. At 2,570 symbols one BarSet is
 roughly 5,140 DataFrames.
 
-load_horizon_picks has the same shape for the same reason - `bucket` is
-the clock floored to a minute, deliberately, so live-anchored prices
+load_horizon_picks HAD the same shape for the same reason - `bucket` is
+the clock floored to a window, deliberately, so live-anchored prices
 refresh - and cache_data PICKLES, so its entries are independent copies.
+It no longer does: its TTL was set equal to that window on 2026-09-23, so
+its key cannot turn over inside its own TTL. See the test at the bottom.
 
 Neither is a leak in the strict sense: the TTL does evict. But a key that
 turns over forty-five times inside one TTL window is unbounded in every
@@ -86,5 +88,26 @@ def test_the_key_really_does_churn_faster_than_the_ttl() -> None:
     assert config.CACHE_TTL_SECONDS >= 300, config.CACHE_TTL_SECONDS
 
 
-def test_the_horizon_bucket_still_turns_over_within_the_ttl() -> None:
-    assert app.HORIZON_ANCHOR_SECONDS < config.CACHE_TTL_SECONDS
+def test_the_horizon_bucket_cannot_outchurn_its_own_ttl() -> None:
+    """THIS FILE'S PREMISE NO LONGER APPLIES TO THIS CACHE.
+
+    It used to assert HORIZON_ANCHOR_SECONDS < CACHE_TTL_SECONDS: the
+    bucket was one minute against the shared fifteen-minute TTL, so the
+    key turned over fifteen times inside one window and max_entries was
+    genuinely load-bearing.
+
+    On 2026-09-23 load_horizon_picks was given its OWN ttl, equal to the
+    bucket, because the two disagreeing was a bug in the other direction -
+    a TTL shorter than the window expires the entry mid-window and any
+    full app run recomputes 7.4s of work the bucket said was current. With
+    them equal, a new key arrives exactly as the old one expires and at
+    most one entry is live per window.
+
+    The cap above stays. It costs nothing, it still guards the shape, and
+    it is the right default for a pickling cache - but it is no longer
+    what bounds this one, and a reader comparing against CACHE_TTL_SECONDS
+    would be looking at a constant this cache does not use.
+    """
+    assert app.HORIZON_ANCHOR_SECONDS == config.HORIZON_REFRESH_SECONDS
+    decorator = _decorator_args(app.load_horizon_picks)
+    assert "ttl=config.HORIZON_REFRESH_SECONDS" in decorator, decorator

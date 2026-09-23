@@ -288,13 +288,24 @@ def test_a_zero_threshold_reports_without_binding(monkeypatch) -> None:
     assert "[INFO]" in line
 
 
-def test_the_default_threshold_is_not_a_veto_on_most_output() -> None:
-    """Measured 2026-09-18: 1.0 cut 56% of cleared setups, 0.5 cut 20%.
+def test_the_default_threshold_stays_inside_what_was_measured() -> None:
+    """RAISED to 1.0 on 2026-09-22, which overturns this test's own premise.
 
-    Promoting an unvalidated rule to the larger veto is what
-    SCAN_REQUIRE_OI_CONFIRMATION's comment exists to warn against.
+    It previously asserted <= 0.75, on the 2026-09-18 measurement that 1.0
+    cut 56% of cleared setups against 0.5's 20%, and argued that taking
+    the larger veto was "promoting an unvalidated rule". That argument
+    rested on having nothing measured on the other side, and there now is
+    something: of 71 actionable setups on the 14:35 snapshot of
+    2026-09-22, 43 had already moved further in their own direction than
+    the additional move their target projected. A gate whose purpose is
+    refusing chased entries was not refusing them.
+
+    The upper bound stays at 1.0 deliberately. 1.0 means "at most half
+    done" and is the largest floor with any measurement behind it;
+    anything above is untested, and this assertion is what makes raising
+    it a conscious act rather than a typo.
     """
-    assert 0.0 < config.SCAN_MIN_ROOM_RATIO <= 0.75
+    assert 0.0 < config.SCAN_MIN_ROOM_RATIO <= 1.0
 
 
 def _broke_upward():

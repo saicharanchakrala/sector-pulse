@@ -220,22 +220,67 @@ SCAN_REWARD_RISK = 2.0
 # had moved 3.16% and asked for 3.10% more, and 46% needed the rest of
 # the session to travel further than the whole morning had.
 #
-# What 0.5 MEANS: refuse when less than HALF the already-spent move
-# plausibly remains. Not "less remains than has happened" - that is 1.0.
+# What 1.0 MEANS: refuse when less plausibly remains than has already
+# been spent - a setup may be at most half done. 0.5, the previous value,
+# meant only half the spent move need remain, which admits a name that has
+# already travelled two thirds of its plausible day range.
 #
-# Why not 1.0: it cut 34 of those 61 (56%), and the rule has no backtest
-# behind it. Promoting an unvalidated belief to that large a veto is what
-# SCAN_REQUIRE_OI_CONFIRMATION's comment exists to warn against. 0.5 cut
-# 12 of 61 (20%). Distribution: median ratio 0.92, 10th percentile 0.37.
+# RAISED FROM 0.5 ON 2026-09-22. The old argument was that 1.0 was "an
+# unvalidated belief" promoted "to that large a veto", which rested on
+# having nothing measured on the other side. From the live 14:35 snapshot
+# of 2026-09-22, 71 actionable setups:
+#
+#   43 of 71 had ALREADY moved further in their own direction than the
+#      additional move their target was projecting
+#   median already moved +0.85%, median target from here 0.78%
+#   median time since clearing 211 minutes; 51 of 71 cleared over 2h ago
+#   LCL cleared at 09:35 and was still on the table at 14:36
+#
+# WHAT IT COSTS, from a separate sweep over the 70 of those 71 that
+# carried a computable ratio: 27 survive at 1.0, so the floor CUTS 61%
+# and keeps 39%. An earlier draft of this comment wrote "(39%)" next to
+# the word cost, which reads as a 39% cut and understates it by half.
+#
+# THE TWO FIGURES ABOVE ARE SEPARATE MEASUREMENTS that happen to differ
+# by the same count (70 - 27 = 43), and the coincidence is worth naming
+# so it is not read as one statistic quoted twice. They also measure
+# different things: the first compares the spent move against
+# target_distance, while this gate binds on expected_range - and
+# _reach_reason already forces target_distance <= expected_range, so the
+# populations are related but not identical.
+#
+# AN ARGUMENT THAT WAS DROPPED. An earlier draft noted that the three
+# largest movers passed at 0.52, 0.51 and 0.52 against the 0.50 floor and
+# called that "the signature of a threshold in the wrong place". It is
+# not evidence of anything: ratio = expected_range / spent, so among
+# survivors the biggest movers necessarily carry the smallest ratios, and
+# under ANY floor f they sit just above f. At 1.0 the same observation
+# will reappear at 1.01.
+#
+# MEASURED AT ONE INSTANT, 14:35, and that matters more here than it
+# would earlier in the day. expected_range is atr_bar * sqrt(bars_left),
+# so it shrinks toward the close while the spent move grows: 14:35 is
+# where this floor bites HARDEST. The 61% cut is therefore closer to a
+# worst case than to a daily average, and the profile across the session
+# is still unmeasured. churn_sample.py, added the same week, samples the
+# published table every pass and is the tool that would settle it.
+#
+# STILL NOT BACKTESTED, and that caveat survives the change. What exists
+# is 2,738 resolved outcomes from 2026-09-21 showing a negative expectancy
+# (-0.369R over all, -0.213R over taken), and an exit sweep in which no
+# profit-taking level was positive. None of that isolates this gate. It
+# establishes that the previous setting was not producing a winning
+# selection, which is weaker than proving 1.0 does.
 #
 # KNOWN AND UNMEASURED: expected_range is atr_bar * sqrt(bars_left), so it
 # shrinks through the session while the spent move grows. The same 3% move
 # passes at 75 bars left and fails at 25, which means this gate tightens
 # as the day goes on and partly subsumes SCAN_SESSION_MIN_MINUTES_LEFT.
-# The 20% above is one instant, not a daily average.
+# The 61% cut above is one instant - 14:35 - not a daily average, and
+# for the reason just given it is the instant least favourable to output.
 #
 # Set it to 0.0 to report the ratio without binding on it.
-SCAN_MIN_ROOM_RATIO = 0.5
+SCAN_MIN_ROOM_RATIO = 1.0
 # How close to its untouched trigger a name counts as "approaching", in
 # ATR-per-bar units. The scanner reports on breaks that have happened; at
 # this distance it also names the ones that have not, so a setup can be
@@ -311,6 +356,29 @@ CACHE_TODAY_MAX_AGE_SECONDS = 900
 # it once, before the open, while the scan would do it while you wait.
 # Tick volume and the bar builder's memory roughly double as well.
 FEED_UNIVERSE_SIZE = 2800
+
+# How often the short/mid/long horizon tables re-anchor on live prices.
+#
+# ONE HOUR, because almost nothing in these tables moves faster. Trend,
+# relative strength, drawdown and position-in-range are computed from
+# COMPLETED DAILY BARS over 10, 63 and 252 sessions, and the daily store
+# only advances once a night in the nightly job - so the ordering cannot
+# change during a session however often it is recomputed. The single
+# intraday input is the live price anchor, which moves entry, stop and
+# exit levels but not the ranking.
+#
+# WHAT A TICK COSTS, measured 2026-09-23 over the 210-symbol F&O universe:
+# 4.1s for one batched quote sweep plus 3.3s to assess, 7.4s in total.
+# That is affordable at any of these cadences; the reason for an hour is
+# that a shorter one buys nothing, not that it costs too much.
+#
+# IT IS ALSO THE CACHE TTL for load_horizon_picks. The two must agree: the
+# refresh works by flooring the clock into a bucket that forms part of the
+# cache key, so a TTL SHORTER than the bucket means the entry expires
+# mid-window and any page interaction recomputes anyway - which is what
+# happened when the TTL was the shared 15-minute CACHE_TTL_SECONDS and the
+# bucket was an hour. Keep them the same value.
+HORIZON_REFRESH_SECONDS = 3600
 
 SCAN_AUTO_REFRESH_SECONDS = 60
 # How often the page RE-READS the scan the feed published. Distinct from

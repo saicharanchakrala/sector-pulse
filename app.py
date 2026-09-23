@@ -139,6 +139,64 @@ def sentiment_emoji(sentiment: float) -> str:
     return "⚪"
 
 
+def minutes_since_clock(stamp, now: "datetime | None" = None) -> float:
+    """Minutes since a HH:MM:SS stamp from today's session.
+
+    `cleared_at` and `first_seen_at` are CLOCK STRINGS, not timestamps -
+    the feed writes them as "11:12:29" - so they cannot be subtracted from
+    an aware datetime without being given today's date first. Doing that
+    subtraction naively is a real trap: it yields a negative age, which
+    reads as "cleared in the future" rather than as an error.
+
+    WHY THIS COLUMN EXISTS. The table already showed cleared_at, and a
+    bare "09:35" does not announce itself as five hours stale next to a
+    row that cleared four seconds ago. Measured on the 14:35 snapshot of
+    2026-09-22: the median setup on screen had cleared 211 minutes
+    earlier and 51 of 71 had cleared more than two hours before, while
+    61% had already moved further than the move their target projected.
+    The age is the fastest way to see that without reading two clocks and
+    subtracting.
+
+    Returns NaN rather than raising, because one unparseable stamp must
+    not take the table down with it - and the guard cannot use `not
+    stamp`, which raises TypeError on pd.NA ("boolean value of NA is
+    ambiguous"). This runs under .map() over a whole column, so one NA
+    would take down the entire published-scan render, which is the exact
+    failure the sentence above promises it prevents.
+
+    CLAMPED AT ZERO, like the sibling age_hours below. The stamps come
+    from the container's clock and `now` from this machine's, so forward
+    skew makes a freshly cleared row read as negative - "cleared in the
+    future", which is a nonsense a reader would have to diagnose. Skew is
+    the only way to get one, so zero is the honest floor.
+    """
+    if stamp is None or stamp is pd.NaT:
+        return float("nan")
+    try:
+        if pd.isna(stamp):
+            return float("nan")
+    except (TypeError, ValueError):
+        pass
+    if not str(stamp).strip():
+        return float("nan")
+    if now is None:
+        now = datetime.now(IST_ZONE)
+    try:
+        parts = [int(p) for p in str(stamp).strip().split(":")]
+    except (TypeError, ValueError):
+        return float("nan")
+    if len(parts) < 2:
+        return float("nan")
+    hour, minute = parts[0], parts[1]
+    second = parts[2] if len(parts) > 2 else 0
+    try:
+        when = now.replace(hour=hour, minute=minute, second=second,
+                           microsecond=0)
+    except ValueError:
+        return float("nan")
+    return max(0.0, (now - when).total_seconds() / 60.0)
+
+
 def age_hours(published: datetime) -> float:
     """Hours elapsed since a timezone-aware published timestamp."""
     return max(0.0, (datetime.now(timezone.utc) - published).total_seconds() / 3600)
@@ -1302,12 +1360,20 @@ def render_published_scan() -> bool:
     # blocked - the second group is the useful half, since the gates are
     # the part of this scanner the measurements support.
     show = table.sort_values(["actionable", "score"], ascending=[False, False])
+    if "cleared_at" in show.columns:
+        # HOW LONG IT HAS BEEN STANDING, not just when it started. See
+        # minutes_since_clock - a row that cleared at 09:35 looked
+        # identical to one that cleared seconds ago.
+        show = show.copy()
+        show["held_min"] = (show["cleared_at"].map(minutes_since_clock)
+                            .round(0).astype("Int64"))
     columns = [c for c in ("symbol", "direction", "actionable", "score",
                            # WHEN, next to WHAT. Every scan rebuilds the
                            # table, so run_time is when the pass ran - a
                            # row held since 09:45 was indistinguishable
                            # from one that printed four seconds ago.
-                           "first_seen_at", "cleared_at", "exit_by",
+                           "first_seen_at", "cleared_at", "held_min",
+                           "exit_by",
                            "entry", "stop", "target", "quantity",
                            "required_win_rate", "breakeven_pct", "rvol",
                            "relative_strength", "turnover_20d")
@@ -1320,6 +1386,14 @@ def render_published_scan() -> bool:
             "gate - both first-wins, so a setup that cleared at 10:42 and "
             "failed later still reads 10:42, because that is when it would "
             "have been acted on.\n\n"
+            "**held_min** is how many minutes ago it cleared. A large "
+            "number is a warning, not a recommendation: on the 14:35 "
+            "snapshot of 2026-09-22 the median setup on screen had "
+            "cleared 211 minutes earlier, and 61% had already moved "
+            "further in their own direction than the extra move their "
+            "target was projecting. `SCAN_MIN_ROOM_RATIO` is the gate "
+            f"that refuses those, currently "
+            f"{config.SCAN_MIN_ROOM_RATIO:.2f}.\n\n"
             f"**exit_by** is the planned exit - a setup leaves on its "
             f"target, its stop, or this time, whichever comes first, and "
             f"this is the only one of the three knowable in advance. It is "
@@ -1994,7 +2068,11 @@ def render_live_feed_panel() -> None:
                        f"that owns it, or with taskkill.")
 
 
-@st.cache_data(ttl=config.CACHE_TTL_SECONDS, max_entries=4,
+# TTL MATCHES THE REFRESH WINDOW, not the shared 15-minute default. The
+# bucket in the cache key is the clock floored to HORIZON_REFRESH_SECONDS,
+# so a shorter TTL expires the entry mid-window and a full app run then
+# recomputes 7.4s of work the bucket said was still current.
+@st.cache_data(ttl=config.HORIZON_REFRESH_SECONDS, max_entries=4,
                show_spinner=False)
 def load_horizon_picks(symbols: tuple[str, ...], top: int,
                        bucket: int = 0, anchor_live: bool = False) -> dict:
@@ -2018,7 +2096,21 @@ def load_horizon_picks(symbols: tuple[str, ...], top: int,
     return {"picks": picks, "live_count": len(live)}
 
 
-HORIZON_ANCHOR_SECONDS = 60
+# Read from config so the cache TTL on load_horizon_picks and the
+# fragment's tick cannot drift apart - see the note beside it there.
+HORIZON_ANCHOR_SECONDS = config.HORIZON_REFRESH_SECONDS
+
+
+def _human_interval(seconds: int) -> str:
+    """"3600s" is a number a reader has to convert. This is the sentence."""
+    if seconds >= 3600:
+        hours = seconds / 3600.0
+        return "hour" if abs(hours - 1.0) < 1e-9 else f"{hours:.0f} hours"
+    if seconds >= 60:
+        minutes = seconds / 60.0
+        return "minute" if abs(minutes - 1.0) < 1e-9 \
+            else f"{minutes:.0f} minutes"
+    return f"{int(seconds)}s"
 
 
 def horizon_anchor() -> tuple:
@@ -2078,7 +2170,8 @@ def render_horizon_tables(symbols: list, top: int = 20) -> None:
         st.caption(
             f"Prices, stops and exits are anchored on the LIVE price for "
             f"{result['live_count']:,} symbols, refreshed about every "
-            f"{HORIZON_ANCHOR_SECONDS}s. The trend and volatility columns "
+            f"{_human_interval(HORIZON_ANCHOR_SECONDS)}. The trend and "
+            f"volatility columns "
             f"still come from completed daily bars, which is why the "
             f"ordering barely moves during a session."
         )
@@ -3147,7 +3240,32 @@ def render_scan_tab() -> None:
     if discovered is None:
         st.info("Sync the instruments to assess the longer horizons.")
         return
-    render_horizon_tables(sorted({i.symbol for i in discovered.fo_stocks}))
+    # ON A TIMER, because until now nothing reran this. The refresh
+    # machinery was already here and unreachable: horizon_anchor returns a
+    # time bucket that forms part of load_horizon_picks' cache key, so the
+    # result self-invalidates every HORIZON_ANCHOR_SECONDS - and the
+    # caption below it told the reader the prices were "refreshed about
+    # every 60s". Nothing ever triggered the rerun that would re-evaluate
+    # the bucket, so the tables sat on whatever they computed on the last
+    # full app run, and the caption was a promise the page did not keep.
+    #
+    # UNCONDITIONAL run_every, which is the shape positions_panel was
+    # corrected to and the opposite of published_poll_interval. A fragment
+    # tick never causes a full app run, so any condition evaluated HERE is
+    # frozen for the life of the page: deciding "only when the market is
+    # open" outside the fragment means a page opened at 09:00 never starts
+    # a timer at all. Out of hours this costs nothing anyway, because
+    # horizon_anchor pins the bucket to 0 and the cached result is served
+    # without recomputing.
+    #
+    # Measured 2026-09-23 over the 210-symbol F&O universe: 4.1s for one
+    # batched quote sweep and 3.3s to assess, 7.4s in total against a 60s
+    # tick. The quote sweep is on Kite's QUOTE budget, batched 500 to a
+    # request, not the 3-a-second historical budget the feed lives on.
+    st.fragment(
+        lambda: render_horizon_tables(
+            sorted({i.symbol for i in discovered.fo_stocks})),
+        run_every=HORIZON_ANCHOR_SECONDS)()
 
 
 def render_positional_tab(profile_key: str, news_weight: float,
