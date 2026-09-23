@@ -75,6 +75,15 @@ chimes_preview/
 # Personal trading data, same as scan_log.csv beside it.
 outcomes.csv
 
+# Rotated outcome files, kept when the column set changes. Only the live
+# outcomes.csv above was ignored, so every rotation left a file of personal
+# trading data untracked and stageable - the same gap scan_log_*.csv had.
+outcomes.csv.superseded*
+
+# Churn samples: one row per suggestion entering or leaving the live
+# table. Derived from the published scan, personal, and regenerable.
+churn_samples.csv
+
 # The pre-open watchlist, rebuilt nightly from the daily store.
 # Derived data, and the store it comes from is gitignored too.
 premarket.parquet
