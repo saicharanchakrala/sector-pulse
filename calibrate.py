@@ -18,6 +18,13 @@ never pools them, because a replay is a reconstruction and the
 `replayed` column exists because a replayed row stamped with a past time
 is otherwise indistinguishable from a live one.
 
+ROWS ARE NOT THE UNIT, SESSIONS ARE. Setups logged on one day share that
+day's market move, so the row floor alone let three sessions of rows
+print a full expectancy block. Every floor now also needs MIN_SESSIONS
+distinct run_dates, and the mean carries a 95% interval that resamples
+whole sessions. Rows scanned outside the scan window are dropped first
+and counted, because those scans read the previous session's bars.
+
 WHAT A HIT RATE HAS TO BEAT. The share of wins that merely covers the
 round trip - and there are two honest answers, so both are printed.
 `needed` assumes every non-winner loses the full stop, which is the
@@ -28,8 +35,10 @@ neither level. `edge` is measured against `real`, so it agrees in sign
 with the money column instead of contradicting it.
 
 WHAT IT IS WORTH IN RUPEES. Expectancy is the average R per trade times
-the rupee value of one R, and that value is a constant because the sizer
-makes it one. Reported next to the R figure because the decision to keep
+the rupee value of one R of price risk. The sizer makes the whole loss at
+the stop, charges included, a constant, so one R of price is that budget
+less the round trip - see price_r_rupees. Reported next to the R figure
+because the decision to keep
 running a strategy is made in money, not in multiples of a stop - and
 reported for the TAKEN rows separately, because the log is mostly setups
 the gates refused and their expectancy is not the strategy's.
@@ -42,11 +51,42 @@ import sys
 from collections import defaultdict
 
 import config
+import forecast_stats
 
 # Below this, no rate and no expectancy is reported. At n=5 the standard
 # error of a proportion near 0.4 is about 0.22 - wider than any edge worth
 # finding, so a number would be worse than silence.
 MIN_SAMPLE = 30
+
+# AND below this many distinct SESSIONS, however many rows there are.
+#
+# WHY ROWS WERE NOT ENOUGH. Every setup logged on one day shares that
+# day's market move - a gap-down open stops out most of the longs
+# together - so rows inside a session are correlated and the session is
+# the unit of independence, which is exactly what
+# forecast_stats.block_bootstrap resamples. MIN_SAMPLE counts rows.
+# Measured 2026-09-24: outcomes.csv held 9,800 resolved rows from three
+# sessions (2026-09-21 to 23), 1,054 of them taken, and both populations
+# cleared the row floor and printed a full expectancy block. That was a
+# track record three days long, printed as though it were a thousand
+# trades.
+#
+# WHY TWENTY. About one trading month, which is the least over which a
+# session-level interval is more than a formality: block_bootstrap
+# refuses outright below five groups, and at five the percentile interval
+# is drawn from a handful of distinct resamples. MIN_SAMPLE stays as
+# well, because twenty sessions with one setup each is its own kind of
+# too small.
+MIN_SESSIONS = 20
+
+# The last session whose rows were certainly sized with the round trip ON
+# TOP of the risk budget. levels.build_levels now fits price risk and
+# charges together inside it, so one R of price is worth budget / (1 +
+# cost_r) - but for rows sized before that it was worth about the whole
+# budget, and price_r_rupees reads them roughly a tenth low. A LOWER BOUND:
+# the ECS feed sizes the old way until it is redeployed, so rows after this
+# date can be old-style too. The report says so while any such row counts.
+SIZED_WITH_CHARGES_ON_TOP_THROUGH = "2026-09-24"
 
 # Score bands. Coarse on purpose: the score is bounded 0..1 and five bands
 # over a few hundred rows keeps each one big enough to mean something.
@@ -96,12 +136,20 @@ def load(path=None) -> list:
 
 
 def rupees_per_r() -> float:
-    """What one R is worth, in rupees.
+    """The per-trade risk budget, in rupees: the whole loss at the stop.
 
-    A CONSTANT, and that is the whole point of the position sizing:
-    quantity is derived so the rupee risk is the same whatever the stop
-    distance, so every R multiple converts at one rate. With the current
-    100,000 of capital and 1% per trade, one R is 1,000 rupees.
+    A CONSTANT, and that is the whole point of the position sizing: the
+    loss if the stop fills is the same whatever the stop distance. With the
+    current 100,000 of capital and 1% per trade it is 1,000 rupees.
+
+    NO LONGER THE VALUE OF ONE R OF PRICE RISK. levels.build_levels now
+    sizes so that price risk PLUS the round trip fits the budget, so a
+    full stop-out costs 1 R of price plus cost_r R of charges and together
+    they are this figure. One R of price is therefore worth
+    budget / (1 + cost_r), about nine tenths of it at typical costs - see
+    price_r_rupees, which is what the expectancy conversion uses. Rows logged
+    before that change were sized with the charges on top, so for them the
+    conversion reads roughly a tenth low.
 
     TAKEN FROM CONFIG, not from the resolved rows, because outcomes.csv
     does not carry risk_rupees. The actual rupees at risk run slightly
@@ -112,6 +160,21 @@ def rupees_per_r() -> float:
     """
     return float(config.SCAN_CAPITAL) * float(
         config.SCAN_RISK_PCT_PER_TRADE) / 100.0
+
+
+def price_r_rupees(row) -> "float | None":
+    """What one R of PRICE risk was worth on this row, or None.
+
+    Net R is in units of price risk, and the sizer fits price risk and
+    the round trip together inside the budget (see rupees_per_r), so one R
+    of price is worth budget / (1 + cost_r). Converting net R at the whole
+    budget would overstate every rupee figure, gains and losses alike, by
+    the charges' share of the budget.
+    """
+    cost = cost_r(row)
+    if cost is None:                  # cost_r never returns a negative
+        return None
+    return rupees_per_r() / (1.0 + cost)
 
 
 def cost_r(row) -> "float | None":
@@ -254,6 +317,57 @@ def is_live(row) -> bool:
     return str(row.get("replayed", "")).lower() not in ("true", "1")
 
 
+def in_scan_window(row) -> bool:
+    """Whether a row was scanned while its own session's bars existed.
+
+    THE ROWS THIS DROPS. The feed's scan loop ran on a timer with no clock
+    check, and setups.measure falls back to the last session it holds - so
+    a scan at 06:37 measured YESTERDAY's bars and stamped them with
+    today's run_date, and outcomes.py then scored those levels against
+    today's bars. Measured 2026-09-24: 2,350 of the 9,800 resolved rows
+    carry a run_time before 09:30 (06:37, 08:08, 09:21). They are not a
+    noisy sample of the strategy, they are a different experiment.
+
+    THE SAME WINDOW THE LIVE LOOP NOW OBEYS, from scan_publish, so the
+    report and the feed cannot disagree about what a valid scan instant
+    is: on a weekday, from the opening range's close up to but not
+    including the session close.
+
+    REPLAYS ARE JUDGED BY THE SAME RULE ON THEIR OWN run_time. A replayed
+    row carries a past instant legitimately - that is what a replay is -
+    so a replay as of 10:00 is inside the window and one as of 06:37 is
+    not, for the same reason a live scan at 06:37 is not: nothing of that
+    day's session existed to measure.
+
+    FAILS CLOSED. A row whose run_date or run_time cannot be read is
+    outside, because a scan instant that cannot be placed cannot be shown
+    to be inside.
+    """
+    import scan_publish
+
+    return scan_publish.in_scan_window(row)
+
+
+def sessions(rows: list) -> int:
+    """Distinct run_dates among `rows`, the unit of independence.
+
+    See MIN_SESSIONS. A blank run_date is not a session; in the report
+    such a row never gets this far, because in_scan_window cannot place it.
+    """
+    return len({str(row.get("run_date") or "").strip() for row in rows}
+               - {""})
+
+
+def clears_floors(rows: list) -> bool:
+    """Whether `rows` are enough, by count AND by sessions, to report on.
+
+    ONE CHECK FOR EVERY GATE, for the reason rateable is one gate: two
+    floors checked in two places is how one of them gets left out of the
+    second place.
+    """
+    return len(rows) >= MIN_SAMPLE and sessions(rows) >= MIN_SESSIONS
+
+
 def disposition(row) -> str:
     """Whether the scanner would have ACTED on this setup.
 
@@ -303,7 +417,8 @@ def summarise(rows: list) -> dict:
     """Per band: n, hits, net R, and the parts both break-even bars need."""
     bands = defaultdict(lambda: {"n": 0, "hits": 0, "net_r": 0.0,
                                  "required": 0.0, "cost_r": 0.0,
-                                 "rr": 0.0, "loser_r": 0.0, "losers": 0})
+                                 "rr": 0.0, "loser_r": 0.0, "losers": 0,
+                                 "days": set()})
     for row in rows:
         if not rateable(row):
             continue
@@ -312,6 +427,11 @@ def summarise(rows: list) -> dict:
             continue
         entry = bands[band]
         entry["n"] += 1
+        # Sessions per band, for the same reason the report counts them
+        # at all: a band's n can be hundreds of rows from three days.
+        day = str(row.get("run_date") or "").strip()
+        if day:
+            entry["days"].add(day)
         entry["net_r"] += net_r(row)
         entry["required"] += required_from_row(row)
         entry["cost_r"] += cost_r(row)
@@ -386,15 +506,30 @@ def expectancy(rows: list) -> dict:
     parts are reported alongside it, because a positive expectancy built
     on one outsized win is a different fact from one built on a steady
     edge. Net of costs throughout; see net_r.
+
+    WITH AN INTERVAL THAT RESAMPLES SESSIONS, not rows. The mean of 1,054
+    rows from three days looks precise and is not: resampling individual
+    rows treats each setup as an independent draw, when every setup on a
+    day shares that day's move, and shrinks the interval until noise
+    looks like an edge. forecast_stats.block_bootstrap resamples whole
+    run_dates and refuses below five of them, and a refusal comes back
+    here as None - never as a narrow interval that was not estimated. The
+    seed is fixed so the same outcomes always print the same interval.
     """
     wins, losses, net = [], [], []
+    groups = []
     required = []
+    worth = []
     hits = 0
     for row in rows:
         value = net_r(row)
         if value is None:
             continue
         net.append(value)
+        one_r = price_r_rupees(row)
+        if one_r is not None:
+            worth.append(one_r)
+        groups.append(str(row.get("run_date") or "").strip())
         (wins if value > 0 else losses).append(value)
         hits += 1 if row.get("outcome") == "TARGET" else 0
         rate = required_from_row(row)
@@ -404,8 +539,19 @@ def expectancy(rows: list) -> dict:
         return {}
     count = len(net)
     mean = sum(net) / count
+    rupees_r = (sum(worth) / len(worth)) if worth else rupees_per_r()
+    _, low, high, _ = forecast_stats.block_bootstrap(
+        net, groups, seed=forecast_stats.DEFAULT_SEED)
+    estimable = low == low and high == high          # NaN is the refusal
     return {
         "n": count,
+        # The groups the interval actually resampled, so the count printed
+        # beside it cannot disagree with it. A blank run_date is one
+        # undated group here; report() never passes one, because
+        # in_scan_window cannot place it.
+        "sessions": len(set(groups)),
+        "ci_low": low if estimable else None,
+        "ci_high": high if estimable else None,
         # TWO DIFFERENT RATES, deliberately, and both are printed because
         # they answer different questions. `win_rate` is the share that
         # made money after costs, which is what the decomposition is
@@ -417,17 +563,27 @@ def expectancy(rows: list) -> dict:
         "avg_win": (sum(wins) / len(wins)) if wins else 0.0,
         "avg_loss": (sum(losses) / len(losses)) if losses else 0.0,
         "expectancy_r": mean,
-        "expectancy_rupees": mean * rupees_per_r(),
+        # ONE RATE FOR THE WHOLE BLOCK, the population's mean value of one
+        # R of price risk (see price_r_rupees). One rate rather than a
+        # per-row product so the average winner, the average loser and the
+        # per-trade figure printed beside them still add up.
+        "rupees_per_r": rupees_r,
+        "expectancy_rupees": mean * rupees_r,
+        # Rows known to be sized the old way, for the caveat printed
+        # beside the rupee figures (see SIZED_WITH_CHARGES_ON_TOP_THROUGH).
+        # ISO dates compare correctly as strings.
+        "sized_old_way": sum(1 for day in groups
+                             if day and day <= SIZED_WITH_CHARGES_ON_TOP_THROUGH),
         "required": (sum(required) / len(required)) if required else None,
     }
 
 
 def _band_table(bands: dict) -> list:
     """The per-band rows."""
-    lines = [f"{'score band':>12}  {'n':>5}  {'hit rate':>9}  "
+    lines = [f"{'score band':>12}  {'n':>5}  {'days':>4}  {'hit rate':>9}  "
              f"{'needed':>7}  {'real':>7}  {'edge':>7}  "
              f"{'mean net R':>10}",
-             "-" * 72]
+             "-" * 78]
     for low, high in BANDS:
         entry = bands.get((low, high))
         if not entry or not entry["n"]:
@@ -437,17 +593,46 @@ def _band_table(bands: dict) -> list:
         needed = entry["required"] / n
         real = realised_required(entry)
         lines.append(f"{low:.1f}-{high:.1f}".rjust(12) +
-                     f"  {n:5d}  {hit:8.1%}  {needed:6.1%}  {real:6.1%}  "
+                     f"  {n:5d}  {len(entry.get('days', ())):4d}  "
+                     f"{hit:8.1%}  {needed:6.1%}  {real:6.1%}  "
                      f"{hit - real:+7.1%}  {entry['net_r'] / n:10.3f}")
     return lines
 
 
+def _interval_lines(exp: dict) -> list:
+    """The 95% interval on the mean net R, or why there is none.
+
+    SAID OUT LOUD WHEN IT IS MISSING. block_bootstrap returns NaN below
+    five sessions, and printing the mean alone at that point would look
+    exactly like a mean whose interval was simply not shown.
+    """
+    low, high = exp.get("ci_low"), exp.get("ci_high")
+    if low is None or high is None:
+        return [f"  {'95% interval':<24}not estimable - "
+                f"{exp.get('sessions', 0)} sessions, fewer than the five a "
+                f"session resample needs"]
+    rupees = exp.get("rupees_per_r", rupees_per_r())
+    lines = [f"  {'95% interval, sessions':<24}{low:>+8.3f} R to "
+             f"{high:+.3f} R  ({low * rupees:+,.0f} to "
+             f"{high * rupees:+,.0f})"]
+    if low <= 0.0 <= high:
+        lines.append("  The interval spans zero: this sample cannot tell "
+                     "the expectancy apart from no edge at all.")
+    return lines
+
+
 def _expectancy_lines(exp: dict, label: str) -> list:
-    """The expectancy block, in R and in rupees."""
-    rupees = rupees_per_r()
+    """The expectancy block, in R and in rupees, with its session count.
+
+    The session count sits beside n because n alone is the number that
+    misleads - see MIN_SESSIONS.
+    """
+    rupees = exp.get("rupees_per_r", rupees_per_r())
     lines = ["",
-             f"EXPECTANCY over {exp['n']:,} {label}, net of costs, "
-             f"where one R is Rs {rupees:,.0f}",
+             f"EXPECTANCY over {exp['n']:,} {label} from "
+             f"{exp.get('sessions', 0):,} sessions, net of costs, "
+             f"where one R of price risk is worth Rs {rupees:,.0f} "
+             f"(the Rs {rupees_per_r():,.0f} budget less charges)",
              f"  {'reached the target':<24}{exp['hit_rate']:>9.1%}",
              f"  {'made money after costs':<24}{exp['win_rate']:>9.1%}",
              f"  {'average winner':<24}{exp['avg_win']:>+8.3f} R"
@@ -456,6 +641,12 @@ def _expectancy_lines(exp: dict, label: str) -> list:
              f"  {exp['avg_loss'] * rupees:>+10,.0f}",
              f"  {'PER TRADE':<24}{exp['expectancy_r']:>+8.3f} R"
              f"  {exp['expectancy_rupees']:>+10,.0f}"]
+    lines.extend(_interval_lines(exp))
+    if exp.get("sized_old_way"):
+        lines.append(f"  {exp['sized_old_way']:,} of these rows were sized "
+                     f"with charges on top of the budget, so for them one R "
+                     f"was nearer Rs {rupees_per_r():,.0f} and the rupee "
+                     f"figures above read up to about a tenth low.")
     if exp.get("required") is not None:
         lines.append(f"  {'bar, full-loss basis':<24}"
                      f"{exp['required']:>9.1%}")
@@ -467,20 +658,40 @@ def _expectancy_lines(exp: dict, label: str) -> list:
     return lines
 
 
-def _refusal(live: list, replayed: list, usable: int) -> list:
-    """What is said instead of a number, and why."""
+def _refusal(live: list, replayed: list, usable: list) -> list:
+    """What is said instead of a number, and why.
+
+    BOTH COUNTS AND BOTH FLOORS, whichever one failed. A refusal that
+    quoted only the row count would read "1,054 against a floor of 30" -
+    which looks like a bug in the refusal, not a reason for it.
+    """
+    count = len(usable)
+    days = sessions(usable)
     lines = ["",
-             f"NOT ENOUGH TO CALIBRATE. {usable} usable live outcomes "
-             f"against a floor of {MIN_SAMPLE}.",
-             "",
-             "At this size the error bar on a hit rate is wider than any "
-             "edge worth finding, so no rate is printed.",
-             "A few hundred is where a score band starts to mean "
-             "something. The feed logs every directional setup once per "
-             "session; fetch_scan_log brings those down and outcomes.py "
-             "resolves them."]
-    if usable < len(live):
-        lines.append(f"{len(live) - usable} of the {len(live)} live rows "
+             f"NOT ENOUGH TO CALIBRATE. {count:,} usable live outcomes from "
+             f"{days:,} sessions, against floors of {MIN_SAMPLE} outcomes "
+             f"and {MIN_SESSIONS} sessions.",
+             ""]
+    if days < MIN_SESSIONS:
+        lines.append(f"Setups logged on one day share that day's market "
+                     f"move, so {count:,} rows from {days:,} sessions carry "
+                     f"closer to {days:,} independent observations than "
+                     f"{count:,}. The session floor is about a trading "
+                     f"month, and more rows per day do not substitute for "
+                     f"more days.")
+    # ONLY WHEN THE ROWS ARE SHORT. Beside "9,800 usable outcomes" a line
+    # about a few hundred being enough reads as a refusal contradicting
+    # itself, which is the thing the two counts above exist to prevent.
+    if count < MIN_SAMPLE:
+        lines.extend([
+            "At this size the error bar on a hit rate is wider than any "
+            "edge worth finding, so no rate is printed.",
+            "A few hundred is where a score band starts to mean "
+            "something. The feed logs every directional setup once per "
+            "session; fetch_scan_log brings those down and outcomes.py "
+            "resolves them."])
+    if count < len(live):
+        lines.append(f"{len(live) - count:,} of the {len(live):,} live rows "
                      f"could not be costed or scored and are excluded - "
                      f"the floor counts rows that yield a number, not "
                      f"rows that exist.")
@@ -489,11 +700,12 @@ def _refusal(live: list, replayed: list, usable: int) -> list:
     # trade returns is a statistic and is not. Printing the first without
     # the second is the distinction this file exists to hold.
     lines.append("")
-    lines.append(f"One R is Rs {rupees_per_r():,.0f} "
+    lines.append(f"Each trade risks Rs {rupees_per_r():,.0f} "
                  f"({config.SCAN_RISK_PCT_PER_TRADE:.2f}% of "
-                 f"Rs {config.SCAN_CAPITAL:,.0f}), so expectancy in rupees "
-                 f"is that times the mean net R - withheld here for the "
-                 f"same reason the hit rate is.")
+                 f"Rs {config.SCAN_CAPITAL:,.0f}) including charges, so "
+                 f"one R of price risk is worth that less the round trip, "
+                 f"and expectancy in rupees is the mean net R at that rate "
+                 f"- withheld here for the same reason the hit rate is.")
     if replayed:
         lines.append("")
         lines.append(f"The {len(replayed)} replayed rows are excluded "
@@ -512,29 +724,61 @@ def _population_lines(live: list, usable: list, taken: list,
     blocked = len(usable) - len(taken) - len(unknown)
     tail = (f", {len(unknown)} predate the column"
             if unknown else "")
-    lines.append(f"Of {len(usable)} usable live rows, {len(taken)} were "
-                 f"TAKEN by the gates and {blocked} were blocked{tail}.")
+    lines.append(f"Of {len(usable):,} usable live rows from "
+                 f"{sessions(usable)} sessions, {len(taken):,} were "
+                 f"TAKEN by the gates and {blocked:,} were blocked{tail}.")
     return lines
+
+
+def _stale_lines(stale: list) -> list:
+    """The rows dropped for being scanned outside the window, counted.
+
+    Counted rather than silently dropped for the same reason MAX_COST_R
+    rows are: a population that shrinks without saying so is how a ragged
+    sample hides. See in_scan_window.
+    """
+    import scan_publish
+
+    first, close = scan_publish.window_bounds()
+    replays = sum(1 for row in stale if not is_live(row))
+    return [f"Scanned outside the scan window ({first:%H:%M} to "
+            f"{close:%H:%M} IST on a weekday) or with no readable scan "
+            f"time: {len(stale):,}, of which {replays:,} replayed. Before "
+            f"the window a scan reads the PREVIOUS session's bars under "
+            f"this session's date, so its levels were scored against a day "
+            f"they were not computed from; after it there is no session "
+            f"left to trade. Excluded from everything below."]
 
 
 def report(rows: list) -> str:
     """The whole readout, or an honest refusal."""
-    live = [r for r in rows if is_live(r)]
-    replayed = [r for r in rows if not is_live(r)]
+    # THE SCAN WINDOW FIRST, before the live/replayed split, so neither
+    # population and no floor ever counts a row scanned against the wrong
+    # session. See in_scan_window.
+    timely, stale = [], []
+    for row in rows:
+        (timely if in_scan_window(row) else stale).append(row)
+    live = [r for r in timely if is_live(r)]
+    replayed = [r for r in timely if not is_live(r)]
     usable = [r for r in live if rateable(r)]
     taken = [r for r in usable if disposition(r) == "taken"]
     unknown = [r for r in usable if disposition(r) == "unknown"]
 
-    lines = [f"{len(rows)} resolved setups: {len(live)} live, "
-             f"{len(replayed)} replayed."]
+    lines = [f"{len(rows):,} resolved setups: {len(live):,} live, "
+             f"{len(replayed):,} replayed"
+             + (f", {len(stale):,} outside the scan window." if stale
+                else ".")]
+    if stale:
+        lines.extend(_stale_lines(stale))
     lines.extend(_population_lines(live, usable, taken, unknown))
 
     # THE FLOOR COUNTS USABLE ROWS, not rows. Gating on len(live) while
     # computing the statistic over the rows that parsed let a per-trade
     # rupee figure out at n=3, in the file that says it will not print a
-    # number it cannot support.
-    if len(usable) < MIN_SAMPLE:
-        return "\n".join(lines + _refusal(live, replayed, len(usable)))
+    # number it cannot support. AND IT COUNTS SESSIONS, because 1,054
+    # usable rows from three days cleared the row floor on its own.
+    if not clears_floors(usable):
+        return "\n".join(lines + _refusal(live, replayed, usable))
 
     bands = summarise(usable)
     lines.append("")
@@ -569,8 +813,11 @@ def report(rows: list) -> str:
     # above describes a population the gates mostly refused - 5.4% taken
     # in the current log. What the strategy would have earned is the
     # taken rows alone.
+    # The same two floors as the headline block. The taken rows are a
+    # small slice of the usable ones - 1,054 of 9,800 in the current file
+    # - so they can miss either floor while the headline clears both.
     taken_exp = expectancy(taken)
-    if taken_exp and taken_exp["n"] >= MIN_SAMPLE:
+    if taken_exp and clears_floors(taken):
         lines.extend(_expectancy_lines(taken_exp, "TAKEN live setups"))
         lines.append("")
         lines.append("This is the strategy's own expectancy. The block "
@@ -579,21 +826,31 @@ def report(rows: list) -> str:
     else:
         lines.append("")
         lines.append(f"NO EXPECTANCY FOR THE TAKEN ROWS: "
-                     f"{taken_exp.get('n', 0)} of them resolved, against "
-                     f"a floor of {MIN_SAMPLE}. The figures above include "
-                     f"setups the gates REFUSED - the counterfactual the "
-                     f"log keeps on purpose, not what the strategy would "
-                     f"have earned.")
+                     f"{taken_exp.get('n', 0)} of them resolved over "
+                     f"{sessions(taken)} sessions, against floors of "
+                     f"{MIN_SAMPLE} rows and {MIN_SESSIONS} sessions. The "
+                     f"figures above include setups the gates REFUSED - the "
+                     f"counterfactual the log keeps on purpose, not what "
+                     f"the strategy would have earned.")
 
+    # A band joins the verdict only past BOTH floors, like every other
+    # figure here: ten rows from one day is one observation of that band.
     ordered = [(band, entry["hits"] / entry["n"])
                for band, entry in sorted(bands.items())
-               if entry["n"] >= 10]
+               if entry["n"] >= 10
+               and len(entry.get("days", ())) >= MIN_SESSIONS]
     if len(ordered) >= 3:
         rates = [rate for _, rate in ordered]
-        rising = all(b <= a for a, b in zip(rates, rates[1:])) or \
-            all(b >= a for a, b in zip(rates, rates[1:]))
+        # RISING ONLY. This accepted a hit rate that FELL with the score
+        # as "yes" too, which contradicted the sentence printed beside it:
+        # a score whose best band hits least is ordering things backwards,
+        # and that is not a pass.
+        rising = all(b >= a for a, b in zip(rates, rates[1:]))
+        falling = all(b <= a for a, b in zip(rates, rates[1:]))
+        verdict = ("yes" if rising else
+                   "NO, it falls as the score rises" if falling else "NO")
         lines.append("")
-        lines.append("Monotonic in score: " + ("yes" if rising else "NO") +
+        lines.append("Rises with score: " + verdict +
                      " - if the hit rate does not rise with the score, "
                      "the score is not ordering anything.")
     return "\n".join(lines)

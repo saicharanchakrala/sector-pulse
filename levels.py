@@ -13,7 +13,12 @@ as arithmetic is a level you cannot audit after the trade:
   target   the reward-to-risk multiple of the stop distance, which at the
            default half-move stop lands on one full plausible move
   risk     entry to stop, per share
-  size     risk budget in rupees divided by risk per share
+  size     the largest share count whose loss at the stop PLUS its
+           round-trip charges fits the rupee risk budget, capped by what
+           capital times MIS leverage can fund. Charges used to be priced
+           after sizing: in the scan logs of 2026-09-22 and 23 the median
+           stop-out lost about 1,100 (p90 about 1,200) against a 1,000
+           budget, and 97% of the 7,079 rows with levels exceeded it.
   target   entry plus the reward-to-risk multiple of risk
 
 Nothing here forecasts. It turns one price, one volatility reading and one
@@ -21,14 +26,66 @@ structural level into a position whose downside is known before entry.
 """
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass
 
 import config
 import trade_costs
 
+logger = logging.getLogger(__name__)
+
 LONG = "LONG"
 SHORT = "SHORT"
+
+# Upper bound on the sizing walk in _quantity_inside_budget. NOT a tuning
+# knob: each step provably lands at or above the answer and strictly below
+# the previous guess. Over 20,000 random inputs in the space the scan
+# produces - prices 20 to 12,000, stops 0.02% to 3%, budgets 250 to
+# 20,000 - the walk never needed more than six steps (the brokerage cap is
+# the only non-linear term, and it is worth at most about 47 rupees). That
+# figure is for that space only: far outside it, at sub-rupee prices with
+# stops a few millionths of the price, a review measured 19 steps and a
+# log-uniform sweep 20. The bound exists so that an input nobody
+# anticipated fails closed with a warning instead of spinning.
+_SIZING_MAX_STEPS = 64
+
+
+def _finite_positive(value) -> bool:
+    """True for a real, finite number above zero; False for None, NaN or inf.
+
+    WHY NOT `value <= 0.0`. Every comparison with NaN is False, so a guard
+    written that way waves NaN straight through - and int(budget // nan)
+    then raised deep inside the sizer instead of build_levels returning
+    None as its docstring promises. A NaN ATR is not hypothetical: it is
+    what a symbol whose bars are all missing produces.
+    """
+    if value is None:
+        return False
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(number) and number > 0.0
+
+
+def risk_budget(capital: float, risk_pct: float) -> float:
+    """Rupees one trade may lose at its stop, charges included; 0.0 if refused.
+
+    The single place the per-trade budget is computed, so that equity
+    sizing here and option sizing in options_chain cannot disagree about
+    what a trade is allowed to lose.
+
+    FAILS CLOSED, returning 0.0 rather than a clamped figure, when either
+    input is missing, non-finite or not positive, or when risk_pct is above
+    config.SCAN_MAX_RISK_PCT. The ceiling is read at call time, not bound
+    as a default, so a test or a config change moves it everywhere at once.
+    """
+    if not (_finite_positive(capital) and _finite_positive(risk_pct)):
+        return 0.0
+    if float(risk_pct) > float(config.SCAN_MAX_RISK_PCT):
+        return 0.0
+    return float(capital) * float(risk_pct) / 100.0
 
 
 @dataclass(frozen=True)
@@ -40,7 +97,7 @@ class TradeLevels:
     stop: float
     target: float
     quantity: int
-    lot_risk: float                 # rupees at risk if the stop fills exactly
+    lot_risk: float                 # PRICE risk: rupees lost to the move alone
     reward_risk: float              # target distance / stop distance
     breakeven_pct: float            # round-trip cost as a percent move
     cost_rupees: float              # round-trip cost for this exact size
@@ -52,6 +109,24 @@ class TradeLevels:
     def risk_per_share(self) -> float:
         """Absolute entry-to-stop distance."""
         return abs(self.entry - self.stop)
+
+    @property
+    def risk_with_costs(self) -> float:
+        """Everything lost if the stop fills exactly: the move plus charges.
+
+        THIS is the number the sizer holds inside the risk budget, and the
+        one the portfolio cap adds up. lot_risk stays PRICE risk only,
+        because required_win_rate solves p*reward - (1-p)*risk = costs and
+        needs the move and the charges as separate terms; folding the
+        charges into lot_risk would count them twice there.
+
+        The charges are priced at a flat exit (exit == entry), the same
+        call that produces cost_rupees and breakeven_pct. At the real stop
+        price a LONG pays marginally less (a smaller sell leg) and a SHORT
+        marginally more (a larger buy-back leg) - for a stop 0.5% away on a
+        1,00,000 ticket the short's difference is about 13 paise.
+        """
+        return self.lot_risk + self.cost_rupees
 
     @property
     def target_distance(self) -> float:
@@ -188,7 +263,10 @@ def expected_remaining_range(atr_per_bar: float, bars_left: int) -> float:
     Varsity comparison less lopsided than it was relayed; it moves the
     expectancy not at all.
     """
-    if atr_per_bar <= 0.0 or bars_left <= 0:
+    # Finite-and-positive rather than `<= 0`, which NaN passes: a NaN ATR
+    # returned a NaN range, and every downstream `range <= 0.0` guard then
+    # waved it through as well.
+    if not (_finite_positive(atr_per_bar) and _finite_positive(bars_left)):
         return 0.0
     return atr_per_bar * math.sqrt(bars_left)
 
@@ -242,6 +320,48 @@ def _structural_levels(direction: str, opening_low: "float | None",
             if level is not None and level > 0.0]
 
 
+def _quantity_inside_budget(entry: float, risk_per_share: float,
+                            budget: float, ceiling: int) -> int:
+    """Largest share count whose stop-out loss INCLUDING charges fits the budget.
+
+    Solves q * risk_per_share + cost(q) <= budget for a whole number q, with
+    cost(q) = trade_costs.equity_intraday_cost(entry, entry, q).total - the
+    same call that prices cost_rupees, so the stored fields satisfy
+    lot_risk + cost_rupees <= budget exactly. `ceiling` must be at or above
+    the answer; the price-only size budget // risk_per_share always is,
+    because charges can only take shares away.
+
+    WHY A WALK AND NOT ONE DIVISION. Cost is not linear in q: brokerage is
+    0.03% a leg but capped at 20 rupees an order, so the per-share charge
+    FALLS as the ticket grows. The per-share loss risk_per_share +
+    cost(q)/q is therefore non-increasing in q, which gives the walk its
+    guarantee: from any guess above the answer, budget divided by the
+    per-share loss at that guess is still at or above the answer (the loss
+    per share there is no larger than at the answer), so the next guess
+    min(guess - 1, that estimate) never undershoots and always shrinks. The
+    first guess that fits is the exact largest q. Measured over 20,000
+    random inputs (prices 20 to 12,000, stops 0.02% to 3%, budgets 250 to
+    20,000): two cost evaluations in the typical case, six at worst, and
+    q + 1 overshot the budget in every one.
+
+    Returns 0 when not one share fits, which the caller turns into None.
+    """
+    quantity = ceiling
+    for _ in range(_SIZING_MAX_STEPS):
+        if quantity <= 0:
+            return 0
+        cost = trade_costs.equity_intraday_cost(entry, entry, quantity).total
+        if quantity * risk_per_share + cost <= budget:
+            return quantity
+        per_share_loss = risk_per_share + cost / quantity
+        quantity = min(quantity - 1, int(budget // per_share_loss))
+    logger.warning("Sizing did not settle within %d steps (entry %s, risk "
+                   "per share %s, budget %s); refusing the position rather "
+                   "than guessing a size", _SIZING_MAX_STEPS, entry,
+                   risk_per_share, budget)
+    return 0
+
+
 def build_levels(direction: str, entry: float, atr_per_bar: float,
                  bars_left: int, opening_low: "float | None" = None,
                  opening_high: "float | None" = None,
@@ -259,14 +379,32 @@ def build_levels(direction: str, entry: float, atr_per_bar: float,
     Returns None rather than a degraded position when entry or ATR is
     missing: a stop derived from a zero ATR would sit on top of the entry
     and size the position at the full risk budget divided by nearly nothing.
+
+    Also None - failing closed rather than trimming - when any numeric
+    input is NaN or infinite, when risk_pct is above
+    config.SCAN_MAX_RISK_PCT, and when not a single share fits the budget
+    once its round-trip charges are counted.
     """
     if direction not in (LONG, SHORT):
         raise ValueError(f"direction must be {LONG} or {SHORT}, got {direction!r}")
-    if entry is None or entry <= 0.0 or atr_per_bar is None or atr_per_bar <= 0.0:
+    # FINITE AND POSITIVE, not `<= 0.0`, which NaN passes. See
+    # _finite_positive: a NaN entry or ATR used to reach int(budget // nan)
+    # and raise instead of returning None.
+    if not (_finite_positive(entry) and _finite_positive(atr_per_bar)):
         return None
-    if capital <= 0.0 or risk_pct <= 0.0 or reward_risk <= 0.0:
+    if not (_finite_positive(capital) and _finite_positive(risk_pct)
+            and _finite_positive(reward_risk)):
         return None
-    if leverage < 1.0 or band < 0.0 or band >= 1.0 or stop_fraction <= 0.0:
+    # The per-trade ceiling. risk_budget applies it too; checking it here
+    # as well makes the refusal explicit at the top of the function rather
+    # than a side effect of a zero budget much further down.
+    if risk_pct > config.SCAN_MAX_RISK_PCT:
+        return None
+    if not (_finite_positive(leverage) and _finite_positive(stop_fraction)):
+        return None
+    if not math.isfinite(band):
+        return None
+    if leverage < 1.0 or band < 0.0 or band >= 1.0:
         return None
 
     # Risk is bounded into [min_multiple, atr_multiple] ATRs. Taking the
@@ -281,7 +419,7 @@ def build_levels(direction: str, entry: float, atr_per_bar: float,
     # shadowing it silently collapses the window to [(1 - plausible move)
     # * base, base]. The test suite caught exactly that.
     plausible_move = expected_remaining_range(atr_per_bar, bars_left)
-    if plausible_move <= 0.0:
+    if not _finite_positive(plausible_move):
         return None
     base = plausible_move * stop_fraction
     if base <= 0.0:
@@ -307,12 +445,23 @@ def build_levels(direction: str, entry: float, atr_per_bar: float,
         return None
 
     risk_per_share = abs(entry - stop)
-    if risk_per_share <= 0.0:
+    if not _finite_positive(risk_per_share):
         return None
-    budget = capital * risk_pct / 100.0
-    by_risk = int(budget // risk_per_share)
+    budget = risk_budget(capital, risk_pct)
+    if budget <= 0.0:
+        return None
+    # CHARGES COME OUT OF THE BUDGET, not on top of it. The old rule was
+    # budget // risk_per_share with the round trip priced afterwards, so
+    # a stop-out lost the budget PLUS its charges: a median of about 1,100
+    # against a stated 1,000 in the 2026-09-22/23 scan logs. The
+    # price-only size is kept as the walk's starting ceiling, because
+    # charges can only remove shares.
+    by_price = int(budget // risk_per_share)
+    by_risk = _quantity_inside_budget(entry, risk_per_share, budget, by_price)
     # Funding cap: risk-based sizing on a tight stop asks for a position many
     # times the account. MIS leverage relaxes it but does not remove it.
+    # Fewer shares than by_risk always still fit the budget, because the
+    # stop-out loss including charges only grows with quantity.
     affordable = int((capital * leverage) // entry)
     quantity = min(by_risk, affordable)
     capital_capped = quantity < by_risk

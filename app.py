@@ -54,8 +54,10 @@ import glossary
 import horizons
 import instrument_report
 import instrument_search
+import levels as levels_mod
 import setups
 import sound
+import survival
 import trade_costs
 from levels import LONG
 from models import NewsItem, ScoredNewsItem, SectorMomentum, SectorScore
@@ -946,7 +948,11 @@ def scan_frame(actionable: list[setups.Setup]) -> pd.DataFrame:
             "Stop loss at": round(s.levels.stop, 2),
             "Exit price": round(s.levels.target, 2),
             "Qty": s.levels.quantity,
-            "Risk": round(s.levels.lot_risk, 0),
+            # The loss at the stop INCLUDING charges, which is what the
+            # size is held to and what the "Risk" tooltip promises ("what
+            # you would lose if the stop is hit exactly"). It used to be
+            # price risk alone, about 90% of the real loss.
+            "Risk": round(s.levels.risk_with_costs, 0),
             "Cost": round(s.levels.cost_rupees, 0),
             "Win % needed": round(needed * 100, 1),
             "Can pay for itself?": ("no - needs more than any measured rate"
@@ -1346,15 +1352,53 @@ def render_published_scan() -> bool:
             icon=":material/schedule:")
         return False
 
-    actionable = int(table["actionable"].sum()) if "actionable" in table else 0
     directional = int((table["direction"] != setups.NO_SETUP).sum()) \
         if "direction" in table else 0
+    # THE COMBINED CAP, CHECKED RATHER THAN ASSUMED. The feed and this page
+    # deploy separately, so the table may come from a feed that predates
+    # the cap. Rebuilt from the table's own columns, the totals say which:
+    # cap lines present, inside the cap with none, or past it. Only the
+    # columns it reads are turned into dicts: this runs on every fragment
+    # tick, over a table of a couple of thousand rows and forty columns.
+    wanted = [c for c in ("symbol", "actionable", "entry", "stop",
+                          "quantity", "cost_rupees", "reasons")
+              if c in table.columns]
+    published = setups.published_exposure(table[wanted].to_dict("records"),
+                                          capital=config.SCAN_CAPITAL)
+    cap_state = published_cap_state(published)
+    actionable = published.exposure.kept
+    label, help_text = {
+        CAP_ENFORCED: (
+            "Actionable (inside the cap)",
+            "Cleared every gate AND fits inside the combined risk cap. The "
+            "published table carries cap lines, so the feed applies it."),
+        CAP_UNCONFIRMED: (
+            "Actionable",
+            "Cleared every gate. Their total is inside the combined risk "
+            "cap, but no published row carries a cap line, so this table "
+            "cannot show whether the feed applies the cap or it simply "
+            "did not bind."),
+        CAP_EXCEEDED: (
+            "Cleared every gate (NOT capped)",
+            "The published table exceeds the combined risk cap, so the "
+            "feed is running code older than the cap and these are NOT "
+            "held inside it."),
+    }[cap_state]
     left, mid, right = st.columns(3)
     left.metric("Symbols scanned", f"{len(table):,}")
     mid.metric("Got a direction", f"{directional:,}")
-    right.metric("Cleared every gate", f"{actionable:,}")
+    right.metric(label, f"{actionable:,}", help=help_text)
     st.caption(f"Computed by the feed {age:.0f}s ago, where the bars "
                f"already are. Nothing here was calculated in this page.")
+    if actionable or not published.held:
+        render_cap_config_problem()
+    if not actionable and published.held:
+        # See render_scan_results: a cap that turns away every setup is a
+        # misconfiguration, not a quiet market, and must not read as one.
+        st.error(setups.cap_blocked_all_text(
+            len(published.held), published.closed_by,
+            risk_pct=config.SCAN_RISK_PCT_PER_TRADE,
+            capital=config.SCAN_CAPITAL), icon=":material/error:")
 
     # Cleared trades first, then the ones that got a direction and were
     # blocked - the second group is the useful half, since the gates are
@@ -1382,10 +1426,12 @@ def render_published_scan() -> bool:
     if "first_seen_at" in show.columns:
         st.caption(
             "**first_seen_at** is when the symbol first showed this "
-            "direction today and **cleared_at** when it first passed every "
-            "gate - both first-wins, so a setup that cleared at 10:42 and "
-            "failed later still reads 10:42, because that is when it would "
-            "have been acted on.\n\n"
+            "direction today and **cleared_at** when it was first "
+            "actionable - every gate passed AND inside the combined risk "
+            "cap, so a setup the cap held back has not cleared. Both are "
+            "first-wins, so a setup that cleared at 10:42 and failed later "
+            "still reads 10:42, because that is when it would have been "
+            "acted on.\n\n"
             "**held_min** is how many minutes ago it cleared. A large "
             "number is a warning, not a recommendation: on the 14:35 "
             "snapshot of 2026-09-22 the median setup on screen had "
@@ -1411,6 +1457,22 @@ def render_published_scan() -> bool:
             f"restate exit_by. A real one has to come from resolved "
             f"outcomes, and none has reached a target yet."
         )
+
+    # THE SAME BLOCK AS THE LOCAL SCAN, built from the published columns,
+    # and the streak table with it. Shown when anything is actionable, as
+    # the local path does; the all-blocked case is the error above.
+    if actionable:
+        notes = []
+        if published.uncharged:
+            notes.append(f"{published.uncharged} actionable row(s) carry no "
+                         f"charges column, so the total counts their price "
+                         f"risk only and UNDERSTATES the loss.")
+        if published.unpriced:
+            notes.append(f"{published.unpriced} actionable row(s) carry no "
+                         f"entry, stop or quantity and are left out of the "
+                         f"total.")
+        render_combined_risk(published.exposure, list(published.held),
+                             state=cap_state, note=" ".join(notes))
 
     with st.expander("Why each one passed or was blocked"):
         reasons = show[["symbol", "direction", "reasons"]] \
@@ -1621,16 +1683,40 @@ def run_scan(scope: str, as_of: "datetime | None" = None):
             evaluated.append(setups.evaluate(
                 reading, capital=config.SCAN_CAPITAL,
                 risk_pct=config.SCAN_RISK_PCT_PER_TRADE))
-    return setups.rank(evaluated), bars, benchmark, now, replaying
+    # The combined cap is applied HERE, where the ranking is produced, so
+    # everything downstream - the table, the counts, the position watch -
+    # sees the same actionable set the CLI and the published feed do.
+    ranked = setups.apply_portfolio_caps(setups.rank(evaluated),
+                                         capital=config.SCAN_CAPITAL)
+    return ranked, bars, benchmark, now, replaying
 
 
 def render_scan_option_picks(actionable: list[setups.Setup]) -> None:
-    """Show the tradeable contract, if any, for each actionable setup."""
+    """Show the tradeable contract, if any, for each actionable setup.
+
+    Sized, not quoted per lot: a bought option can expire worthless, so
+    its whole premium plus charges is the loss, and the lot count is what
+    fits the same per-trade budget the shares are held to. When not one
+    lot fits, the panel says so and suggests nothing.
+    """
+    # levels.risk_budget, the one place the budget is computed, so the
+    # caption cannot state a figure pick_contract does not size against.
+    # It returns 0.0 above the ceiling, and the caption says so rather
+    # than advertising a zero-rupee budget.
+    budget = levels_mod.risk_budget(config.SCAN_CAPITAL,
+                                    config.SCAN_RISK_PCT_PER_TRADE)
+    sizing = (f"Each contract is sized so the whole premium plus charges - "
+              f"what is lost if it expires worthless - fits the "
+              f"Rs {budget:,.0f} per-trade budget." if budget > 0.0 else
+              f"No per-trade budget: "
+              f"{config.SCAN_RISK_PCT_PER_TRADE:g}% is above the "
+              f"{config.SCAN_MAX_RISK_PCT:g}% ceiling, so no contract can "
+              f"be sized.")
     st.subheader("Option contracts")
     st.caption(
         "Direction comes from the equity setup above. All that is assessed "
         "here is whether a contract is liquid and cheap enough to express it. "
-        "Buying only - selling naked options is never proposed."
+        f"Buying only - selling naked options is never proposed. {sizing}"
     )
     discovered = instruments.load_latest()
     lot_sizes = ({inst.symbol: inst.lot_size or 0
@@ -1659,9 +1745,15 @@ def render_scan_option_picks(actionable: list[setups.Setup]) -> None:
                     f"{metrics.atm_call_iv:.1f} / put {metrics.atm_put_iv:.1f}"
                     + (f" | PCR {pcr:.2f}" if pcr is not None else "")
                 )
-            contract, reasons = options_chain.pick_contract(
-                contracts, spot, setup.direction, lot_size)
-            if contract is None:
+            pick = options_chain.pick_contract(
+                contracts, spot, setup.direction, lot_size,
+                capital=config.SCAN_CAPITAL,
+                risk_pct=config.SCAN_RISK_PCT_PER_TRADE)
+            contract, reasons = pick.contract, pick.reasons
+            if contract is None and pick.refused_by_budget:
+                st.error(f"**No contract fits the risk budget, so nothing is "
+                         f"suggested.** {reasons[0]}")
+            elif contract is None:
                 st.warning(f"No tradeable contract: {reasons[0]}")
             else:
                 side = "CALL" if setup.direction == LONG else "PUT"
@@ -1669,8 +1761,7 @@ def render_scan_option_picks(actionable: list[setups.Setup]) -> None:
                     setup.symbol, expiry, contract.strike, side)
                 name = exact or (f"{setup.symbol} {expiry} "
                                  f"{contract.strike:,.0f} {side}")
-                outlay = contract.mid * lot_size
-                st.success(f"BUY  **{name}**")
+                st.success(f"BUY {pick.lots} lot(s) of **{name}**")
                 if exact is None:
                     st.warning(
                         "Could not confirm this contract in Kite's "
@@ -1679,18 +1770,25 @@ def render_scan_option_picks(actionable: list[setups.Setup]) -> None:
                     )
                 st.write(
                     f"{setup.symbol} | expiry {expiry} | strike "
-                    f"{contract.strike:,.0f} | {side} | lot {lot_size:,}"
+                    f"{contract.strike:,.0f} | {side} | {pick.lots} lot(s) "
+                    f"x {lot_size:,} = {pick.quantity:,} options"
                 )
+                # THE TOTAL AT RISK, not a per-lot price. "Rs X per lot"
+                # read as the suggested outlay whatever it was against the
+                # budget; this is the loss if the option expires worthless.
                 st.write(
                     f"mid {contract.mid:.2f} (bid {contract.bid:.2f} / ask "
-                    f"{contract.ask:.2f}) -> **Rs {outlay:,.0f} per lot**"
+                    f"{contract.ask:.2f}) -> **Rs {pick.total_at_risk:,.0f} "
+                    f"at risk** (Rs {pick.premium_outlay:,.0f} premium + "
+                    f"Rs {pick.charges:,.0f} charges) of a Rs "
+                    f"{pick.budget:,.0f} budget"
                 )
                 # The cost arithmetic, which is the part of this tool that
                 # held up under measurement. Shown here rather than left
                 # for the user to work out.
                 if contract.mid > 0 and lot_size > 0:
                     breakeven = trade_costs.options_breakeven_pct(
-                        contract.mid, 1, lot_size)
+                        contract.mid, pick.lots, lot_size)
                     recover = contract.mid * (1 + breakeven / 100.0)
                     needed = (contract.strike + recover
                               if side == "CALL"
@@ -1747,6 +1845,168 @@ def render_recent_filings(symbol: str, as_of=None) -> None:
         st.caption(f":material/campaign: {note}")
 
 
+@st.cache_data(show_spinner=False, max_entries=4)
+def cached_streak_table(risk_pct: float) -> survival.StreakTable:
+    """survival.streak_table, computed once per risk level.
+
+    Deterministic (the Monte Carlo is seeded) and about a tenth of a
+    second, which is too slow to repeat on every auto-refresh tick for a
+    table that cannot change between them. Keyed on one config value, so
+    the cap of four is hygiene rather than a bound that will ever bind.
+    """
+    return survival.streak_table(risk_pct)
+
+
+def render_survival_table(risk_pct: float) -> None:
+    """Losing streaks and drawdowns at this risk per trade, in an expander.
+
+    Context for the combined-risk line above it, not a forecast: the win
+    rate is the break-even rate of the configured geometry, because a rule
+    with no measured edge is what this scanner is.
+    """
+    try:
+        table = cached_streak_table(float(risk_pct))
+    except (ValueError, ArithmeticError) as exc:
+        logger.warning("Losing-streak table unavailable: %s", exc)
+        return
+    with st.expander(f"Losing streaks at {table.risk_pct:g}% risk per trade"):
+        st.caption(
+            f"Over {table.trades} trades at a {table.win_rate * 100:.1f}% "
+            f"win rate - {table.win_rate_label}. Each full loss costs "
+            f"{table.risk_pct:g}% of the capital, charges included, so "
+            f"losses add up in a straight line, and every loss needs a "
+            f"larger gain to recover.")
+        # Tooltips supplied here rather than through glossary.config_for:
+        # these headers exist only in this expander, and each says what
+        # the number means for the decision in one sentence.
+        columns = ("Losses in a row", "Drawdown", "Gain to recover",
+                   f"Chance in {table.trades} trades")
+        helps = (
+            "Consecutive trades that each hit the stop.",
+            "Share of the capital those losses cost, charges included.",
+            "Gain the remaining capital needs just to get back to the "
+            "start: drawdown / (1 - drawdown).",
+            f"Exact probability of at least one run this long within "
+            f"{table.trades} independent trades at this win rate.",
+        )
+        rows = [(row.streak, survival.format_percent(row.drawdown),
+                 survival.format_percent(row.recovery),
+                 survival.format_percent(row.probability))
+                for row in table.rows]
+        st.dataframe(
+            pd.DataFrame(rows, columns=list(columns)), hide_index=True,
+            width="stretch",
+            column_config={name: st.column_config.Column(help=text)
+                           for name, text in zip(columns, helps, strict=True)})
+        st.caption(
+            f"Chance of a {table.ruin_drawdown * 100:.0f}% fall from peak "
+            f"within {table.trades} trades: "
+            f"**{survival.format_percent(table.prob_ruin_drawdown)}**. "
+            f"Streak chances are exact; the fall from peak is simulated "
+            f"with a fixed seed, and treats trades as independent - real "
+            f"losers cluster, so both are if anything optimistic.")
+
+
+# How far a combined-risk figure is the cap's own doing. The local scan
+# applies the cap itself; a table the feed published can only be CHECKED
+# against it, because the feed and this page deploy separately and a feed
+# still running code from before the cap publishes an uncapped table.
+CAP_ENFORCED = "enforced"          # applied here, or cap lines in the table
+CAP_UNCONFIRMED = "unconfirmed"    # inside the cap; nothing shows it applied
+CAP_EXCEEDED = "exceeded"          # the published table breaches the cap
+
+
+def published_cap_state(published: setups.PublishedExposure) -> str:
+    """Which of the three CAP_ states a published table is in.
+
+    EXCEEDED wins: a table past the cap proves the feed did not hold it,
+    whatever else it carries. A cap line in any row proves the feed's
+    code has the cap. Neither leaves only "inside the cap", which a feed
+    predating the cap produces too whenever the total happens to fit - so
+    that state claims no more than the arithmetic shows.
+    """
+    if published.over_cap:
+        return CAP_EXCEEDED
+    if published.cap_seen:
+        return CAP_ENFORCED
+    return CAP_UNCONFIRMED
+
+
+def render_cap_config_problem() -> bool:
+    """An error when the configured caps cannot hold one trade. True if shown.
+
+    See setups.cap_config_problem: a cap below the per-trade risk, or an
+    unusable one, fails closed on every setup, and the empty table it
+    leaves looks exactly like a quiet market unless something says why.
+    """
+    problem = setups.cap_config_problem()
+    if not problem:
+        return False
+    st.error(f"**The combined risk cap in this app's config cannot hold "
+             f"one full-size trade:** {problem}. A scan run with it comes "
+             f"back empty or short, and that is this fault, not a quiet "
+             f"market.", icon=":material/error:")
+    return True
+
+
+def render_combined_risk(exposure: setups.PortfolioExposure, held: list,
+                         state: str = CAP_ENFORCED, note: str = "") -> None:
+    """The combined-risk block and the streak table, from plain figures.
+
+    SHARED BY BOTH SCAN PATHS, which is why it takes numbers rather than
+    Setup objects. The local scan passes setups.portfolio_exposure of its
+    capped ranking; the feed's view - the main live path - passes the
+    totals setups.published_exposure rebuilds from the published table.
+    Before, only the local path had this block, and the feed's view
+    merely relabelled a metric.
+
+    `held` names the setups a cap turned away, in rank order. `state` is
+    one of the CAP_ constants and decides what the block may claim:
+    ENFORCED says the cap was applied; UNCONFIRMED says only that the
+    total is inside it; EXCEEDED says the published table breaches it,
+    so the feed runs code older than the cap. `note` is appended as is,
+    for caveats about the figures themselves.
+    """
+    heading = {
+        CAP_ENFORCED: "**Combined risk (enforced):**",
+        CAP_UNCONFIRMED: "**Combined risk (inside the cap):**",
+        CAP_EXCEEDED: "**Combined risk - NOT capped by the feed:**",
+    }.get(state, "**Combined risk:**")
+    text = (
+        f"{heading} the {exposure.kept} actionable setup(s) lose "
+        f"Rs {exposure.risk_used:,.0f} if every one stops out, charges "
+        f"included - {exposure.risk_used_pct_of_cap:.0f}% of the "
+        f"Rs {exposure.risk_cap:,.0f} cap "
+        f"({config.SCAN_MAX_OPEN_RISK_PCT:g}% of "
+        f"Rs {config.SCAN_CAPITAL:,.0f}), on Rs "
+        f"{exposure.notional_used:,.0f} of notional against a Rs "
+        f"{exposure.notional_cap:,.0f} funding cap.")
+    if state == CAP_EXCEEDED:
+        text += (" That is beyond the cap, so the feed is running code "
+                 "older than the combined cap and its 'actionable' is not "
+                 "held inside it. Take setups in rank order and stop "
+                 f"before the total passes Rs {exposure.risk_cap:,.0f}.")
+    elif state == CAP_UNCONFIRMED:
+        text += (" No published row carries a cap line, so this table "
+                 "cannot show whether the feed applies the cap or the cap "
+                 "simply did not bind; the total is inside it either way.")
+    if held:
+        shown = ", ".join(str(s) for s in held[:8])
+        shown += " ..." if len(held) > 8 else ""
+        text += (f" **{len(held)} more cleared every gate but were held "
+                 f"back because the cap was full** (in rank order): "
+                 f"{shown}.")
+    if note:
+        text += f" {note}"
+    text += (" The cap covers this scan only - it cannot see positions "
+             "already entered, so subtract those yourself.")
+    if state == CAP_EXCEEDED:
+        st.error(text)
+    else:
+        (st.warning if held else st.info)(text)
+    render_survival_table(config.SCAN_RISK_PCT_PER_TRADE)
+
+
 def render_scan_results(ranked: list[setups.Setup], bars: scan_data.BarSet,
                         benchmark, now: datetime, want_options: bool,
                         replaying: bool = False,
@@ -1758,7 +2018,12 @@ def render_scan_results(ranked: list[setups.Setup], bars: scan_data.BarSet,
     left, mid, right = st.columns(3)
     left.metric("Symbols with bars", f"{bars.covered}/{bars.requested}")
     mid.metric("Got a direction", f"{len(actionable) + len(directional)}")
-    right.metric("Cleared every gate", f"{len(actionable)}")
+    # Relabelled with the combined cap: a setup the cap held back DID
+    # clear every gate, so "cleared every gate" undercounted it silently.
+    right.metric("Actionable (inside the cap)", f"{len(actionable)}",
+                 help="Cleared every gate AND fits inside the combined risk "
+                      "cap for this scan. Setups the cap held back are "
+                      "named under Combined risk below.")
     nifty = (f" | Nifty {benchmark:+.2f}% today" if benchmark is not None
              else " | today's Nifty move is unavailable, so the "
                   "compare-to-the-market check refuses to pass")
@@ -1798,6 +2063,11 @@ def render_scan_results(ranked: list[setups.Setup], bars: scan_data.BarSet,
                 "Check the live feed is subscribed to this universe."
             )
 
+    held = [s.symbol for s in ranked if setups.capped_by_portfolio(s)]
+    # The misconfiguration banner, unless the empty-result message below
+    # is about to name the same cause with the cap's figures beside it.
+    if actionable or not held:
+        render_cap_config_problem()
     if not actionable:
         premature = [s for s in ranked if not s.readings.range_closed]
         if not bars.intraday or bars.covered == 0:
@@ -1823,6 +2093,16 @@ def render_scan_results(ranked: list[setups.Setup], bars: scan_data.BarSet,
                 f"reading of the market: the same empty result would appear "
                 f"on the sharpest gap-up morning on record."
             )
+        elif held:
+            # NOT A QUIET MARKET. Setups cleared every gate and a cap
+            # turned away every one, which a working cap never does - it
+            # always keeps the top setup. The "expected answer" message
+            # below would hide a misconfigured cap behind the most
+            # ordinary sentence on the page.
+            st.error(setups.cap_blocked_all_text(
+                len(held), setups.closing_cap(ranked),
+                risk_pct=config.SCAN_RISK_PCT_PER_TRADE,
+                capital=config.SCAN_CAPITAL), icon=":material/error:")
         else:
             st.info(
                 "Nothing passed every check. On most days that is the "
@@ -1841,18 +2121,9 @@ def render_scan_results(ranked: list[setups.Setup], bars: scan_data.BarSet,
         show_terms("How a stop and target are set",
                    "Why charges matter so much",
                    "What 'volume vs normal' tells you")
-        # Each setup is sized to a fraction of capital on its own. Taken
-        # together they are not, and nothing said so: sixteen setups on one
-        # session came to 16x the assumed capital in notional.
-        total_risk = sum(s.levels.lot_risk for s in actionable)
-        total_notional = sum(s.levels.entry * s.levels.quantity
-                             for s in actionable)
-        st.warning(
-            f"**Aggregate exposure:** taking all {len(actionable)} risks "
-            f"{total_risk:,.0f} rupees across {total_notional:,.0f} of "
-            f"notional. Each row is sized independently against its own "
-            f"stop, so the per-trade cap does not bound the total."
-        )
+        render_combined_risk(
+            setups.portfolio_exposure(ranked, capital=config.SCAN_CAPITAL),
+            held)
         best = actionable[0]
         st.markdown(f"**Top setup: {best.symbol} {best.direction}**")
         st.write(setups.explain(best))

@@ -320,6 +320,7 @@ def run_once(symbols: list, history: dict, today: dict, daily: dict,
             logger.debug("%s could not be evaluated: %s", symbol, exc)
 
     ranked = setups.rank(evaluated)
+    ranked = setups.apply_portfolio_caps(ranked)
     rows = [row_for(setup, now) for setup in ranked]
     table = pd.DataFrame(rows)
     if not table.empty:
@@ -438,7 +439,15 @@ def stamp_first_seen(table, when: "datetime | None" = None):
 
     Two stamps, because they answer different questions:
       first_seen_at - when the symbol first showed this direction
-      cleared_at    - when it first passed every gate, or blank if never
+      cleared_at    - when it was first ACTIONABLE, or blank if never
+
+    ACTIONABLE NOW MEANS INSIDE THE COMBINED CAP. run_once passes the
+    ranking through setups.apply_portfolio_caps before the rows are built,
+    so a setup that passed every gate but was held back by the cap is not
+    actionable and does not stamp cleared_at. The stamp therefore reads
+    "first passed every gate while inside the combined risk cap", not
+    "first passed every gate"; stamps written before the cap existed
+    meant the latter.
 
     First wins for both, and `cleared_at` is never overwritten by a later
     block: the moment it qualified is the moment it would have been acted
@@ -521,6 +530,170 @@ def _missing(value) -> bool:
     return value is None or value != value
 
 
+# --- the scan window -----------------------------------------------------
+
+# What loop() logs while it idles because no symbol other than the
+# benchmark has a bar from today's session in hand. A constant so the
+# idle state is ONE state, logged once, rather than a fresh message every
+# tick.
+NO_SESSION_BARS = ("no symbol has a bar stamped today in the stream or the "
+                   "seed - a holiday, or a feed that has not yet closed a "
+                   "bar")
+
+
+def window_bounds() -> tuple:
+    """The first scannable minute and the session close, as IST times.
+
+    The first minute is the opening range's close, not the bell: before
+    SCAN_OPENING_RANGE_MINUTES have elapsed the latest bar is one of the
+    bars defining the range, so the range brackets the price by
+    construction and no breakout can be represented. app._session_bounds
+    offers a replay the same first minute for the same reason.
+    """
+    from datetime import time as clock
+
+    open_hour, open_minute = config.SCAN_SESSION_OPEN
+    first = open_hour * 60 + open_minute + config.SCAN_OPENING_RANGE_MINUTES
+    close_hour, close_minute = config.SCAN_SESSION_CLOSE
+    return clock(first // 60, first % 60), clock(close_hour, close_minute)
+
+
+def scan_window(now: datetime) -> "tuple[bool, str]":
+    """Whether a scan at `now` can measure today's session, and why not.
+
+    THE BUG THIS CLOSES. loop() scanned on a timer with no clock check,
+    and setups.measure falls back to the last session it holds - so a
+    scan before the open measured YESTERDAY's bars and row_for stamped
+    them with TODAY's run_date. Measured 2026-09-24: 2,350 of the 9,800
+    resolved outcomes carry a run_time before 09:30 (06:37, 08:08,
+    09:21), and all 2,485 rows of scan_log_20260924.csv are stamped
+    00:00-06:48. remember() kept each as the first sighting, adoption
+    carried it across restarts, and outcomes.py scored yesterday's levels
+    against today's bars.
+
+    OPEN on a weekday from the opening range's close (see window_bounds)
+    up to but not including the session close. At the close the session
+    is over and nothing a scan finds can be traded.
+
+    REUSES live_bars.in_session for the close and the weekend, so the
+    feed's bar gate and this cannot disagree about trading hours. The
+    weekend is also checked here only to name it in the reason. Like
+    in_session this knows nothing of exchange HOLIDAYS; loop() covers
+    those by refusing to scan without bars stamped today.
+
+    A NAIVE CLOCK IS CLOSED, not assumed IST. Read as exchange-local, a
+    naive UTC clock would open this window at 15:00 IST and hold it open
+    until 21:00 - six hours of scanning a finished session. Closed is the
+    direction that cannot publish anything stale.
+
+    `now` is required, never defaulted, so a test freezes time by passing
+    it. The reasons are fixed strings per state, so loop() can log a
+    change of state once instead of logging every tick.
+    """
+    import live_bars
+
+    if now.tzinfo is None:
+        return False, "the clock carries no timezone"
+    local = now.astimezone(IST)
+    first, close = window_bounds()
+    if local.weekday() >= 5:
+        return False, "no session on a weekend"
+    if local.time() < first:
+        return False, f"before the opening range closes at {first:%H:%M}"
+    if not live_bars.in_session(local):
+        return False, f"the session closed at {close:%H:%M}"
+    return True, f"inside the scan window {first:%H:%M}-{close:%H:%M}"
+
+
+def scan_instant(row) -> "datetime | None":
+    """When a published or logged row was scanned, in IST, or None.
+
+    READ FROM THE ROW'S OWN run_date AND run_time, not from the clock of
+    whoever is holding it, because those two columns are what outcomes.py
+    resolves from and calibrate judges - a guard on anything else could
+    pass a row stamped 06:37. Both writers stamp HH:MM:SS; HH:MM is also
+    read, because hand-written rows and older fixtures carry it. None for
+    anything else, including the NaN a DataFrame gives a missing cell.
+    """
+    day = str(row.get("run_date") or "").strip()
+    clock = str(row.get("run_time") or "").strip()
+    for layout in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.strptime(f"{day} {clock}",
+                                     layout).replace(tzinfo=IST)
+        except ValueError:
+            continue
+    return None
+
+
+def in_scan_window(row) -> bool:
+    """Whether a row's own scan instant is inside the scan window.
+
+    FAILS CLOSED: a row whose instant cannot be read is outside, because
+    it cannot be shown to be inside. Shared by remember(), log_row() and
+    calibrate, so the feed and the report agree on what a valid row is.
+    """
+    when = scan_instant(row)
+    return when is not None and scan_window(when)[0]
+
+
+def _stamped_on(frame, day) -> bool:
+    """Whether a per-symbol bar frame holds a bar on `day` (IST)."""
+    import pandas as pd
+
+    if frame is None or getattr(frame, "empty", True):
+        return False
+    try:
+        last = pd.Timestamp(frame.index.max())
+    except (TypeError, ValueError):
+        return False
+    if last is pd.NaT:
+        return False
+    last = (last.tz_localize(IST) if last.tzinfo is None
+            else last.tz_convert(IST))
+    return last.date() == day
+
+
+def session_symbols(symbols: list, today: dict, seed: "dict | None",
+                    now: datetime) -> list:
+    """The symbols holding at least one bar stamped with `now`'s date.
+
+    THE SECOND HALF OF THE GUARD. scan_window reads the clock and not the
+    exchange calendar, so on a trading holiday it is open all day while
+    the feed receives nothing - and setups.measure, handed only prior
+    sessions, measures the last one it finds. The same failure as the
+    pre-open scans, reached through the calendar instead of the clock.
+    It also covers a feed process that outlived its session: BarBuilder
+    never clears, so its snapshot can hold only yesterday's bars.
+
+    PER SYMBOL, NOT PER SESSION. The fallback is per frame, so one symbol
+    with a bar today does not make another symbol's frame current. An
+    earlier draft asked "does ANY frame have a bar today" and then scanned
+    everything - so after a restart at 11:00, every symbol the seeder had
+    not reached yet was measured on the previous session and stamped with
+    today's date, and so was any name that simply had not traded yet.
+
+    CHECKED ON THE SPLIT FRAMES, not the raw snapshot. frames_from drops
+    partial bars, and a feed that joined mid-bucket has only partial bars
+    for its first minutes - rows the raw snapshot holds and the scan never
+    sees. The split is computed for the scan anyway, so this costs one
+    index lookup per symbol.
+
+    THE SEED COUNTS. A feed restarted at 11:00 closes its first bar at
+    11:03, while seed_session has already fetched 09:15 onwards from Kite
+    - that is today's session, and scanning it is what the seed is for.
+    Each frame is dated by its own last bar rather than trusted for being
+    non-empty, so a fetch that returned the prior session cannot pass.
+    The seeder thread fills `seed` while this runs; a single get() per key
+    is safe against that, where iterating the dict would not be.
+    """
+    day = now.astimezone(IST).date()
+    seed = seed or {}
+    return [symbol for symbol in symbols
+            if _stamped_on(today.get(symbol), day)
+            or _stamped_on(seed.get(symbol), day)]
+
+
 def log_row(published: dict) -> dict:
     """One published scan row, reshaped into a scan_log row.
 
@@ -530,7 +703,20 @@ def log_row(published: dict) -> dict:
     `risk_rupees` is quantity times the stop distance, which is how
     levels.build_levels computes lot_risk in the first place, and
     `blocked_by` is the first failing gate out of the audit trail.
+
+    RAISES ValueError FOR A ROW SCANNED OUTSIDE THE SCAN WINDOW. There is
+    no valid scan_log row to return for it: before the window its levels
+    came from the previous session's bars, after it there is no session
+    left to trade (see scan_window), and a None or an empty dict would
+    travel on to whatever the caller does next. remember() filters first
+    and never reaches this; it exists so a caller that skips the filter
+    fails loudly instead of logging a stale setup.
     """
+    if not in_scan_window(published):
+        raise ValueError(
+            f"refusing to log {published.get('symbol')!r} scanned at "
+            f"{published.get('run_date')} {published.get('run_time')}: "
+            f"outside the scan window")
     quantity = published.get("quantity")
     entry = published.get("entry")
     stop = published.get("stop")
@@ -615,12 +801,27 @@ def remember(table, when: "datetime | None" = None) -> int:
     replaces a blocked one, and among actionable ones the first wins.
     Among blocked ones the first also wins, which keeps the earliest
     evidence of why it never qualified.
+
+    NOTHING SCANNED OUTSIDE THE SCAN WINDOW IS RECORDED, judged on each
+    row's own run_date and run_time (see scan_instant), not on `when`: a
+    table scanned at 15:20 and logged at 15:31 is valid, one scanned at
+    06:37 is not whenever it is logged. loop() no longer scans outside the
+    window; this is the second wall, so no caller can put a stale pre-open
+    row into the log. The first-sighting rule is exactly what made those
+    rows stick - a 06:37 row blocked every later, valid sighting of the
+    same setup that day.
+
+    ADOPTED ROWS ARE HELD TO THE SAME RULE. A log published before this
+    guard existed can be full of them - all 2,485 rows of
+    scan_log_20260924.csv are stamped before 06:49 - and adopting it on a
+    restart would republish every one and hand them to outcomes.py again.
     """
     global _SESSION_LOG_DAY
 
     if table is None or getattr(table, "empty", True):
         return 0
     now = when or datetime.now(IST)
+    refused = 0
     with _LOG_LOCK:
         if _SESSION_LOG_DAY != now.date():
             _SESSION_LOG.clear()
@@ -629,19 +830,35 @@ def remember(table, when: "datetime | None" = None) -> int:
             # and it costs one missing read - and on a RESTART mid-session,
             # where without it the next publish overwrites the whole
             # morning with whatever this process has seen so far.
-            _SESSION_LOG.update(adopt_published_log(now))
+            adopted = adopt_published_log(now)
+            kept = {key: row for key, row in adopted.items()
+                    if in_scan_window(row)}
+            if len(kept) < len(adopted):
+                logger.warning("Dropped %d adopted scan-log rows stamped "
+                               "outside the scan window; a scan there "
+                               "measures the wrong session, so they will "
+                               "not be republished", len(adopted) - len(kept))
+            _SESSION_LOG.update(kept)
             _SESSION_LOG_DAY = now.date()
         for published in table.to_dict("records"):
             # NaN, not just None - see _missing. A NO SETUP row reaches
             # here with entry NaN, which `is None` reads as present.
             if _missing(published.get("entry")):
                 continue          # no levels, so nothing to resolve against
+            if not in_scan_window(published):
+                refused += 1
+                continue
             key = (published.get("symbol"), published.get("direction"))
             row = log_row(published)
             held = _SESSION_LOG.get(key)
             if held is None or (row["taken"] and not held["taken"]):
                 _SESSION_LOG[key] = row
-        return len(_SESSION_LOG)
+        held_count = len(_SESSION_LOG)
+    if refused:
+        logger.warning("Refused %d scan-log rows stamped outside the scan "
+                       "window; a scan there measures the wrong session",
+                       refused)
+    return held_count
 
 
 def publish_log(when: "datetime | None" = None) -> int:
@@ -665,6 +882,80 @@ def publish_log(when: "datetime | None" = None) -> int:
     return len(rows)
 
 
+def _iteration(builder, symbols: list, history: dict, tokens: dict,
+               daily: dict, seed: "dict | None",
+               now: datetime) -> "str | None":
+    """One pass of the loop at `now`. Returns why it idled, or None.
+
+    SPLIT OUT OF loop() so the window is testable with a frozen clock:
+    loop() reads the wall clock and the stop event and nothing else, and
+    everything that decides whether a scan happens is in here with `now`
+    passed in. The same `now` stamps the table, the publish and the log,
+    so they cannot straddle a midnight or a window edge between them.
+
+    IDLING MEANS NOTHING AT ALL - no scan, no publish, no log. A table
+    published from a closed window is exactly what the UI must never read
+    as current, and a logged row from one is what outcomes.py scored
+    against the wrong session. Two reasons to idle, checked cheapest
+    first: the clock (scan_window), which costs no snapshot at all, then
+    whether any symbol other than the benchmark has a bar stamped today.
+
+    ONLY THOSE SYMBOLS ARE SCANNED (see session_symbols). A symbol with no
+    bar today is left out of the table rather than measured on the last
+    session it holds. The benchmark follows the same rule and loses
+    nothing by it: benchmark_change_pct is pinned to the clock's day and
+    returns None for a benchmark without a bar today either way.
+
+    Raises only if scan_window or the live_bars import does; the scan and
+    the log each keep their own handler, as before.
+    """
+    import live_bars
+
+    is_open, reason = scan_window(now)
+    if not is_open:
+        return reason
+    # EXCHANGE TIME FROM HERE ON. scan_window accepts any aware clock, but
+    # row_for stamps run_date and run_time from now's own digits - a UTC
+    # 04:00 would publish "04:00:00" and remember() would then refuse every
+    # row as pre-open. loop() passes IST today; this keeps that true for
+    # any other caller.
+    now = now.astimezone(IST)
+    started = time.monotonic()
+    try:
+        frame = builder.snapshot()
+        today = live_bars.frames_from(frame, tokens)
+        fresh = session_symbols(symbols, today, seed, now)
+        if not any(symbol != config.SCAN_BENCHMARK for symbol in fresh):
+            return NO_SESSION_BARS
+        table, assembled = run_once(fresh, history, today, daily,
+                                    seed=seed, now=now)
+        # BEFORE the publish, so the table the UI reads carries the
+        # stamps. It is also what remember() logs, so the scan log and
+        # the published table agree on when a setup arrived.
+        table = stamp_first_seen(table, now)
+        rows = publish(table, now)
+        logger.info("scan: %d setups from %d symbols in %.1fs; %d held "
+                    "back with no bar stamped today", rows, assembled,
+                    time.monotonic() - started, len(symbols) - len(fresh))
+    except Exception as exc:
+        logger.warning("scan failed (%.1fs): %s",
+                       time.monotonic() - started, exc)
+        return None
+    # SEPARATE FROM THE SCAN, and after it. The published table is what
+    # the UI reads and must not be delayed or lost because the log
+    # failed; the log is a record, and a record is worth less than the
+    # thing it records. Its own handler for the same reason.
+    try:
+        held = remember(table, now)
+        written = publish_log(now)
+        if written:
+            logger.info("scan log: %d distinct setups held, %d written",
+                        held, written)
+    except Exception as exc:
+        logger.warning("could not record the scan log: %s", exc)
+    return None
+
+
 def loop(builder, symbols: list, history: dict, tokens: dict, daily: dict,
          stop: threading.Event, every: int = DEFAULT_EVERY,
          seed: "dict | None" = None) -> None:
@@ -673,38 +964,33 @@ def loop(builder, symbols: list, history: dict, tokens: dict, daily: dict,
     NEVER RAISES OUT. This runs beside the tick stream, and a scan that
     fails must not take the feed down with it - the feed's job is the
     socket, and bars still being written is worth more than a table.
-    """
-    import live_bars
 
+    ONLY INSIDE THE SCAN WINDOW, and only with bars stamped today. It used
+    to scan on the timer alone, and a pre-open scan republished the prior
+    session's bars under today's date - see scan_window. Outside, each
+    tick does nothing (see _iteration).
+
+    THE IDLE STATE IS LOGGED ONCE PER CHANGE, not once per tick. A feed
+    started at 06:00 would otherwise print the same line 420 times
+    before the window opens, and bury the one line that matters - the
+    moment scanning actually starts or stops.
+    """
     logger.info("Scan loop every %ds over %d symbols", every, len(symbols))
+    idle = None                       # None means "scanning"
     while not stop.wait(every):
-        started = time.monotonic()
         try:
-            frame = builder.snapshot()
-            today = live_bars.frames_from(frame, tokens)
-            now = datetime.now(IST)
-            table, assembled = run_once(symbols, history, today, daily,
-                                        seed=seed, now=now)
-            # BEFORE the publish, so the table the UI reads carries the
-            # stamps. It is also what remember() logs, so the scan log and
-            # the published table agree on when a setup arrived.
-            table = stamp_first_seen(table, now)
-            rows = publish(table)
-            logger.info("scan: %d setups from %d symbols in %.1fs",
-                        rows, assembled, time.monotonic() - started)
+            reason = _iteration(builder, symbols, history, tokens, daily,
+                                seed, datetime.now(IST))
         except Exception as exc:
-            logger.warning("scan failed (%.1fs): %s",
-                           time.monotonic() - started, exc)
+            # Only scan_window sits outside _iteration's own handlers, and
+            # it has no reason to raise - but see NEVER RAISES OUT.
+            logger.warning("scan loop iteration failed: %s", exc)
             continue
-        # SEPARATE FROM THE SCAN, and after it. The published table is what
-        # the UI reads and must not be delayed or lost because the log
-        # failed; the log is a record, and a record is worth less than the
-        # thing it records. Its own handler for the same reason.
-        try:
-            held = remember(table)
-            written = publish_log()
-            if written:
-                logger.info("scan log: %d distinct setups held, %d written",
-                            held, written)
-        except Exception as exc:
-            logger.warning("could not record the scan log: %s", exc)
+        if reason == idle:
+            continue
+        if reason is not None:
+            logger.info("scan loop idle - nothing scanned, published or "
+                        "logged: %s", reason)
+        else:
+            logger.info("scan loop resuming: %s no longer applies", idle)
+        idle = reason

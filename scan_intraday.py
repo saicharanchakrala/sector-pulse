@@ -1,18 +1,24 @@
 """Intraday scanner CLI: python scan_intraday.py [--options] [--top N].
 
 Ranks the F&O universe by a transparent intraday rule and prints, for every
-setup that clears each gate, an entry, a stop, a target and a size. With
---options it also picks the near-the-money contract that is actually
-tradeable for the top names.
+setup that clears each gate, an entry, a stop, a target and a size. The
+size holds the loss at the stop, charges included, inside the per-trade
+budget, and the setups marked actionable are held inside a combined risk
+cap for the scan. With --options it also picks the near-the-money contract
+that is actually tradeable for the top names, sized so its whole premium
+fits the same per-trade budget.
 
 Read this before using it:
 
-  * This rule has now been measured, and it has no directional edge. On
-    56,825 Kite signals across 210 names and 248 sessions it performed the
-    same as a coin flip taken at the same instants - best excess 0.0015 R
-    per trade before costs, -0.034 R after them. The gates and weights are
-    conventional technical-analysis choices, and measuring them did not turn
-    them into an edge. The scan reports what it measured and stops there.
+  * This rule has now been measured, and it has no directional edge. Its
+    structural core - VWAP side plus opening-range break - was run over a
+    year of cached bars (`python -m edge_lab`: 54,397 signals, 229
+    sessions, 210 names), and its edge over a coin tossed for direction at
+    the same bars lies between -0.003 and +0.003 R in every stop/target
+    cell; after costs every cell loses. The gates and weights on top are
+    conventional technical-analysis choices, and measuring them did not
+    turn them into an edge. The scan reports what it measured and stops
+    there.
   * Bars are live, but a bar is not a fill. Levels come from the last
     completed Kite candle, so the entry price is the last print rather than
     an executable quote, and slippage is not modelled beyond the cost stack.
@@ -33,9 +39,11 @@ from zoneinfo import ZoneInfo
 
 import config
 import instruments
+import levels
 import options_chain
 import scan_data
 import setups
+import survival
 from levels import LONG
 
 logger = logging.getLogger("scan_intraday")
@@ -93,7 +101,9 @@ def _parse_args(argv: "list[str] | None" = None) -> argparse.Namespace:
                         help="intraday capital the sizer assumes")
     parser.add_argument("--risk-pct", type=float,
                         default=config.SCAN_RISK_PCT_PER_TRADE,
-                        help="percent of capital risked per trade")
+                        help="percent of capital lost at the stop per trade, "
+                             "charges included (at most "
+                             f"{config.SCAN_MAX_RISK_PCT:g})")
     parser.add_argument("--options", action="store_true",
                         help="also pick a tradeable option contract per setup")
     parser.add_argument("--discover", action="store_true",
@@ -116,10 +126,33 @@ def _parse_args(argv: "list[str] | None" = None) -> argparse.Namespace:
                              "sees only what was knowable then. Limited to "
                              f"the last {config.SCAN_MAX_REPLAY_DAYS} days")
     args = parser.parse_args(argv)
-    if args.capital <= 0:
-        parser.error(f"--capital must be positive, got {args.capital}")
-    if args.risk_pct <= 0:
-        parser.error(f"--risk-pct must be positive, got {args.risk_pct}")
+    # isfinite first: argparse's float() accepts "nan" and "inf", and NaN
+    # fails every `<= 0` test, so it used to pass validation outright.
+    if not math.isfinite(args.capital) or args.capital <= 0:
+        parser.error(f"--capital must be a positive number, got "
+                     f"{args.capital}")
+    if not math.isfinite(args.risk_pct) or args.risk_pct <= 0:
+        parser.error(f"--risk-pct must be a positive number, got "
+                     f"{args.risk_pct}")
+    if args.risk_pct > config.SCAN_MAX_RISK_PCT:
+        parser.error(
+            f"--risk-pct {args.risk_pct:g} is above the "
+            f"{config.SCAN_MAX_RISK_PCT:g}% ceiling (config.SCAN_MAX_RISK_PCT). "
+            f"At {args.risk_pct:g}% ten straight losses cost "
+            f"{min(100.0, 10 * args.risk_pct):.0f}% of the account; the "
+            f"sizer refuses every trade above the ceiling, so this run "
+            f"would print nothing.")
+    # THE COMBINED CAP MUST HOLD ONE FULL TRADE. A cap below the per-trade
+    # risk (say SCAN_MAX_OPEN_RISK_PCT 1.5 with --risk-pct 2), or an
+    # unusable one, fails closed on every setup, and the empty report it
+    # produces is indistinguishable from a quiet market. Refused here, at
+    # the one point a CLI run can still be told why.
+    problem = setups.cap_config_problem(risk_pct=args.risk_pct,
+                                        capital=args.capital)
+    if problem:
+        parser.error(f"refusing to scan: {problem}. Raise "
+                     f"config.SCAN_MAX_OPEN_RISK_PCT to at least the "
+                     f"per-trade risk, or lower --risk-pct.")
     if args.top <= 0:
         parser.error(f"--top must be positive, got {args.top}")
     if args.as_of.strip():
@@ -286,6 +319,42 @@ def _existing_header(path) -> "list[str] | None":
     return first or None
 
 
+def loggable_now(candidates: list, intraday: dict, now: datetime
+                 ) -> "tuple[list, str | None]":
+    """The setups that may be logged at `now`, and why any were held back.
+
+    NOT OUTSIDE THE SCAN WINDOW. Before the bell there are no bars for
+    today, setups.measure falls back to the last session held, and that
+    session's range is closed - so run()'s premature check passes and the
+    rows would carry yesterday's levels under today's date, the stale-row
+    bug scan_publish.scan_window closes for the feed. The same predicate,
+    so the CLI, the feed and calibrate agree on what a valid scan instant
+    is. A replay is judged on its own instant.
+
+    AND ONLY NAMES WITH A BAR DATED THAT DAY. The window reads the clock,
+    not the exchange calendar, so on a trading holiday - or a replay of
+    one - it is open while every frame ends on the previous session.
+    scan_publish.session_symbols is the feed's per-symbol half of the same
+    guard, keyed here on the tickers `intraday` is keyed on.
+    """
+    import scan_publish
+
+    window_open, reason = scan_publish.scan_window(now)
+    if not window_open:
+        return [], (f"{reason}. The table above describes the last session "
+                    f"held, not a tradeable one now.")
+    by_ticker = {instruments.to_ticker(s.readings.symbol): s
+                 for s in candidates}
+    current = set(scan_publish.session_symbols(list(by_ticker), intraday,
+                                               None, now))
+    fresh = [s for ticker, s in by_ticker.items() if ticker in current]
+    if len(fresh) < len(candidates):
+        return fresh, (f"{len(candidates) - len(fresh)} of "
+                       f"{len(candidates)} setups were measured on bars "
+                       f"from an earlier session, not {now:%Y-%m-%d}.")
+    return fresh, None
+
+
 def append_log(rows: list[dict[str, object]]) -> None:
     """Append actionable setups to scan_log.csv, header-aware.
 
@@ -323,8 +392,11 @@ def append_log(rows: list[dict[str, object]]) -> None:
 
 def _table_header() -> str:
     """Column header for the ranked table."""
+    # "Max loss" is the loss at the stop INCLUDING charges, which is what
+    # the size is now held to. The column used to be price risk alone and
+    # read as the whole downside when it was about 90% of it.
     return (f"{'Symbol':<14}{'Dir':<6}{'Score':>6}{'Entry':>10}{'Stop':>10}"
-            f"{'Target':>10}{'Qty':>7}{'Risk':>9}{'Win%':>7}{'RVOL':>6}"
+            f"{'Target':>10}{'Qty':>7}{'Max loss':>9}{'Win%':>7}{'RVOL':>6}"
             f"{'RS':>7}{'OI%':>8}{'Cost x':>8}")
 
 
@@ -345,18 +417,65 @@ def _table_row(setup: setups.Setup) -> str:
     cost = trade.cost_multiple
     return (f"{reading.symbol:<14}{setup.direction:<6}{setup.rank_score:>6.3f}"
             f"{trade.entry:>10.2f}{trade.stop:>10.2f}{trade.target:>10.2f}"
-            f"{trade.quantity:>7}{trade.lot_risk:>9,.0f}"
+            f"{trade.quantity:>7}{trade.risk_with_costs:>9,.0f}"
             f"{trade.required_win_rate * 100:>7.1f}{reading.rvol or 0.0:>6.2f}"
             f"{reading.relative_strength or 0.0:>+7.2f}"
             f"{_oi_cell(reading.oi_change_pct):>8}"
             f"{_cost_cell(cost):>8}")
 
 
+def _print_exposure(ranked: list[setups.Setup], capital: float) -> None:
+    """The combined-risk block: what the cap let through and what it held back.
+
+    Reads the ALREADY-CAPPED ranking, so every figure is one the cap
+    enforced rather than a recomputation that could disagree with it.
+    """
+    exposure = setups.portfolio_exposure(ranked, capital=capital)
+    print()
+    print(f"COMBINED RISK (enforced): the {exposure.kept} actionable "
+          f"setup(s) lose {exposure.risk_used:,.0f} rupees if every one "
+          f"stops out, "
+          f"charges included - {exposure.risk_used_pct_of_cap:.0f}% of the "
+          f"{exposure.risk_cap:,.0f} cap ({config.SCAN_MAX_OPEN_RISK_PCT:g}% "
+          f"of {capital:,.0f}),")
+    print(f"on {exposure.notional_used:,.0f} of notional against a "
+          f"{exposure.notional_cap:,.0f} funding cap "
+          f"({config.SCAN_MIS_LEVERAGE:g}x).")
+    if exposure.blocked:
+        held = [s.symbol for s in ranked if setups.capped_by_portfolio(s)]
+        shown = ", ".join(held[:8]) + (" ..." if len(held) > 8 else "")
+        print(f"{exposure.blocked} more cleared every gate but were held back "
+              f"because the cap was full (in rank order): {shown}")
+    print("The cap covers this scan only. It cannot see positions you have "
+          "already entered, so subtract those yourself.")
+
+
+def _print_survival(risk_pct: float) -> None:
+    """Losing-streak footer at the risk per trade this run used.
+
+    Never allowed to take the report down: it is context, and a scan that
+    printed its setups must not end in a traceback over a footer.
+    """
+    try:
+        table = survival.streak_table(risk_pct)
+    except (ValueError, ArithmeticError) as exc:
+        logger.warning("Losing-streak table unavailable: %s", exc)
+        return
+    print()
+    for line in survival.text_lines(table):
+        print(line)
+
+
 def print_report(ranked: list[setups.Setup], bars: scan_data.BarSet,
                  source: str, benchmark: "float | None", now: datetime,
-                 top: int, capital: float = config.SCAN_CAPITAL
+                 top: int, capital: float = config.SCAN_CAPITAL,
+                 risk_pct: float = config.SCAN_RISK_PCT_PER_TRADE
                  ) -> list[setups.Setup]:
-    """Print the full scan report; return the actionable setups shown."""
+    """Print the full scan report; return the actionable setups shown.
+
+    `ranked` is expected to have been through setups.apply_portfolio_caps,
+    so "actionable" here already means "inside the combined risk cap".
+    """
     actionable = [s for s in ranked if s.actionable]
     print(f"\n{'=' * 100}")
     print("SECTOR PULSE INTRADAY SCAN")
@@ -395,6 +514,21 @@ def print_report(ranked: list[setups.Setup], bars: scan_data.BarSet,
             print("record. Re-run once the range has closed.")
             print(f"{chr(10)}{DISCLAIMER}{chr(10)}")
             return []
+        # NOT A QUIET MARKET. Setups cleared every gate and a portfolio cap
+        # turned every one away, which a working cap never does - it
+        # always keeps the top setup. Saying "the expected answer" here
+        # would hide a misconfigured cap behind the most ordinary message.
+        held = [s for s in ranked if setups.capped_by_portfolio(s)]
+        if held:
+            print("NOTHING IS ACTIONABLE - THE PORTFOLIO CAP BLOCKED IT ALL.")
+            text = setups.cap_blocked_all_text(
+                len(held), setups.closing_cap(ranked), risk_pct=risk_pct,
+                capital=capital)
+            for line in textwrap.wrap(text, width=92):
+                print(f"  {line}")
+            _print_near_misses(ranked)
+            print(f"\n{DISCLAIMER}\n")
+            return []
         print("NO SETUP cleared every gate. On most days that is the expected "
               "answer: the direction rule needs VWAP and the opening "
               "range to agree, which they usually do not.")
@@ -403,23 +537,15 @@ def print_report(ranked: list[setups.Setup], bars: scan_data.BarSet,
         return []
 
     print()
-    print(f"{len(actionable)} setup(s) cleared every gate, best first:")
+    print(f"{len(actionable)} setup(s) cleared every gate and fit inside the "
+          f"combined risk cap, best first:")
     print()
     print(_table_header())
     print("-" * len(_table_header()))
     for setup in actionable[:top]:
         print(_table_row(setup))
 
-    total_risk = sum(s.levels.lot_risk for s in actionable)
-    total_notional = sum(s.levels.entry * s.levels.quantity for s in actionable)
-    print()
-    print(f"AGGREGATE EXPOSURE: taking all {len(actionable)} risks "
-          f"{total_risk:,.0f} rupees ({total_risk / capital * 100:.1f}% of "
-          f"the {capital:,.0f} assumed) across {total_notional:,.0f} of "
-          f"notional,")
-    print(f"which is {total_notional / capital:.1f}x that capital. Each row "
-          f"is sized independently against its own stop, so the")
-    print("per-trade cap does not bound the total and nothing above flags it.")
+    _print_exposure(ranked, capital)
     best = actionable[0]
     print()
     print(f"TOP SETUP: {best.symbol} {best.direction} - score {best.rank_score:.3f}")
@@ -434,6 +560,7 @@ def print_report(ranked: list[setups.Setup], bars: scan_data.BarSet,
               f"(score {setup.rank_score:.3f})")
         for reason in setup.reasons:
             print(f"    - {reason}")
+    _print_survival(risk_pct)
     print(f"\n{DISCLAIMER}\n")
     return actionable[:top]
 
@@ -448,22 +575,47 @@ def _print_near_misses(ranked: list[setups.Setup], limit: int = 5) -> None:
     print(f"Closest {min(limit, len(directional))} that had a direction but "
           f"failed a gate:")
     for setup in directional[:limit]:
-        failures = [r.replace(" [FAIL]", "") for r in setup.reasons
+        # Everything from the first " [" off, as explain() does: the room
+        # gate and the portfolio cap carry an [ENTRY] tag after [FAIL],
+        # and stripping only " [FAIL]" printed that tag in the sentence.
+        failures = [r.split(" [")[0] for r in setup.reasons
                     if "[FAIL]" in r]
         print(f"  {setup.symbol:<14}{setup.direction:<6}"
               f"{'; '.join(failures) if failures else 'no failure recorded'}")
 
 
 def print_options(shown: list[setups.Setup], lot_sizes: dict[str, int],
-                  index_symbols: "set[str] | None" = None) -> None:
-    """Pick and print a tradeable contract for each shown setup."""
+                  index_symbols: "set[str] | None" = None,
+                  capital: float = config.SCAN_CAPITAL,
+                  risk_pct: float = config.SCAN_RISK_PCT_PER_TRADE) -> None:
+    """Pick, size and print a tradeable contract for each shown setup.
+
+    Sized against the same per-trade budget as the shares: a bought
+    option's worst case is its whole premium plus charges, so the lot
+    count is whatever fits levels.risk_budget(capital, risk_pct), and a
+    contract whose single lot does not fit is refused out loud rather
+    than printed "per lot" as though one lot were a suggestion.
+    """
     if not shown:
         return
+    # levels.risk_budget, the one place the budget is computed, so this
+    # line cannot state a figure pick_contract does not size against. It
+    # returns 0.0 above the ceiling; _parse_args refuses that already, and
+    # the line says so rather than printing a zero budget as if usable.
+    budget = levels.risk_budget(capital, risk_pct)
     print(f"{'-' * 100}")
     print("OPTION CONTRACTS for the setups above")
     print("Direction comes from the equity setup. What is assessed here is "
           "only whether a contract\nis liquid and cheap enough to express it. "
           "Buying only: selling naked options is never proposed.")
+    if budget > 0.0:
+        print(f"Sized so the whole premium plus charges - the loss if it "
+              f"expires worthless - fits the {budget:,.0f}-rupee per-trade "
+              f"budget.")
+    else:
+        print(f"No per-trade budget: {risk_pct:g}% is refused by the sizer "
+              f"(ceiling {config.SCAN_MAX_RISK_PCT:g}%), so no contract can "
+              f"be sized.")
     print("-" * 100)
     session = options_chain.open_session()
     for setup in shown:
@@ -479,8 +631,10 @@ def print_options(shown: list[setups.Setup], lot_sizes: dict[str, int],
             print(f"\n  {symbol}: no option chain returned.")
             continue
         metrics = options_chain.summarise(symbol, contracts, spot, expiry)
-        contract, reasons = options_chain.pick_contract(
-            contracts, spot, setup.direction, lot_size)
+        pick = options_chain.pick_contract(
+            contracts, spot, setup.direction, lot_size,
+            capital=capital, risk_pct=risk_pct)
+        contract, reasons = pick.contract, pick.reasons
         print(f"\n  {symbol} {setup.direction} | expiry {expiry} | "
               f"spot {spot:.2f} | lot {lot_size}")
         if metrics is not None:
@@ -493,13 +647,24 @@ def print_options(shown: list[setups.Setup], lot_sizes: dict[str, int],
                 print(f"    max pain {metrics.max_pain:.0f} (descriptive only, "
                       f"no predictive record)")
         if contract is None:
-            print(f"    no tradeable contract: {reasons[0]}")
+            if pick.refused_by_budget:
+                print("    NO CONTRACT FITS THE RISK BUDGET - nothing is "
+                      "suggested.")
+                for line in textwrap.wrap(reasons[0], width=88):
+                    print(f"      {line}")
+            else:
+                print(f"    no tradeable contract: {reasons[0]}")
             for line in reasons[1:4]:
                 print(f"      {line}")
             continue
         side = "CALL" if setup.direction == LONG else "PUT"
-        print(f"    BUY {contract.strike:.0f} {side} at mid {contract.mid:.2f} "
+        print(f"    BUY {pick.lots} lot(s) = {pick.quantity:,} options of the "
+              f"{contract.strike:.0f} {side} at mid {contract.mid:.2f} "
               f"(bid {contract.bid:.2f} / ask {contract.ask:.2f})")
+        print(f"    at risk: {pick.premium_outlay:,.0f} of premium + "
+              f"{pick.charges:,.0f} of charges = {pick.total_at_risk:,.0f} "
+              f"rupees, all lost if it expires worthless "
+              f"(budget {pick.budget:,.0f})")
         for reason in reasons:
             print(f"      - {reason}")
 
@@ -563,15 +728,22 @@ def run(args: argparse.Namespace) -> int:
                        now.strftime("%Y-%m-%d %H:%M"))
     evaluated = build_setups(symbols, bars, benchmark, now, args.capital,
                              args.risk_pct, fo_state=fo_state)
-    ranked = setups.rank(evaluated)
+    # Capped against the SAME capital the rows were sized on, so a
+    # --capital run is not held to the config default's cap.
+    ranked = setups.apply_portfolio_caps(setups.rank(evaluated),
+                                         capital=args.capital)
     shown = print_report(ranked, bars, source, benchmark, now, args.top,
-                         capital=args.capital)
+                         capital=args.capital, risk_pct=args.risk_pct)
     # EVERY SETUP WITH LEVELS, not just the ones printed. `shown` is the
     # actionable subset - the trades worth taking - and logging only those
     # gave a file with no negatives in it. The blocked ones cost nothing
     # extra to record and are the half that makes the log learnable.
     loggable = [s for s in ranked if s.levels is not None]
-    append_log([_row(s, now, replayed=replaying) for s in loggable])
+    fresh, why = loggable_now(loggable, bars.intraday, now)
+    if fresh:
+        append_log([_row(s, now, replayed=replaying) for s in fresh])
+    if why:
+        print(f"\nNOT LOGGED to scan_log.csv: {why}")
     if args.options and shown:
         if replaying:
             print()
@@ -592,7 +764,8 @@ def run(args: argparse.Namespace) -> int:
             lot_sizes = {inst.symbol: inst.lot_size
                          for inst in universe.fo_underlyings if inst.lot_size}
             index_symbols = {inst.symbol for inst in universe.fo_indices}
-            print_options(shown, lot_sizes, index_symbols)
+            print_options(shown, lot_sizes, index_symbols,
+                          capital=args.capital, risk_pct=args.risk_pct)
     return 0
 
 

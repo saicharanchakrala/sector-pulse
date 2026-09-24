@@ -15,19 +15,24 @@ up 6.7% before the underlying moves at all.
 Chain metrics like put-call ratio and max pain are reported because traders
 ask for them. Both are widely used and neither has a robust published edge;
 they are descriptive context, labelled as such.
+
+A picked contract is SIZED, not suggested one lot at a time: a bought
+option can expire worthless, so its premium plus charges is the loss, and
+the lot count comes from the same per-trade risk budget the equity sizer
+uses (levels.risk_budget). When not one lot fits, nothing is suggested.
 """
 from __future__ import annotations
 
 import logging
 import math
 import urllib.parse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import requests
 
 import config
 import trade_costs
-from levels import LONG, SHORT
+from levels import LONG, SHORT, risk_budget
 
 logger = logging.getLogger(__name__)
 
@@ -348,33 +353,185 @@ def quality_reasons(contract: Contract, lots: int,
     return bool(spread_ok and oi_ok and volume_ok), reasons
 
 
+# Same role as levels._SIZING_MAX_STEPS: a bound so an unforeseen input
+# fails closed, not a knob. The per-lot loss has one fixed term (the flat
+# 20-rupee brokerage per order), so the walk settles in a step or two.
+_LOT_SIZING_MAX_STEPS = 64
+
+
+def option_loss(premium: float, lots: int, lot_size: int) -> float:
+    """Worst case of BUYING `lots` lots at `premium`: all of it, plus charges.
+
+    A bought option can expire worthless, so the whole premium is the
+    loss at the "stop" - there is no nearer one. The round-trip charges
+    are priced at a flat exit, the conservative figure: selling near zero
+    carries less STT and exchange charge than selling at the entry
+    premium, so the real worst case sits a little below this.
+    """
+    quantity = lots * lot_size
+    if quantity <= 0 or not math.isfinite(premium) or premium <= 0.0:
+        return 0.0
+    charges = trade_costs.options_cost(premium, premium, lots, lot_size).total
+    return premium * quantity + charges
+
+
+def lots_within_budget(premium: float, lot_size: int, budget: float) -> int:
+    """Most lots whose worst-case loss, charges included, fits the budget.
+
+    floor(budget / (premium * lot_size + per-lot charges)), except that
+    the charges are not a fixed amount per lot - brokerage is a flat 20
+    rupees an ORDER however many lots it carries - so it is solved the
+    same way levels._quantity_inside_budget solves shares: start from the
+    premium-only count, which charges can only reduce, and step down from
+    the per-lot loss measured at each guess. 0 means not one lot fits.
+    """
+    if not (math.isfinite(premium) and premium > 0.0 and lot_size > 0
+            and math.isfinite(budget) and budget > 0.0):
+        return 0
+    lots = int(budget // (premium * lot_size))
+    for _ in range(_LOT_SIZING_MAX_STEPS):
+        if lots <= 0:
+            return 0
+        loss = option_loss(premium, lots, lot_size)
+        if loss <= budget:
+            return lots
+        lots = min(lots - 1, int(budget // (loss / lots)))
+    logger.warning("Lot sizing did not settle (premium %s, lot %s, budget "
+                   "%s); refusing rather than guessing", premium, lot_size,
+                   budget)
+    return 0
+
+
+@dataclass(frozen=True)
+class OptionPick:
+    """The contract chosen for one setup, sized against the risk budget.
+
+    `contract` is None when nothing is suggested; `reasons[0]` then says
+    why in one sentence and `refused_by_budget` separates "the only liquid
+    contract costs more than a trade may lose" from "nothing is liquid".
+    """
+
+    contract: "Contract | None"
+    lots: int
+    lot_size: int
+    budget: float
+    reasons: list[str] = field(default_factory=list)
+    refused_by_budget: bool = False
+
+    @property
+    def quantity(self) -> int:
+        """Options bought: lots times the lot size."""
+        return self.lots * self.lot_size
+
+    @property
+    def premium_outlay(self) -> float:
+        """Premium paid for the whole position, in rupees."""
+        if self.contract is None:
+            return 0.0
+        return self.contract.mid * self.quantity
+
+    @property
+    def total_at_risk(self) -> float:
+        """Premium plus round-trip charges: the loss if it expires worthless."""
+        if self.contract is None:
+            return 0.0
+        return option_loss(self.contract.mid, self.lots, self.lot_size)
+
+    @property
+    def charges(self) -> float:
+        """Round-trip charges on the whole position, at a flat exit."""
+        return self.total_at_risk - self.premium_outlay
+
+
 def pick_contract(contracts: list[Contract], spot: float, direction: str,
-                  lot_size: int, lots: int = 1
-                  ) -> "tuple[Contract | None, list[str]]":
-    """Cheapest tradeable near-the-money contract for a direction.
+                  lot_size: int, capital: "float | None" = None,
+                  risk_pct: "float | None" = None) -> OptionPick:
+    """The nearest-the-money liquid contract, sized so its loss fits the budget.
+
+    NOT the cheapest, which the docstring used to claim: candidates run
+    from at-the-money out to OPT_STRIKES_EITHER_SIDE and the first that
+    clears every quality gate wins, which biases toward at-the-money
+    where the book is deepest.
 
     A long view buys calls and a short view buys puts. Only buying is
     considered: selling naked options carries open-ended loss, which no
-    scanner should quietly propose. Candidates run from at-the-money out to
-    OPT_STRIKES_EITHER_SIDE, and the first that clears every quality gate
-    wins, which biases toward at-the-money where the book is deepest.
+    scanner should quietly propose.
+
+    SIZED, WHERE IT USED TO SUGGEST ONE LOT. A bought option's worst case
+    is the whole premium plus charges, so the position is
+    lots_within_budget(mid, lot_size, budget) with the same per-trade
+    budget the equity sizer uses (levels.risk_budget: capital * risk_pct
+    / 100, refused above SCAN_MAX_RISK_PCT). One lot of an at-the-money
+    single-stock option routinely costs several times a 1,000-rupee
+    budget, and "Rs X per lot" printed beside it read as a suggestion to
+    risk X.
+
+    WHEN NOT ONE LOT FITS, NOTHING IS SUGGESTED - deliberately, rather
+    than walking further out of the money until something is cheap
+    enough. A far out-of-the-money option fits the budget BECAUSE it is
+    unlikely to pay, so letting the budget choose the strike would turn a
+    risk limit into a lottery-ticket selector. The refusal names one
+    lot's worst case against the budget.
+
+    `capital` and `risk_pct` default to config, read at call time.
     """
+    capital = config.SCAN_CAPITAL if capital is None else capital
+    risk_pct = config.SCAN_RISK_PCT_PER_TRADE if risk_pct is None else risk_pct
+    budget = risk_budget(capital, risk_pct)
+
+    def refuse(reasons: list[str], by_budget: bool = False) -> OptionPick:
+        """An OptionPick that suggests nothing, carrying why."""
+        return OptionPick(None, 0, lot_size, budget, reasons, by_budget)
+
+    if budget <= 0.0:
+        return refuse([f"no usable risk budget: {risk_pct}% of {capital} is "
+                       f"missing, not positive, or above the "
+                       f"{config.SCAN_MAX_RISK_PCT:g}% ceiling"],
+                      by_budget=True)
+    if lot_size <= 0:
+        return refuse(["no lot size known, so neither the premium at risk "
+                       "nor the charges can be computed"])
     if direction not in (LONG, SHORT):
-        return None, [f"unknown direction {direction!r}"]
+        return refuse([f"unknown direction {direction!r}"])
     side = CALL if direction == LONG else PUT
     strike = atm_strike(contracts, spot)
     if strike is None:
-        return None, ["no strikes in the chain"]
+        return refuse(["no strikes in the chain"])
     pool = sorted((c for c in contracts if c.side == side),
                   key=lambda c: abs(c.strike - strike))
     window = pool[:max(1, config.OPT_STRIKES_EITHER_SIDE * 2 + 1)]
     if not window:
-        return None, [f"no {side} contracts in the chain"]
+        return refuse([f"no {side} contracts in the chain"])
     rejected: list[str] = []
     for candidate in window:
-        ok, reasons = quality_reasons(candidate, lots, lot_size)
-        if ok:
-            return candidate, reasons
-        rejected.append(f"{candidate.strike:.0f} {side}: "
-                        + "; ".join(r for r in reasons if "[FAIL]" in r))
-    return None, ["no contract cleared the quality gates"] + rejected[:5]
+        ok, reasons = quality_reasons(candidate, 1, lot_size)
+        if not ok:
+            rejected.append(f"{candidate.strike:.0f} {side}: "
+                            + "; ".join(r for r in reasons if "[FAIL]" in r))
+            continue
+        lots = lots_within_budget(candidate.mid, lot_size, budget)
+        if lots <= 0:
+            one_lot = option_loss(candidate.mid, 1, lot_size)
+            premium = candidate.mid * lot_size
+            return refuse([
+                f"the risk budget refuses the nearest liquid contract: one "
+                f"lot of the {candidate.strike:.0f} {side} is {lot_size:,} x "
+                f"{candidate.mid:.2f} = {premium:,.0f} rupees of premium "
+                f"plus {one_lot - premium:,.0f} of charges, all of it lost "
+                f"if it expires worthless, against a {budget:,.0f} budget "
+                f"({risk_pct:g}% of {capital:,.0f}) - {one_lot / budget:.1f}x "
+                f"what one trade may lose. Cheaper strikes further out of "
+                f"the money are not substituted.", *reasons],
+                by_budget=True)
+        # Re-assessed at the real size: the flat brokerage is a smaller
+        # share of premium on two lots than on one, so the INFO cost line
+        # must describe the position actually suggested.
+        _, reasons = quality_reasons(candidate, lots, lot_size)
+        at_risk = option_loss(candidate.mid, lots, lot_size)
+        reasons.append(
+            f"{lots} lot(s) = {lots * lot_size:,} options put "
+            f"{at_risk:,.0f} rupees at risk (premium plus charges, lost in "
+            f"full if it expires worthless) against the {budget:,.0f} "
+            f"budget [PASS]")
+        return OptionPick(candidate, lots, lot_size, budget, reasons)
+    return refuse(["no contract cleared the quality gates", *rejected[:5]])

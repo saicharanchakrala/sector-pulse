@@ -1,10 +1,11 @@
 """A harness for testing intraday rules against measured price behaviour.
 
 Built because the first rule failed in a way that could only be diagnosed by
-measurement. Across 3,537 signals its adverse excursion exceeded its
-favourable excursion at every percentile, and every stop/target pair lost
-money - so the problem was the signal, not the geometry. Guessing a second
-rule would repeat the mistake.
+measurement. Over a year of bars - 54,397 signals, 229 sessions, 210 names,
+`python -m edge_lab` - its direction call matched a coin tossed at the same
+bars to within 0.003 R in every stop/target cell, and every cell lost money
+once costs were charged - so the problem was the signal, not the geometry.
+Guessing a second rule would repeat the mistake.
 
 The contract is deliberately narrow so that rules are comparable and cannot
 cheat:
@@ -27,17 +28,21 @@ day it is still trading. Treat those two as opt-in lookahead unless the
 caller supplies a point-in-time series; every other field is safe by
 construction.
 
-Three disciplines, all enforced here rather than left to each rule:
+Four disciplines, all enforced here rather than left to each rule:
 
   one signal per direction per session, taken on the first bar it fires, so
     one move cannot be counted as many wins;
   a bar that spans both stop and target counts as a stop, because 5-minute
     bars carry no intra-bar ordering and assuming otherwise flatters results;
-  unresolved positions are marked out at the close, not discarded, because a
-    rule that leaves most trades open must be judged on what that pays.
+  unresolved positions are marked out at the close, not discarded and not
+    scored as flat, because a rule that leaves most trades open must be
+    judged on what that pays;
+  every result is set against a coin tossed for direction at the same bars,
+    scored under these same rules, because a closed-form baseline cannot
+    see the session end or the tie rule and misreads chance as skill.
 
 Sample-size honesty: every path now loads from Kite, which reaches years -
-the 5-minute set in bar_cache spans 239 sessions across 210 names - so a
+the 5-minute set in bar_cache spans 249 sessions across 210 names - so a
 result here is not short of rows. It is still short of independence:
 signals within a session are correlated, so treat a result that survives
 only at one parameter setting as noise.
@@ -463,6 +468,19 @@ def _signal_row(ctx: Context, bars: dict, direction: str,
 
     The forward slice starts at i+1, so the entry bar's own extremes never
     count as an excursion.
+
+    THE COIN-FLIP TWIN. Every geometry is also scored for the OPPOSITE
+    direction on the same forward path, under the same session end and the
+    same tie rule, and kept under `flipped`. A trader who tossed a coin for
+    direction at this bar would take each side half the time, so the
+    average of the two sides is exactly what a coin flip pays here. That
+    is the baseline summarise compares against. The closed-form
+    stop / (stop + target) it replaces assumes unlimited time and a
+    continuous path; this harness counts hits only before the close and
+    gives a bar spanning both levels to the stop, and both of those favour
+    the nearer level: at the shipped geometry a driftless walk hits about
+    24%, nine points below the formula's 33%, so the formula read pure
+    chance as nine points worse than chance.
     """
     i, entry, sigma = ctx.i, ctx.price, ctx.sigma
     forward_high = bars["high"][i + 1:]
@@ -485,11 +503,17 @@ def _signal_row(ctx: Context, bars: dict, direction: str,
         "mae_sigma": max(0.0, mae) / sigma,
         "close_move_sigma": close_move / sigma,
     }
+    opposite = SHORT if direction == LONG else LONG
+    flipped: dict = {}
     for stop in stops:
         for target in targets:
             row[(stop, target)] = first_touch(
                 forward_high, forward_low, direction, entry,
                 sigma * stop, sigma * target)
+            flipped[(stop, target)] = first_touch(
+                forward_high, forward_low, opposite, entry,
+                sigma * stop, sigma * target)
+    row["flipped"] = flipped
     return row
 
 
@@ -551,6 +575,90 @@ def run_rule(rule, frames: dict[str, pd.DataFrame],
     return rows
 
 
+def _tally(rows: list[dict], key: tuple, stop: float, reward_risk: float,
+           flipped: bool) -> tuple:
+    """(hits, stops, open, summed R) for one geometry on one side.
+
+    AN OPEN TRADE IS MARKED AT THE CLOSE, in R: its close move over the
+    stop distance. It used to count as 0R, which contradicted this
+    module's own docstring and forecast_diagnostics, where valuing
+    unresolved trades at zero is named as the error that once produced a
+    false edge. It matters most at the shipped geometry, where most
+    signals reach neither level. The value is bounded by construction: a
+    trade that touched neither level closed between them, so it lies in
+    (-1, reward_risk).
+
+    `flipped` reads the coin-flip twin instead, whose close move is the
+    rule's with the sign reversed.
+    """
+    hits = stopped = open_ = 0
+    summed = 0.0
+    for row in rows:
+        if key not in row:
+            continue
+        verdicts = row.get("flipped", {}) if flipped else row
+        verdict = verdicts.get(key)
+        if verdict is None:
+            continue
+        if verdict == "TARGET":
+            hits += 1
+        elif verdict == "STOP":
+            stopped += 1
+        else:
+            open_ += 1
+        summed += _outcome_r(verdict, row, stop, reward_risk, flipped)
+    return hits, stopped, open_, summed
+
+
+def _outcome_r(verdict: str, row: dict, stop: float, reward_risk: float,
+               flipped: bool) -> float:
+    """One trade's result in R: +reward_risk, -1, or marked at the close.
+
+    The single scoring rule for _tally and edge_by_session, so the grid
+    and the interval printed under it cannot score a trade two ways.
+    """
+    if verdict == "TARGET":
+        return reward_risk
+    if verdict == "STOP":
+        return -1.0
+    move = float(row["close_move_sigma"])
+    return (-move if flipped else move) / stop
+
+
+def edge_by_session(rows: list[dict], stop: float, target: float) -> dict:
+    """The rule's edge over the coin at one geometry, with its interval.
+
+    Per signal the edge is half the rule side minus the twin side, which
+    averages to exactly the grid's `edge_r`. The 95% interval resamples
+    whole SESSIONS through forecast_stats.block_bootstrap, because every
+    signal on a day shares that day's move: 54,397 signals from 229
+    sessions is 229 observations, not 54,397. Signals without a twin are
+    left out rather than scored against nothing.
+    """
+    import forecast_stats
+
+    key = (stop, target)
+    reward_risk = target / stop
+    values, groups = [], []
+    for row in rows:
+        own = row.get(key)
+        twin = row.get("flipped", {}).get(key)
+        if own is None or twin is None:
+            continue
+        values.append((_outcome_r(own, row, stop, reward_risk, False)
+                       - _outcome_r(twin, row, stop, reward_risk, True)) / 2)
+        groups.append(str(row["day"]))
+    if not values:
+        return {"stop": stop, "target": target, "signals": 0, "sessions": 0,
+                "edge_r": None, "low": None, "high": None}
+    mean, low, high, _ = forecast_stats.block_bootstrap(values, groups)
+    estimable = low == low and high == high          # NaN is the refusal
+    return {"stop": stop, "target": target, "signals": len(values),
+            "sessions": len(set(groups)), "edge_r": float(mean),
+            "low": float(low) if estimable else None,
+            "high": float(high) if estimable else None}
+
+
 def summarise(rows: list[dict], stops: tuple = DEFAULT_STOPS,
               targets: tuple = DEFAULT_TARGETS) -> dict:
     """Aggregate signals into excursion stats and a geometry grid.
@@ -559,6 +667,15 @@ def summarise(rows: list[dict], stops: tuple = DEFAULT_STOPS,
     that is what makes them comparable across geometries: a wider stop risks
     more rupees for the same turnover, so the same charge is a smaller
     fraction of R.
+
+    Every cell carries its own coin-flip baseline: `random_rate` and
+    `random_gross_r` are what tossing a coin for direction at the same bars
+    would have paid, and `edge_pp` / `edge_r` are the rule minus that.
+    `edge_r` is the one to read. It is in R, it counts the trades that
+    reached neither level, and it is gross, so costs cannot make a rule
+    with real direction skill look like one without it. A positive
+    `edge_r` in one cell of a 25-cell grid is not evidence on its own:
+    pick the best of 25 noisy numbers and one will look good.
     """
     if not rows:
         return {"signals": 0, "grid": [], "excursions": {}}
@@ -581,24 +698,47 @@ def summarise(rows: list[dict], stops: tuple = DEFAULT_STOPS,
         cost_in_r = (COST_FRACTION / median_stop_frac
                      if median_stop_frac > 0 else 0.0)
         for target in targets:
-            verdicts = [r[(stop, target)] for r in rows if (stop, target) in r]
-            hits = verdicts.count("TARGET")
-            stopped = verdicts.count("STOP")
-            open_ = verdicts.count("NEITHER")
+            reward_risk = target / stop
+            hits, stopped, open_, summed = _tally(
+                rows, (stop, target), stop, reward_risk, flipped=False)
             total = hits + stopped + open_
             resolved = hits + stopped
             if total == 0:
                 continue
-            reward_risk = target / stop
-            gross = (hits * reward_risk - stopped) / total
+            gross = summed / total
+            hit_rate = (hits / resolved) if resolved else None
+            # The coin-flip baseline: the rule's side and the opposite side
+            # pooled, which is a fair coin's expectation on the same bars.
+            # See _signal_row. Only when EVERY row scored here carries its
+            # twin: a row without one would leave the two sides describing
+            # different sets of rows, so the baseline reads None instead.
+            # Checked per row rather than by comparing totals, which one
+            # rule-only row plus one twin-only row would satisfy.
+            key = (stop, target)
+            twinned = all(key in r.get("flipped", {})
+                          for r in rows if key in r)
+            c_hits, c_stopped, c_open, c_summed = _tally(
+                rows, key, stop, reward_risk, flipped=True)
+            c_total = c_hits + c_stopped + c_open
+            c_resolved = c_hits + c_stopped
+            pooled_resolved = resolved + c_resolved
+            random_rate = ((hits + c_hits) / pooled_resolved
+                           if twinned and pooled_resolved else None)
+            random_gross = ((summed + c_summed) / (total + c_total)
+                            if twinned else None)
             grid.append({
                 "stop": stop, "target": target, "reward_risk": reward_risk,
                 "signals": total, "resolved": resolved,
-                "hit_rate": (hits / resolved) if resolved else None,
-                "random_rate": stop / (stop + target),
-                "edge_pp": ((hits / resolved) - stop / (stop + target)) * 100
-                           if resolved else None,
-                "gross_r": gross, "cost_r": cost_in_r,
+                "hit_rate": hit_rate,
+                "random_rate": random_rate,
+                "edge_pp": ((hit_rate - random_rate) * 100
+                            if hit_rate is not None
+                            and random_rate is not None else None),
+                "gross_r": gross,
+                "random_gross_r": random_gross,
+                "edge_r": (gross - random_gross
+                           if random_gross is not None else None),
+                "cost_r": cost_in_r,
                 "net_r": gross - cost_in_r,
             })
     return {"signals": len(rows), "grid": grid, "excursions": excursions,
@@ -645,15 +785,116 @@ def print_report(name: str, summary: dict) -> None:
               + "".join(f"{exc[label][f'p{p}']:>8.3f}" for p in (10, 25, 50, 75, 90))
               + f"{exc[f'{label}_mean']:>8.3f}")
     best = best_geometry(summary)
+    print("  coin = tossing a coin for direction at the same bars. "
+          "edgeR = grossR - coinR, the one to read.")
+    print("  hitgap = hit% - coin% over RESOLVED trades only. Not evidence: "
+          "open trades can give it back by the close.")
     print(f"  {'stop':>5}{'tgt':>6}{'R:R':>5}{'resolved':>9}{'hit%':>7}"
-          f"{'rand%':>7}{'edge':>7}{'grossR':>8}{'netR':>8}")
-    print("  " + "-" * 62)
+          f"{'coin%':>7}{'hitgap':>7}{'grossR':>8}{'coinR':>8}{'edgeR':>8}"
+          f"{'netR':>8}")
+    print("  " + "-" * 78)
+
+    def cell(value, spec: str, width: int, scale: float = 1.0) -> str:
+        """One right-aligned number, or n/a when the cell has none.
+
+        The sign flag has to precede the width in a format spec, so a
+        signed spec like "+.3f" becomes ">+8.3f", never ">8+.3f". The
+        value is rounded to the printed precision first, so a tiny
+        negative prints as +0.000 rather than -0.000.
+        """
+        if value is None:
+            return f"{'n/a':>{width}}"
+        sign, rest = ("+", spec[1:]) if spec.startswith("+") else ("", spec)
+        places = int(rest[1:-1])
+        shown = round(value * scale, places) + 0.0
+        return f"{shown:>{sign}{width}{rest}}"
+
     for row in sorted(summary["grid"], key=_net_r_desc):
         if row["hit_rate"] is None:
             continue
         mark = "  <<" if best and row is best else ""
         print(f"  {row['stop']:>5.2f}{row['target']:>6.2f}"
               f"{row['reward_risk']:>5.1f}{row['resolved']:>9,}"
-              f"{row['hit_rate'] * 100:>7.1f}{row['random_rate'] * 100:>7.1f}"
-              f"{row['edge_pp']:>+7.1f}{row['gross_r']:>+8.3f}"
-              f"{row['net_r']:>+8.3f}{mark}")
+              f"{cell(row['hit_rate'], '.1f', 7, 100.0)}"
+              f"{cell(row.get('random_rate'), '.1f', 7, 100.0)}"
+              f"{cell(row.get('edge_pp'), '+.1f', 7)}"
+              f"{cell(row['gross_r'], '+.3f', 8)}"
+              f"{cell(row.get('random_gross_r'), '+.3f', 8)}"
+              f"{cell(row.get('edge_r'), '+.3f', 8)}"
+              f"{cell(row['net_r'], '+.3f', 8)}{mark}")
+    if best:
+        print(f"  << marks the best of {len(summary['grid'])} cells, chosen "
+              f"after seeing them. That choice is not evidence of an edge.")
+
+
+def reference_breakout(ctx: Context) -> "str | None":
+    """The structural core of the shipped rule, and nothing else.
+
+    LONG when price is above the session VWAP AND above the opening-range
+    high; SHORT on the mirror; None otherwise, including before the range
+    has closed. The live scanner adds relative-volume, strength, turnover
+    and reachability gates on top, so this measures the direction call
+    those gates filter, not the full scanner. It is here so the README's
+    headline figures can be reproduced from the repository rather than
+    from a script that was never committed.
+    """
+    if not ctx.orb_closed:
+        return None
+    line = float(ctx.vwap[-1])
+    if not np.isfinite(line):
+        return None
+    # The same comparisons as setups.direction, ties included: price AT
+    # the VWAP is "not above" it there, so it counts on the SHORT side.
+    above_vwap = ctx.price > line
+    if above_vwap and ctx.price > ctx.orb_high:
+        return LONG
+    if not above_vwap and ctx.price < ctx.orb_low:
+        return SHORT
+    return None
+
+
+def main(argv: "list[str] | None" = None) -> int:
+    """Measure reference_breakout over the cached one-year 5-minute bars.
+
+    Reads only the local bar cache, through forecast_diagnostics'
+    loader so the cache naming lives in one place rather than here as
+    well. Never fetches. The benchmark index is dropped: it is not a
+    tradeable name and the rule reads no benchmark field.
+    """
+    import argparse
+
+    import forecast_diagnostics
+
+    parser = argparse.ArgumentParser(description=main.__doc__)
+    parser.add_argument("--limit", type=int, default=0,
+                        help="measure only the first N symbols (0 = all)")
+    args = parser.parse_args(argv)
+    frames = forecast_diagnostics.load_frames()
+    frames.pop(forecast_diagnostics.BENCHMARK, None)
+    if args.limit > 0:
+        frames = dict(list(frames.items())[:args.limit])
+    if not frames:
+        print("No cached 5-minute bars found under bar_cache.")
+        return 1
+    rows = run_rule(reference_breakout, frames,
+                    warmup=forecast_diagnostics.WARMUP)
+    print_report("reference_breakout: VWAP side + opening-range break",
+                 summarise(rows))
+    # The shipped geometry in this harness's units: the live stop fraction
+    # of one plausible move, and the live reward-to-risk multiple of it.
+    stop = config.SCAN_STOP_FRACTION
+    shipped = edge_by_session(rows, stop, stop * config.SCAN_REWARD_RISK)
+    if shipped["edge_r"] is not None:
+        interval = ("not estimable (too few sessions)"
+                    if shipped["low"] is None else
+                    f"95% interval {shipped['low']:+.3f} to "
+                    f"{shipped['high']:+.3f} R")
+        print(f"\n  Shipped geometry (stop {shipped['stop']:.2f}, target "
+              f"{shipped['target']:.2f}): edge over the coin "
+              f"{shipped['edge_r']:+.4f} R per signal, {interval}, "
+              f"resampling {shipped['sessions']} whole sessions.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

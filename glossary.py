@@ -80,7 +80,9 @@ COLUMNS = {
     "Price": "Most recent closing price.",
     "Qty": "How many shares fit your capital and risk settings. Not a "
            "suggestion to buy that many.",
-    "Risk": "Rupees you would lose if the stop is hit exactly. Comes from "
+    "Risk": "Rupees you would lose if the stop is hit exactly, charges "
+            "INCLUDED - the Cost column is already inside this figure, so "
+            "do not add the two. The size is chosen so this stays within "
             "your risk-per-trade setting.",
     "Cost": "Total charges to get in and out once: brokerage, taxes and "
             "exchange fees. Unavoidable.",

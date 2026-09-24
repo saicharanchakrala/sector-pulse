@@ -484,7 +484,9 @@ def approach(reading: Readings,
     if orb is None or reading.vwap is None or not reading.range_closed:
         return None
     atr = reading.atr_bar
-    if not atr or atr <= 0.0:
+    # isfinite, not just truthiness: NaN is truthy and fails every `<=`,
+    # so `not atr or atr <= 0.0` let a NaN ATR through to distance / nan.
+    if atr is None or not math.isfinite(atr) or atr <= 0.0:
         return None
     last = reading.last
     if last > orb.high or last < orb.low:
@@ -598,10 +600,14 @@ def evaluate(reading: Readings, capital: float = config.SCAN_CAPITAL,
     reasons.append(oi_line)
 
     orb = reading.opening_range
+    # `atr_bar or 0.0` did not catch NaN, which is truthy. build_levels now
+    # refuses NaN itself; mapping it to 0.0 here as well keeps the intent
+    # readable at the call site.
+    atr = reading.atr_bar
     trade = levels_mod.build_levels(
         direction=direction,
         entry=reading.last,
-        atr_per_bar=reading.atr_bar or 0.0,
+        atr_per_bar=atr if atr is not None and math.isfinite(atr) else 0.0,
         bars_left=reading.bars_left,
         opening_low=orb.low if orb else None,
         opening_high=orb.high if orb else None,
@@ -611,13 +617,23 @@ def evaluate(reading: Readings, capital: float = config.SCAN_CAPITAL,
         risk_pct=risk_pct,
     )
     if trade is None:
-        reasons.append("could not build levels: no ATR or the stop collapsed "
-                       "onto the entry [FAIL]")
+        # The ceiling is named only when it is the cause. Listing it among
+        # every possible reason made the trail claim it on a NaN ATR too.
+        if (risk_pct is not None and math.isfinite(risk_pct)
+                and risk_pct > config.SCAN_MAX_RISK_PCT):
+            why = (f"the {risk_pct:g}% risk per trade is above the "
+                   f"{config.SCAN_MAX_RISK_PCT:g}% ceiling")
+        else:
+            why = ("no usable ATR, the stop collapsed onto the entry, or not "
+                   "one share fits the budget once charges are counted")
+        reasons.append(f"could not build levels: {why} [FAIL]")
         return Setup(reading, direction, None, False, 0.0, reasons)
 
     reasons.append(f"stop {trade.stop:.2f} from the {trade.stop_source}, "
                    f"{trade.stop_pct:.2f}% away, sizing {trade.quantity} "
-                   f"shares for {trade.lot_risk:,.0f} at risk [PASS]")
+                   f"shares for {trade.lot_risk:,.0f} of price risk plus "
+                   f"{trade.cost_rupees:,.0f} of charges = "
+                   f"{trade.risk_with_costs:,.0f} lost at the stop [PASS]")
     if trade.capital_capped:
         reasons.append(f"size capped by funding at {trade.quantity} shares "
                        f"({trade.entry * trade.quantity:,.0f} notional), so "
@@ -643,6 +659,443 @@ def rank(setups: list[Setup]) -> list[Setup]:
                   reverse=True)
 
 
+# Lead-ins of the audit line a portfolio cap writes. Stable text on
+# purpose: scan_intraday.first_blocker and scan_publish.log_row store the
+# first 120 characters of the failing reason as `blocked_by`, and the
+# figures after the lead-in differ row to row (as they do for every other
+# gate), so a PREFIX match on these is how the scan log groups capped
+# rows. capped_by_portfolio recognises a capped setup the same way.
+PORTFOLIO_RISK_CAP = "portfolio risk cap"
+PORTFOLIO_NOTIONAL_CAP = "portfolio notional cap"
+
+# Relative slack on the cap comparisons, for the same reason as
+# TradeLevels._REACH_TOLERANCE: five setups each held to exactly the
+# budget sum to exactly the cap in real arithmetic, and a float sum must
+# not refuse the fifth over a rounding error. One part in a billion of a
+# 5,000 cap is five millionths of a rupee.
+_CAP_TOLERANCE = 1e-9
+
+
+@dataclass(frozen=True)
+class PortfolioExposure:
+    """What one scan snapshot commits in total, against the two caps."""
+
+    risk_used: float            # rupees lost if every kept setup stops out
+    risk_cap: float
+    notional_used: float        # rupees of position across the kept setups
+    notional_cap: float
+    kept: int                   # actionable setups inside the caps
+    blocked: int                # actionable setups the caps turned away
+
+    @property
+    def risk_used_pct_of_cap(self) -> float:
+        """Share of the combined risk cap in use, 0.0 when there is no cap."""
+        if self.risk_cap <= 0.0:
+            return 0.0
+        return self.risk_used / self.risk_cap * 100.0
+
+
+def _cap_settings(capital: "float | None", max_risk_pct: "float | None",
+                  leverage: "float | None"
+                  ) -> tuple[float, float, float, float, float]:
+    """Resolve the cap inputs and the two caps, reading config at CALL time.
+
+    Returns (capital, max_risk_pct, leverage, risk_cap, notional_cap).
+
+    None defaults rather than config values bound into the signature,
+    because a default argument is evaluated once at import: a test that
+    monkeypatches config, or a CLI run with --capital, would otherwise be
+    capped against the capital the module happened to import with.
+
+    FAILS CLOSED on an unusable setting. NaN compares False with
+    everything, so a NaN cap would block nothing at all; an unusable cap
+    is returned as 0.0 instead, which blocks every actionable setup and
+    says so in each audit line.
+    """
+    capital = float(config.SCAN_CAPITAL if capital is None else capital)
+    max_risk_pct = float(config.SCAN_MAX_OPEN_RISK_PCT
+                         if max_risk_pct is None else max_risk_pct)
+    leverage = float(config.SCAN_MIS_LEVERAGE if leverage is None
+                     else leverage)
+    risk_cap = capital * max_risk_pct / 100.0
+    notional_cap = capital * leverage
+    if not (math.isfinite(risk_cap) and risk_cap > 0.0):
+        risk_cap = 0.0
+    if not (math.isfinite(notional_cap) and notional_cap > 0.0):
+        notional_cap = 0.0
+    return capital, max_risk_pct, leverage, risk_cap, notional_cap
+
+
+def capped_by_portfolio(setup: Setup) -> bool:
+    """Whether a portfolio cap, rather than a gate, is what blocked this setup."""
+    return any(reason.startswith((PORTFOLIO_RISK_CAP, PORTFOLIO_NOTIONAL_CAP))
+               and "[FAIL]" in reason for reason in (setup.reasons or []))
+
+
+def apply_portfolio_caps(ranked: list[Setup],
+                         capital: "float | None" = None,
+                         max_risk_pct: "float | None" = None,
+                         leverage: "float | None" = None) -> list[Setup]:
+    """Hold one scan's actionable setups inside a combined risk and funding cap.
+
+    WHY. Every setup is sized on its own against its own stop, so the
+    per-trade budget bounds each row and nothing bounded the total. On
+    2026-09-22 the scan log marked 569 setups taken, each risking 1,000 of
+    1,00,000 - a book that, entered in full, loses more than five times the
+    account on one bad afternoon.
+
+    THE RULE. Walk the ACTIONABLE setups in the order given (rank order,
+    best first) and keep each while two running totals stay inside their
+    caps:
+
+        risk      sum of risk_with_costs      <= capital * max_risk_pct / 100
+        notional  sum of entry * quantity     <= capital * leverage
+
+    Risk is counted WITH charges, because that is what a stop-out actually
+    takes. The first setup that would breach either cap CLOSES the book:
+    it and every lower-ranked actionable setup are turned non-actionable
+    with an audit line, even one small enough to squeeze into what is left.
+    Back-filling would let position size rather than rank decide which
+    trades are taken, and it would favour exactly the funding-capped names
+    that deploy less than the full budget; closing keeps the kept set equal
+    to the top of the ranking, which is the statement a reader can check.
+
+    The audit line reads "<lead-in>: ... [FAIL] [ENTRY]". The lead-in is
+    PORTFOLIO_RISK_CAP or PORTFOLIO_NOTIONAL_CAP, naming the cap the
+    closing setup breached (risk first when it breached both), so
+    scan_intraday.first_blocker records it as `blocked_by`. [ENTRY] marks
+    it as a reason not to OPEN the trade - the same tag the room-to-move
+    gate uses - so the position watch does not tell someone already in
+    the trade that it "no longer clears the gates" because other setups
+    ranked above it.
+
+    NOT ENFORCED, AND WORTH SAYING PLAINLY: the cap bounds what ONE scan
+    snapshot marks actionable. The scanner never learns which suggestions
+    were entered, so positions already open are not subtracted, and a
+    symbol capped in one 30-second pass can be the one kept in the next.
+    Anything that unions snapshots over a session can therefore hold more
+    than one snapshot's worth. THE SCAN LOG IS SUCH A UNION: its `taken`
+    column is true for a setup that was actionable in ANY pass that day
+    (scan_publish.remember lets a taken row replace a blocked one and
+    never the reverse), so a session's `taken` set can hold far more than
+    the risk cap allows at any one instant. Read `taken` as "was inside
+    the cap in at least one snapshot", never as "the book the cap held".
+
+    Pure: nothing is mutated. Non-actionable setups pass through as the
+    same objects, capped ones are copies via dataclasses.replace with
+    passed=False and the extra reason. rank_score is kept, so the copy
+    still shows what the rule scored before the cap turned it away. The
+    input order is preserved, which is still a valid rank order.
+    """
+    (capital, max_risk_pct, leverage,
+     risk_cap, notional_cap) = _cap_settings(capital, max_risk_pct, leverage)
+    used_risk = used_notional = 0.0
+    kept = 0
+    closed_by = ""                  # which cap closed the book, once one has
+    closed_at = 0                   # 1-based actionable rank that closed it
+    position = 0
+    out: list[Setup] = []
+    for setup in ranked:
+        if not setup.actionable:
+            out.append(setup)
+            continue
+        position += 1
+        trade = setup.levels
+        risk = trade.risk_with_costs
+        notional = trade.entry * trade.quantity
+        if not closed_by:
+            over_risk = used_risk + risk > risk_cap * (1.0 + _CAP_TOLERANCE)
+            over_notional = (used_notional + notional
+                             > notional_cap * (1.0 + _CAP_TOLERANCE))
+            if not (over_risk or over_notional):
+                used_risk += risk
+                used_notional += notional
+                kept += 1
+                out.append(setup)
+                continue
+            closed_by = (PORTFOLIO_RISK_CAP if over_risk
+                         else PORTFOLIO_NOTIONAL_CAP)
+            closed_at = position
+        reason = (
+            f"{closed_by}: the {kept} higher-ranked setup(s) kept already "
+            f"lose {used_risk:,.0f} at their stops against a combined cap "
+            f"of {risk_cap:,.0f} ({max_risk_pct:g}% of {capital:,.0f}) and "
+            f"hold {used_notional:,.0f} of the {notional_cap:,.0f} notional "
+            f"allowed ({leverage:g}x); the book closed at actionable rank "
+            f"{closed_at} and is not back-filled, so this setup's "
+            f"{risk:,.0f} at risk on {notional:,.0f} of notional is not "
+            f"taken [FAIL] [ENTRY]")
+        out.append(dataclasses.replace(setup, passed=False,
+                                       reasons=[*setup.reasons, reason]))
+    blocked = position - kept
+    if blocked:
+        logger.info("Portfolio caps kept %d of %d actionable setups (%s "
+                    "closed the book at rank %d): %.0f of %.0f risk, %.0f "
+                    "of %.0f notional", kept, position, closed_by,
+                    closed_at, used_risk, risk_cap, used_notional,
+                    notional_cap)
+    return out
+
+
+def portfolio_exposure(ranked: list[Setup],
+                       capital: "float | None" = None,
+                       max_risk_pct: "float | None" = None,
+                       leverage: "float | None" = None) -> PortfolioExposure:
+    """Totals of a capped scan, for the report and the dashboard.
+
+    Reads the result of apply_portfolio_caps rather than re-running it, so
+    the figures on screen are the ones the cap actually enforced: `kept`
+    is what is still actionable, `blocked` is what carries a portfolio cap
+    line.
+    """
+    *_, risk_cap, notional_cap = _cap_settings(capital, max_risk_pct,
+                                               leverage)
+    actionable = [s for s in ranked if s.actionable]
+    return PortfolioExposure(
+        risk_used=sum(s.levels.risk_with_costs for s in actionable),
+        risk_cap=risk_cap,
+        notional_used=sum(s.levels.entry * s.levels.quantity
+                          for s in actionable),
+        notional_cap=notional_cap,
+        kept=len(actionable),
+        blocked=sum(1 for s in ranked if capped_by_portfolio(s)),
+    )
+
+
+def _cap_lead_in(reasons) -> str:
+    """The portfolio-cap lead-in among these reasons, or "" when none is one.
+
+    The same test capped_by_portfolio applies - a reason that STARTS with a
+    lead-in and carries [FAIL] - returning which cap it names, so a caller
+    can say which cap closed the book rather than only that one did.
+    """
+    for reason in reasons or []:
+        text = str(reason)
+        if "[FAIL]" not in text:
+            continue
+        for lead_in in (PORTFOLIO_RISK_CAP, PORTFOLIO_NOTIONAL_CAP):
+            if text.startswith(lead_in):
+                return lead_in
+    return ""
+
+
+def closing_cap(ranked: list[Setup]) -> str:
+    """Which cap closed the book in a capped ranking, or "" if none closed it.
+
+    Read off the first capped setup's audit line: apply_portfolio_caps
+    writes the SAME lead-in on every setup after the book closes, so the
+    first one found is the answer for all of them.
+    """
+    for setup in ranked:
+        lead_in = _cap_lead_in(setup.reasons)
+        if lead_in:
+            return lead_in
+    return ""
+
+
+def cap_config_problem(risk_pct: "float | None" = None,
+                       capital: "float | None" = None,
+                       max_risk_pct: "float | None" = None,
+                       leverage: "float | None" = None) -> str:
+    """Why the combined caps cannot hold one full-size trade; "" when they can.
+
+    THE MISCONFIGURATION THIS NAMES. apply_portfolio_caps fails closed, so
+    an unusable cap - NaN, zero, negative - blocks every actionable setup.
+    So, in practice, does a risk cap set BELOW the per-trade risk: with
+    SCAN_MAX_OPEN_RISK_PCT at 1.5 and 2% risked per trade, the top setup
+    alone breaches the cap and closes the book on everything after it.
+    Either way the scan comes back empty, and an empty scan is also what a
+    quiet market looks like - so without this the fault read as "nothing
+    set up today", which is the one reading it must never get.
+
+    Used by scan_intraday._parse_args to refuse the run outright, by the
+    dashboard to show an error rather than an empty table, and by
+    cap_blocked_all_text to name the cause. Config is read at call time,
+    as _cap_settings does.
+
+    A plain `<` on the configured percents: a cap EQUAL to the per-trade
+    risk holds exactly one full-size trade, which is tight but legal. A
+    per-trade risk that is not a finite positive number is not judged
+    here; the sizer and the CLI already refuse it on their own terms.
+    """
+    (capital, max_risk_pct, leverage,
+     risk_cap, notional_cap) = _cap_settings(capital, max_risk_pct, leverage)
+    per_trade = float(config.SCAN_RISK_PCT_PER_TRADE if risk_pct is None
+                      else risk_pct)
+    if risk_cap <= 0.0:
+        return (f"the combined risk cap is unusable ({max_risk_pct:g}% of "
+                f"{capital:,.0f}, config.SCAN_MAX_OPEN_RISK_PCT), and an "
+                f"unusable cap blocks every setup")
+    if notional_cap <= 0.0:
+        return (f"the funding cap is unusable ({leverage:g}x of "
+                f"{capital:,.0f}, config.SCAN_MIS_LEVERAGE), and an "
+                f"unusable cap blocks every setup")
+    if (math.isfinite(per_trade) and per_trade > 0.0
+            and max_risk_pct < per_trade):
+        return (f"the combined risk cap of {max_risk_pct:g}% "
+                f"(config.SCAN_MAX_OPEN_RISK_PCT) is below the "
+                f"{per_trade:g}% one trade may lose, so the top full-size "
+                f"setup breaches it on its own and closes the book")
+    return ""
+
+
+def cap_blocked_all_text(held: int, closed_by: str = PORTFOLIO_RISK_CAP,
+                         risk_pct: "float | None" = None,
+                         capital: "float | None" = None,
+                         max_risk_pct: "float | None" = None,
+                         leverage: "float | None" = None) -> str:
+    """The empty-scan message for when a portfolio cap, not the gates, emptied it.
+
+    The CLI and the dashboard used to call every empty scan a quiet market
+    ("the expected answer", "not a fault"). When `held` setups cleared
+    every gate and a cap turned all of them away, that is false: a
+    working cap always keeps the top setup, because no single setup can
+    lose more than the per-trade budget or fund more than the notional
+    cap. So this names the cap that closed the book, its value in percent
+    and rupees, and the per-trade risk it was compared with, and says in
+    so many words that it is a configuration fault.
+
+    Plain sentences with rupee figures and no markup, so the CLI can wrap
+    it and the dashboard can show it as it is. `closed_by` is a lead-in
+    (see closing_cap); the per-trade budget comes from levels.risk_budget,
+    the one place it is computed.
+    """
+    (capital, max_risk_pct, leverage,
+     risk_cap, notional_cap) = _cap_settings(capital, max_risk_pct, leverage)
+    per_trade = float(config.SCAN_RISK_PCT_PER_TRADE if risk_pct is None
+                      else risk_pct)
+    budget = levels_mod.risk_budget(capital, per_trade)
+    which = ("funding (notional) cap" if closed_by == PORTFOLIO_NOTIONAL_CAP
+             else "combined risk cap")
+    budget_text = (f"{budget:,.0f} rupees" if budget > 0.0
+                   else "nothing, because the sizer refuses that percent")
+    problem = cap_config_problem(per_trade, capital, max_risk_pct, leverage)
+    cause = (f"The cause: {problem}." if problem else
+             "The top setup alone did not fit, which a working "
+             "configuration never produces.")
+    return (
+        f"Nothing is actionable because the {which} held back all {held} "
+        f"setup(s) that cleared every gate. The risk cap is "
+        f"{max_risk_pct:g}% of {capital:,.0f} = {risk_cap:,.0f} rupees "
+        f"(config.SCAN_MAX_OPEN_RISK_PCT) and the funding cap "
+        f"{notional_cap:,.0f} ({leverage:g}x); one trade may lose up to "
+        f"{per_trade:g}% = {budget_text} at its stop. {cause} This is a "
+        f"configuration fault, not a quiet market: fix the cap and re-run.")
+
+
+@dataclass(frozen=True)
+class PublishedExposure:
+    """Combined exposure rebuilt from a PUBLISHED scan table, and what it shows."""
+
+    exposure: PortfolioExposure
+    held: tuple                 # symbols a cap line held back, in table order
+    closed_by: str              # lead-in of the cap that closed the book, or ""
+    cap_seen: bool              # at least one row carries a portfolio-cap line
+    over_cap: bool              # actionable rows exceed a cap beyond rounding
+    unpriced: int               # actionable rows lacking entry, stop or quantity
+    uncharged: int              # actionable rows lacking cost_rupees
+
+
+def _cell_number(value) -> "float | None":
+    """A finite float from a published cell; None for None, NaN, inf or text."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _cell_flag(value) -> bool:
+    """A published boolean cell as a bool, with a missing cell read as False.
+
+    NOT bool(value): NaN is truthy, and a column absent from some rows of
+    an older table arrives as NaN, which bool() would read as actionable.
+    """
+    if value is None or (isinstance(value, float) and value != value):
+        return False
+    try:
+        return bool(value)
+    except (TypeError, ValueError):
+        return False
+
+
+def published_exposure(rows, capital: "float | None" = None,
+                       max_risk_pct: "float | None" = None,
+                       leverage: "float | None" = None) -> PublishedExposure:
+    """portfolio_exposure for a published table, rebuilt from its columns.
+
+    WHY. The dashboard's main live path reads the table the feed publishes
+    (scan_publish.row_for, one dict per row), not Setup objects, so it had
+    no combined-risk block at all - and its help text claimed the feed
+    applies the cap, which is true only of a feed redeployed with the cap
+    in it. This rebuilds the same totals from the columns the table does
+    carry, so the claim can be checked instead of asserted. `rows` is an
+    iterable of dicts - table.to_dict("records") - not the DataFrame
+    itself, whose truth value pandas refuses to give.
+
+    THE ARITHMETIC. For every row with `actionable` true, the loss at the
+    stop is abs(entry - stop) * quantity + cost_rupees - risk_with_costs
+    rebuilt, since lot_risk is quantity times the stop distance - and the
+    notional is entry * quantity. Rows are read in the order given; the
+    feed writes its table in rank order, so `held` is in rank order too.
+
+    ROUNDING. row_for rounds entry, stop and cost to two places, so the
+    rebuilt loss can differ from the one the cap enforced by up to one
+    paisa a share plus a paisa a row, and the notional by half a paisa a
+    share. `over_cap` is set only past that allowance, so a table the cap
+    did hold is never reported as breaching it; it is left False when the
+    cap itself is unusable, because the table cannot be judged against it
+    (cap_config_problem names that fault instead).
+
+    ROBUST TO OLDER TABLES, because the feed and the UI deploy separately.
+    No `reasons` column means no cap line can be seen. A row with no
+    `cost_rupees` counts price risk only and is tallied in `uncharged`, so
+    the caller can say the total UNDERSTATES the loss. An actionable row
+    missing entry, stop or quantity is left out of the sums, tallied in
+    `unpriced`, and still counted as kept.
+    """
+    *_, risk_cap, notional_cap = _cap_settings(capital, max_risk_pct,
+                                               leverage)
+    risk_used = notional_used = 0.0
+    risk_slack = notional_slack = 0.0
+    kept = unpriced = uncharged = 0
+    held: list = []
+    closed_by = ""
+    for row in (rows if rows is not None else []):
+        lead_in = _cap_lead_in(str(row.get("reasons") or "").split(" | "))
+        if lead_in:
+            held.append(row.get("symbol"))
+            closed_by = closed_by or lead_in
+        if not _cell_flag(row.get("actionable")):
+            continue
+        kept += 1
+        entry = _cell_number(row.get("entry"))
+        stop = _cell_number(row.get("stop"))
+        quantity = _cell_number(row.get("quantity"))
+        if entry is None or stop is None or quantity is None:
+            unpriced += 1
+            continue
+        cost = _cell_number(row.get("cost_rupees"))
+        if cost is None:
+            uncharged += 1
+            cost = 0.0
+        risk_used += abs(entry - stop) * quantity + cost
+        notional_used += entry * quantity
+        risk_slack += 0.01 * quantity + 0.01
+        notional_slack += 0.005 * quantity
+    over_risk = (risk_cap > 0.0 and risk_used
+                 > risk_cap * (1.0 + _CAP_TOLERANCE) + risk_slack)
+    over_notional = (notional_cap > 0.0 and notional_used
+                     > notional_cap * (1.0 + _CAP_TOLERANCE) + notional_slack)
+    exposure = PortfolioExposure(
+        risk_used=risk_used, risk_cap=risk_cap, notional_used=notional_used,
+        notional_cap=notional_cap, kept=kept, blocked=len(held))
+    return PublishedExposure(
+        exposure=exposure, held=tuple(held), closed_by=closed_by,
+        cap_seen=bool(held), over_cap=bool(over_risk or over_notional),
+        unpriced=unpriced, uncharged=uncharged)
+
+
 def top_setup(setups: list[Setup]) -> "Setup | None":
     """Highest-scoring actionable setup, or None when nothing cleared."""
     ready = [s for s in setups if s.actionable]
@@ -661,7 +1114,10 @@ def explain(setup: Setup) -> str:
         return f"{head}: {failed[0].replace(' [FAIL]', '')}." if failed else f"{head}."
     trade = setup.levels
     if trade is None or not setup.passed:
-        failed = [r.replace(" [FAIL]", "") for r in setup.reasons if "[FAIL]" in r]
+        # Everything from the first " [" off, not just " [FAIL]": the room
+        # gate and the portfolio cap also carry an [ENTRY] tag, which is
+        # for the position watch, not for a sentence.
+        failed = [r.split(" [")[0] for r in setup.reasons if "[FAIL]" in r]
         return (f"{reading.symbol} points {setup.direction.lower()} but is not "
                 f"actionable: " + "; ".join(failed) + ".")
     side = "buy" if setup.direction == LONG else "sell short"
@@ -671,7 +1127,9 @@ def explain(setup: Setup) -> str:
         f"({trade.stop_pct:.2f}% away, set by the {trade.stop_source}) and to "
         f"exit into {trade.target:.2f} ({trade.target_pct:.2f}%), which is "
         f"{trade.reward_risk:.1f} times the risk. At {trade.quantity} shares "
-        f"that puts {trade.lot_risk:,.0f} rupees at risk to make "
+        f"that puts {trade.lot_risk:,.0f} rupees at risk on the move - "
+        f"{trade.risk_with_costs:,.0f} once charges are counted, which is "
+        f"what the size is held to - to make "
         f"{trade.lot_risk * trade.reward_risk:,.0f} before costs. Volume is "
         f"running {reading.rvol:.2f}x its usual pace for this time of day and "
         f"the stock is {reading.relative_strength:+.2f}pp against the Nifty"

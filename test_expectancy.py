@@ -30,7 +30,9 @@ a multiplication and not an estimate.
 """
 from __future__ import annotations
 
+import itertools
 import random
+from datetime import date, timedelta
 
 import pytest
 
@@ -45,11 +47,26 @@ STOP_PCT = 1.5
 BREAKEVEN = 0.1224
 COST_R = BREAKEVEN / STOP_PCT
 
+# EVERY ROW GETS A SESSION AND AN IN-WINDOW SCAN TIME. The report now
+# drops rows it cannot place inside the scan window and needs
+# MIN_SESSIONS distinct run_dates, so a fixture with no run_date - which
+# is what every row here used to be - would be refused by both and every
+# readout test below would pass or fail for the wrong reason. Dates
+# rotate through MIN_SESSIONS + 5 weekdays, so any 40 consecutive rows
+# span all of them whatever test ran first. See test_calibrate_sessions
+# for the floors themselves.
+_SESSIONS = [day for day in (date(2026, 7, 1) + timedelta(days=offset)
+                             for offset in range(80))
+             if day.weekday() < 5][:calibrate.MIN_SESSIONS + 5]
+_NEXT_SESSION = itertools.count()
+
 
 def _row(**over):
     """A 2:1 setup with a realistic Indian intraday round trip."""
+    session = _SESSIONS[next(_NEXT_SESSION) % len(_SESSIONS)]
     row = {
         "row_id": f"r{random.random()}",
+        "run_date": session.isoformat(), "run_time": "10:30:00",
         "replayed": "",
         "taken": "True",
         "score": "0.65",
@@ -169,6 +186,11 @@ def test_the_derived_rate_equals_the_property_it_replaces() -> None:
         if trade is None:
             continue
         checked += 1
+        # The sizer's contract, now that charges come OUT of the budget
+        # rather than on top of it: the whole loss at the stop, move plus
+        # round trip, fits capital * risk_pct / 100 on every build.
+        assert trade.lot_risk + trade.cost_rupees <= levels.risk_budget(
+            config.SCAN_CAPITAL, config.SCAN_RISK_PCT_PER_TRADE), trade
         derived = calibrate.required_from_row({
             "entry": trade.entry, "stop": trade.stop,
             "target": trade.target, "stop_pct": trade.stop_pct,
@@ -256,10 +278,25 @@ def test_expectancy_is_the_mean_net_r() -> None:
 
 
 def test_expectancy_in_rupees_is_the_r_figure_converted() -> None:
-    """The video's headline number, in the currency actually risked."""
+    """The video's headline number, in the currency actually risked.
+
+    Converted at one R of PRICE risk, which is the budget less the round
+    trip because the sizer fits both inside it - not at the whole budget,
+    which would overstate every rupee figure by the charges' share.
+    """
     exp = calibrate.expectancy(_population())
+    one_r = calibrate.rupees_per_r() / (1.0 + COST_R)
+    assert exp["rupees_per_r"] == pytest.approx(one_r)
+    assert exp["rupees_per_r"] < calibrate.rupees_per_r()
     assert exp["expectancy_rupees"] == pytest.approx(
-        exp["expectancy_r"] * calibrate.rupees_per_r())
+        exp["expectancy_r"] * one_r)
+
+
+def test_a_full_stop_out_costs_the_whole_budget_in_rupees() -> None:
+    """-1 R of price plus the charges is exactly the budget, no more."""
+    stop = _row(r_multiple=-1.0, outcome="STOP")
+    loss = calibrate.net_r(stop) * calibrate.price_r_rupees(stop)
+    assert loss == pytest.approx(-calibrate.rupees_per_r())
 
 
 def test_the_rupee_figure_moves_with_the_configured_risk(monkeypatch) -> None:
@@ -418,10 +455,11 @@ def test_the_floor_counts_usable_rows_not_rows() -> None:
 
 
 def test_below_the_floor_the_conversion_is_still_stated() -> None:
-    """What one R is worth is a config constant and knowable today; what
+    """What a trade risks is a config constant and knowable today; what
     the average trade returns is a statistic and is not."""
     out = calibrate.report(_live(5))
-    assert "One R is Rs 1,000" in out
+    assert "Each trade risks Rs 1,000" in out
+    assert "including charges" in out
     assert "withheld" in out
 
 

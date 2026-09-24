@@ -293,35 +293,54 @@ symbols on most days.
 
 ### Read this before using any of it
 
-**No rule here has a measured edge, and one has been measured to have
-none.** The harness in `edge_lab.py` ran the shipped rule over 3,537 signals
-across 49 sessions and 60 names:
+**No rule here has a measured edge. The direction call has been measured,
+and it is a coin flip.** `python -m edge_lab` runs the structural core of
+the rule - VWAP side plus opening-range break, none of the other gates -
+over the cached year of 5-minute bars: 54,397 signals across 229 sessions
+and 210 names.
 
 | | p10 | p25 | p50 | p75 | p90 | mean |
 |---|---|---|---|---|---|---|
-| Favourable excursion (MFE) | 0.063 | 0.178 | 0.419 | 0.785 | 1.290 | 0.601 |
-| Adverse excursion (MAE) | 0.086 | 0.226 | 0.482 | 0.845 | 1.312 | 0.629 |
+| Favourable excursion (MFE) | 0.074 | 0.201 | 0.442 | 0.809 | 1.287 | 0.599 |
+| Adverse excursion (MAE) | 0.083 | 0.211 | 0.446 | 0.803 | 1.221 | 0.583 |
 
-Both in units of sigma, where sigma is the bar ATR grown by the square root
-of bars remaining. Two things follow, and both matter more than any feature
-in this section.
+Both in plausible-move units: the bar ATR grown by the square root of bars
+remaining, which is about 1.4 true sigma. Three things follow, and all of
+them matter more than any feature in this section.
 
-First, **adverse excursion exceeds favourable at every percentile**. After
-this breakout fires, price moves against the signal slightly more than for
-it. A rule with that property cannot be rescued by choosing a better stop or
-target, because no geometry manufactures edge that is not in the signal.
+First, **the rule is indistinguishable from tossing a coin for direction**.
+Every stop-and-target cell is compared with that coin at the same bars,
+scored under the same rules. Across all 25 cells the rule's edge over it
+lies between -0.003 R and +0.003 R. At the shipped geometry (stop 0.5,
+target 1.0) it is -0.002 R, with a 95% interval of -0.026 to +0.024 R from
+resampling whole sessions. A rule with no directional skill cannot be
+rescued by choosing a better stop or target, because no geometry
+manufactures edge that is not in the signal.
 
-Second, the rule's own target sat at 1.000 sigma, which only **16.6%** of
-signals ever reach. That is why live replays returned so few winners: the
-target was placed near the 85th percentile of favourable movement. The
-sqrt-of-time model overstated reachable range by roughly 2.4x at the median,
-because intraday prices mean-revert at short horizons rather than
-random-walking.
+Second, **costs make every geometry a loser**. Round-trip charges cost
+0.05 R to 0.32 R depending on how tight the stop is, so all 25 cells lose
+money after costs; the best nets -0.053 R per trade. That is the whole
+arithmetic of a strategy with no edge: expectancy before costs is zero, so
+expectancy after costs is minus the costs.
 
-Across the whole stop-and-target grid, **16 of 20 combinations lose money
-even at zero cost**, and the best gross expectancy is +0.047 R against the
-roughly 0.16 R that round-trip charges consume. The shipped geometry scores
-10.2 percentage points *worse* than a coin flip.
+Third, the rule's own target sat at 1.0 plausible moves, which only
+**17.3%** of signals ever reach, and 40% of signals at the shipped geometry
+reach neither level by the close. The sqrt-of-time model overstates
+reachable range by about 2.3x at the median, because intraday prices
+mean-revert at short horizons rather than random-walking.
+
+Earlier versions of this section said the shipped geometry scored 10.2
+points *worse* than a coin flip and that 16 of 20 combinations lost money
+even at zero cost. Both came from a harness that scored trades still open at
+the close as 0 R, and that compared hit rates with stop / (stop + target), a
+formula that assumes unlimited time. Counting hits only before the close,
+with a bar spanning both levels given to the stop, a pure random walk
+reaches the target first about 24% of the time at the shipped geometry, not
+33%, so the formula read chance as about nine points worse than chance. On
+this year of data the old scoring - open trades at 0 R, hit rate against
+stop / (stop + target) - reports -7.5 points; the corrected one reports
+-0.002 R. The practical conclusion does not change: no edge, and costs make
+it a loser.
 
 Every gate is a conventional technical-analysis choice, and the rank weights
 are a judgement call. Neither is validated. Treat the output as a
@@ -347,15 +366,57 @@ unvalidated belief to a veto would look like rigour while being a guess.
   break even after real charges. That number is what makes a
   reward-to-risk ratio mean anything: 2:1 sounds like an edge but only says
   a 33% hit rate breaks even *before* costs.
-- **Aggregate exposure.** Each row is sized independently against its own
-  stop, so the per-trade cap does not bound the total. The report states the
-  combined risk and notional, which on one session came to 11.5x the assumed
-  capital.
+- **Charges come out of the risk budget.** Quantity is the largest whole
+  number of shares for which the price risk to the stop PLUS the round trip
+  fits `SCAN_RISK_PCT_PER_TRADE` of `SCAN_CAPITAL` (1% of Rs 1,00,000). It
+  used to size on price risk alone and add charges on top, so the median
+  stop-out lost about Rs 1,100 against a Rs 1,000 budget. The risk per trade
+  is refused above `SCAN_MAX_RISK_PCT` (2%), the top of the range that keeps
+  a normal losing streak survivable. The scan table's Risk column is that
+  whole loss at the stop; the Cost column is part of it, not added to it.
+- **Combined risk is capped, not just reported.** Each row is sized
+  independently, so the per-trade cap alone does not bound the total: one
+  session's combined notional came to 11.5x the assumed capital. Setups are
+  now taken in rank order until their combined loss at the stop reaches
+  `SCAN_MAX_OPEN_RISK_PCT` (5% of capital) or their combined notional
+  reaches capital times MIS leverage; every lower-ranked setup is blocked
+  with a `portfolio risk cap` reason. The cap covers one scan snapshot. The
+  scanner does not know which suggestions you entered, so positions already
+  open are not subtracted, and the scan log's `taken` column is a union over
+  every 30-second pass, so a session's taken set can exceed one snapshot's
+  cap. A combined cap smaller than one trade's risk is refused by the CLI
+  and flagged in the app, and a scan the cap blocked entirely is reported as
+  a configuration fault rather than a quiet market. The feed view shows the
+  same combined-risk block and says whether the published table was capped:
+  the ECS feed applies the cap only once it is redeployed with this code.
+- **Option contracts are sized against the same budget.** A bought
+  option's worst case is the whole premium plus charges, so the lot count
+  is whatever fits the per-trade budget, and when one lot does not fit
+  nothing is suggested. At Rs 1,000 that is almost always the answer: on the
+  cached chain snapshots one at-the-money lot's worst case has a median of
+  about Rs 15,000.
+- **Losing streaks are shown before they happen.** The Scan tab and the CLI
+  footer print, for the configured risk, the drawdown after 5, 10, 15 and 20
+  straight losses, the gain needed to recover it, and how likely that streak
+  is in 100 trades at the win rate of a system with no edge (the measured
+  case). At 2:1 that is a 33% win rate: five straight losses are a near
+  certainty (99.7%) and ten happen 43% of the time. The chance of a 50%
+  drawdown within 100 trades is 0.02% at 1% risk, 8.7% at 2% and 60% at 5%.
 - **Nothing is computable before 09:30.** The opening range covers the first
   15 minutes, so until it closes the latest bar is one of the bars defining
   it, the range brackets the current price by construction, and no breakout
   can be represented. The scanner says exactly that instead of printing an
-  empty result that looks like a quiet market.
+  empty result that looks like a quiet market. The live feed's scan loop is
+  idle outside 09:30 to 15:30 IST and scans only names with a bar stamped
+  today, and neither the feed nor the CLI logs a setup outside that window:
+  before it, a scan reads the previous session's bars under today's date,
+  which is how 2,350 of the first 9,800 logged outcomes came to describe
+  the wrong day.
+- **The track record counts sessions, not rows.** `calibrate.py` prints no
+  hit rate or expectancy until it has 30 usable outcomes from at least 20
+  sessions, and then prints the mean with a 95% interval that resamples
+  whole sessions. Setups logged on one day share that day's move, so a
+  thousand rows from three days is three observations, not a thousand.
 - **A data failure is not a quiet market.** Zero bars returned prints as a
   data failure, not as an absence of setups.
 
@@ -503,11 +564,28 @@ each rule: one signal per direction per session taken on the first bar it
 fires, a bar spanning both stop and target counted as a stop, and unresolved
 positions marked out at the close rather than discarded.
 
-The output is a grid of stop and target sizes with, for each, the hit rate,
-the hit rate a driftless random walk would give that same geometry, and the
-difference. That difference is the only evidence of predictive skill. A high
-hit rate at a reward-to-risk below 1 proves nothing: 87% wins at 0.33 R:R is
-what a random walk already pays.
+The output is a grid of stop and target sizes with, for each, the hit rate
+and expectancy in R, the same two numbers for a coin tossed for direction at
+the same bars, and the differences. Every signal is also scored in the
+opposite direction on the same forward path, so the coin sees the same
+session end, the same volatility and the same tie rule as the rule does.
+The difference in R, `edgeR`, is the only evidence of predictive skill. A
+high hit rate at a reward-to-risk below 1 proves nothing: 87% wins at
+0.33 R:R is what a random walk already pays. And the best cell of a 25-cell
+grid is not evidence either, because the best of 25 noisy numbers always
+looks good.
+
+The `hitgap` column - hit rate minus the coin's - is printed and is not
+evidence either. It counts only the trades that reached a level, and on the
+year above it is positive in every cell (+5.5 points at the widest) while
+`edgeR` is zero: the trades that resolve early lean the rule's way, and the
+ones still open at the close give exactly that back. A hit rate can be
+bought by choosing which trades to count; expectancy in R cannot.
+
+```bash
+.venv\Scripts\python -m edge_lab            # the reference rule over the cached year
+.venv\Scripts\python -m edge_lab --limit 20 # a quick run over 20 names
+```
 
 ## Monthly contribution planner (target weights)
 

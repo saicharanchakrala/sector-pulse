@@ -22,6 +22,7 @@ from __future__ import annotations
 import math
 from datetime import date
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -237,27 +238,51 @@ def test_unresolved_trade_is_marked_at_the_close_not_at_zero() -> None:
     assert row["entry"] == pytest.approx(entry)
     assert row["close_move_sigma"] == pytest.approx(expected)
     assert row["close_move_sigma"] != 0.0
+    # The coin-flip twin is open at the bell too: a 0.5-point drift reaches
+    # neither side's levels.
+    assert set(row["flipped"].values()) == {"NEITHER"}
     summary = edge_lab.summarise(rows)
     assert summary["signals"] == 1
     for cell in summary["grid"]:
         assert cell["signals"] == 1
         assert cell["resolved"] == 0
         assert cell["hit_rate"] is None
-        assert cell["gross_r"] == pytest.approx(0.0)
+        # Marked at the close in R - the close move over the stop distance -
+        # not scored as flat. This asserted 0.0 while the test's own name
+        # said the opposite, which is how the harness shipped the bug.
+        assert cell["gross_r"] == pytest.approx(expected / cell["stop"])
+        assert cell["gross_r"] > 0.0
+        # A coin takes each side half the time, so the drift cancels and
+        # the whole gross figure is edge over the coin.
+        assert cell["random_gross_r"] == pytest.approx(0.0)
+        assert cell["edge_r"] == pytest.approx(cell["gross_r"])
 
 
 # --- summarise arithmetic ------------------------------------------------
 
-def _row(verdict: str, mfe: float, mae: float) -> dict:
-    """One hand-built row for a single (stop, target) geometry."""
+def _row(verdict: str, mfe: float, mae: float, flipped: str = "NEITHER",
+         close_move: float = 0.0) -> dict:
+    """One hand-built row for a single (stop, target) geometry.
+
+    `flipped` is the coin-flip twin's verdict on the same path, and
+    `close_move` the rule side's close move in plausible-move units.
+    """
     return {"symbol": "TEST", "day": date(2026, 1, 5), "direction": "LONG",
             "entry": 100.0, "sigma": 10.0, "mfe_sigma": mfe,
-            "mae_sigma": mae, "close_move_sigma": 0.0, (0.5, 1.0): verdict}
+            "mae_sigma": mae, "close_move_sigma": close_move,
+            (0.5, 1.0): verdict, "flipped": {(0.5, 1.0): flipped}}
 
 
 def test_summarise_expectancy_arithmetic_by_hand() -> None:
-    rows = [_row("TARGET", 1.2, 0.2), _row("TARGET", 1.1, 0.3),
-            _row("STOP", 0.1, 0.9), _row("NEITHER", 0.4, 0.4)]
+    # Rule side: two targets at +2R, one stop at -1R, one open trade that
+    # closed 0.2 up on a 0.5 stop, which is +0.4R.
+    # Twin side: each target path stopped the short out (-1R each); the
+    # stopped path closed 0.6 down, so the short was open at +1.2R; the
+    # open path is open for the short too, at -0.4R.
+    rows = [_row("TARGET", 1.2, 0.2, flipped="STOP"),
+            _row("TARGET", 1.1, 0.3, flipped="STOP"),
+            _row("STOP", 0.1, 0.9, flipped="NEITHER", close_move=-0.6),
+            _row("NEITHER", 0.4, 0.4, flipped="NEITHER", close_move=0.2)]
     summary = edge_lab.summarise(rows, stops=(0.5,), targets=(1.0,))
     assert summary["signals"] == 4
     assert summary["sessions"] == 1
@@ -270,11 +295,16 @@ def test_summarise_expectancy_arithmetic_by_hand() -> None:
     assert cell["resolved"] == 3
     assert cell["reward_risk"] == pytest.approx(2.0)
     assert cell["hit_rate"] == pytest.approx(2 / 3)
-    assert cell["random_rate"] == pytest.approx(1 / 3)
-    assert cell["edge_pp"] == pytest.approx((2 / 3 - 1 / 3) * 100)
-    # Two targets at 2R and one stop at -1R, diluted by the four signals
-    # taken: the open trade is counted, not dropped.
-    assert cell["gross_r"] == pytest.approx((2 * 2.0 - 1) / 4)
+    # Coin: 2 target hits between the two sides over 3 + 2 resolved trades.
+    assert cell["random_rate"] == pytest.approx(2 / 5)
+    assert cell["edge_pp"] == pytest.approx((2 / 3 - 2 / 5) * 100)
+    # Two targets at 2R, one stop at -1R and the open trade marked at its
+    # +0.4R close, over the four signals taken: counted, not dropped, and
+    # not scored as flat.
+    assert cell["gross_r"] == pytest.approx((2 * 2.0 - 1 + 0.4) / 4)
+    # Twin: -1 - 1 + 1.2 - 0.4 = -1.2R. A coin averages the two sides.
+    assert cell["random_gross_r"] == pytest.approx((3.4 - 1.2) / 8)
+    assert cell["edge_r"] == pytest.approx(3.4 / 4 - 2.2 / 8)
     # Stop distance is 0.5 sigma = 5.0 on a 100 entry, so costs are
     # 0.000824 / 0.05 of one R.
     assert cell["cost_r"] == pytest.approx(edge_lab.COST_FRACTION / 0.05)
@@ -286,6 +316,142 @@ def test_summarise_expectancy_arithmetic_by_hand() -> None:
                                                 / exc["mae_mean"])
     assert exc["mfe"]["p50"] == pytest.approx(0.75)
     assert edge_lab.best_geometry(summary) is cell
+
+
+def test_a_rule_that_is_a_coin_flip_scores_no_edge() -> None:
+    """Swap the sides on every path and the rule IS the coin: zero edge.
+
+    The old closed-form baseline could not pass this, because it never
+    looked at the paths at all.
+    """
+    rows = [_row("TARGET", 1.2, 0.2, flipped="STOP"),
+            _row("STOP", 0.2, 1.2, flipped="TARGET"),
+            _row("NEITHER", 0.3, 0.3, flipped="NEITHER", close_move=0.1),
+            _row("NEITHER", 0.3, 0.3, flipped="NEITHER", close_move=-0.1)]
+    cell = edge_lab.summarise(rows, stops=(0.5,), targets=(1.0,))["grid"][0]
+    assert cell["hit_rate"] == pytest.approx(cell["random_rate"])
+    assert cell["edge_pp"] == pytest.approx(0.0)
+    assert cell["gross_r"] == pytest.approx(cell["random_gross_r"])
+    assert cell["edge_r"] == pytest.approx(0.0)
+
+
+def _driftless_rows(paths: int, bars: int = 35, sub: int = 8,
+                    seed: int = 3) -> list:
+    """Rows for a pure random walk, scored at the shipped 0.5 / 1.0 geometry.
+
+    Sub-steps inside each bar give the bars real highs and lows, so the
+    same-bar tie rule and the close cut-off both bite exactly as they do on
+    market data. The walk's whole-horizon sd is 1/1.4 of one plausible
+    move, which is what the harness unit measures (see the UNITS note).
+    """
+    rng = np.random.default_rng(seed)
+    step = (1.0 / 1.4) / math.sqrt(bars * sub)
+    fine = np.cumsum(rng.normal(0.0, step, (paths, bars * sub)), axis=1)
+    fine = fine.reshape(paths, bars, sub) + 100.0
+    highs, lows = fine.max(axis=2), fine.min(axis=2)
+    rows = []
+    for p in range(paths):
+        row = {"symbol": "WALK", "day": p, "direction": "LONG",
+               "entry": 100.0, "sigma": 1.0, "mfe_sigma": 0.0,
+               "mae_sigma": 0.0,
+               "close_move_sigma": float(fine[p, -1, -1] - 100.0)}
+        row[(0.5, 1.0)] = edge_lab.first_touch(
+            highs[p], lows[p], edge_lab.LONG, 100.0, 0.5, 1.0)
+        row["flipped"] = {(0.5, 1.0): edge_lab.first_touch(
+            highs[p], lows[p], edge_lab.SHORT, 100.0, 0.5, 1.0)}
+        rows.append(row)
+    return rows
+
+
+def test_a_driftless_walk_scores_no_edge_against_the_coin() -> None:
+    """The baseline must call a random walk random.
+
+    The closed-form stop / (stop + target) it replaced says 33.3% here,
+    but a driftless walk counted this harness's way - hits only before the
+    close, ties to the stop - resolves in the target's favour about 24% of
+    the time, so the formula read pure chance as about nine points WORSE
+    than chance. Measured over 40 seeds at 6,000 paths: 22.7-25.7% hit,
+    at least 7.7 points under the formula, with the coin baseline never
+    more than 1.6 points from the hit rate and |edge_r| never above 0.03 R.
+    The limits below sit at roughly twice those extremes.
+    """
+    cell = edge_lab.summarise(_driftless_rows(6000), stops=(0.5,),
+                              targets=(1.0,))["grid"][0]
+    formula = 0.5 / (0.5 + 1.0)
+    assert formula - cell["hit_rate"] > 0.05
+    assert abs(cell["edge_pp"]) < 4.0
+    assert abs(cell["edge_r"]) < 0.06
+
+
+def test_a_short_left_open_is_marked_at_its_own_close_move() -> None:
+    """The SHORT mirror of the unresolved test. close_move_sigma is signed
+    for the signal's own direction, so a drift UP is a loss to a short, and
+    the twin - a long - gains exactly what the short loses."""
+    frames = {"TEST": _frame([WIDE, WIDE, DRIFT])}
+
+    def fire_short(ctx):
+        """Fire SHORT at bar 4 and never again."""
+        return edge_lab.SHORT if ctx.i == 4 else None
+
+    rows = edge_lab.run_rule(fire_short, frames, warmup=2)
+    assert len(rows) == 1
+    row = rows[0]
+    expected = (DRIFT[4][3] - DRIFT[-1][3]) / row["sigma"]
+    assert row["close_move_sigma"] == pytest.approx(expected)
+    assert row["close_move_sigma"] < 0.0
+    for cell in edge_lab.summarise(rows)["grid"]:
+        assert cell["gross_r"] == pytest.approx(expected / cell["stop"])
+        assert cell["gross_r"] < 0.0
+        assert cell["random_gross_r"] == pytest.approx(0.0)
+        assert cell["edge_r"] == pytest.approx(cell["gross_r"])
+
+
+def test_a_twin_missing_from_any_row_withholds_the_baseline() -> None:
+    """Comparing totals would pass one rule-only row plus one twin-only
+    row; the baseline has to see a twin on EVERY row it scores."""
+    rule_only = _row("TARGET", 1.2, 0.2)
+    del rule_only["flipped"]
+    twin_only = _row("STOP", 0.1, 0.9, flipped="TARGET")
+    del twin_only[(0.5, 1.0)]
+    both = _row("STOP", 0.1, 0.9, flipped="TARGET")
+    cell = edge_lab.summarise([rule_only, twin_only, both], stops=(0.5,),
+                              targets=(1.0,))["grid"][0]
+    assert cell["signals"] == 2
+    assert cell["random_rate"] is None
+    assert cell["edge_r"] is None
+
+
+def test_the_report_prints_signs_n_a_and_no_negative_zero(capsys) -> None:
+    """print_report once crashed on a sign-after-width format spec. A
+    missing baseline prints n/a, and a tiny negative rounds to +0.000."""
+    rows = [_row("TARGET", 1.2, 0.2), _row("STOP", 0.1, 0.9),
+            _row("NEITHER", 0.3, 0.3, close_move=-0.0001)]
+    for row in rows:
+        del row["flipped"]
+    summary = edge_lab.summarise(rows, stops=(0.5,), targets=(1.0,))
+    edge_lab.print_report("no twins", summary)
+    out = capsys.readouterr().out
+    assert "n/a" in out
+    assert "+0.333" in out                      # (2 - 1 - 0.0002) / 3
+    assert "-0.000" not in out
+    tiny = [_row("NEITHER", 0.3, 0.3, close_move=-0.0001, flipped="STOP"),
+            _row("TARGET", 1.2, 0.2, flipped="STOP")]
+    edge_lab.print_report("tiny", edge_lab.summarise(
+        tiny, stops=(0.5,), targets=(1.0,)))
+    assert "-0.000" not in capsys.readouterr().out
+
+
+def test_rows_without_a_twin_report_no_baseline_rather_than_a_wrong_one(
+        ) -> None:
+    rows = [_row("TARGET", 1.2, 0.2), _row("STOP", 0.1, 0.9)]
+    for row in rows:
+        del row["flipped"]
+    cell = edge_lab.summarise(rows, stops=(0.5,), targets=(1.0,))["grid"][0]
+    assert cell["gross_r"] == pytest.approx((2.0 - 1.0) / 2)
+    assert cell["random_rate"] is None
+    assert cell["random_gross_r"] is None
+    assert cell["edge_pp"] is None
+    assert cell["edge_r"] is None
 
 
 def test_summarise_reports_nothing_rather_than_zeroes_on_no_rows() -> None:

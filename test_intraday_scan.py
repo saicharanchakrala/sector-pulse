@@ -414,21 +414,36 @@ def test_a_structural_level_on_the_wrong_side_is_ignored() -> None:
 def test_size_comes_from_the_risk_budget_when_capital_allows() -> None:
     trade = _long_levels(capital=1_000_000.0, risk_pct=1.0)
     assert trade is not None
-    # 1% of 10 lakh is 10,000 at risk over a 2.5 stop = 4,000 shares.
-    assert trade.quantity == 4000
+    # 1% of 10 lakh is 10,000, and the charges now come OUT of it. On price
+    # risk alone that was 10,000 / 2.5 = 4,000 shares, which lost about
+    # 10,350 at the stop. By hand at 3,864 shares (386,400 a leg):
+    #   brokerage 20 + 20 (capped)          40.00
+    #   STT 0.025% of the sell leg          96.60
+    #   exchange 0.00297% of 772,800        22.95
+    #   stamp 0.003% of the buy leg         11.59
+    #   SEBI 0.0001% of 772,800              0.77
+    #   GST 18% of 40 + 22.95 + 0.77        11.47
+    #   slippage 0.02% of 772,800          154.56   -> 337.95
+    # 3,864 * 2.5 + 337.95 = 9,997.95 fits; 3,865 comes to 10,000.52.
+    assert trade.quantity == 3864
+    assert trade.cost_rupees == pytest.approx(337.9475, abs=1e-3)
+    assert trade.risk_with_costs <= 10_000.0
     assert not trade.capital_capped
 
 
 def test_size_is_capped_by_funding_not_just_by_risk() -> None:
-    # 1% of 1 lakh is 1,000 at risk over a 2.5 stop, which asks for 400
-    # shares of a 100-rupee stock: 40,000 notional against 1 lakh at 5x is
-    # affordable. Drop leverage to 1x and the same 40,000 is still fine, so
-    # squeeze capital instead.
-    trade = _long_levels(capital=10_000.0, risk_pct=10.0, leverage=1.0)
+    # The old version of this test used a 10% risk budget, which the 2%
+    # ceiling now refuses outright. So the stop is squeezed instead: an
+    # ATR of 0.1 over 25 bars is a 0.5 plausible move and a 0.25 stop. 2%
+    # of 10,000 is 200, which covers 800 shares on price risk and 504 once
+    # charges come out - and at 1x leverage 10,000 funds only 100.
+    trade = _long_levels(capital=10_000.0, risk_pct=2.0, leverage=1.0,
+                         atr_per_bar=0.1)
     assert trade is not None
-    assert trade.capital_capped, "10,000 cannot fund 400 shares at 100"
+    assert trade.capital_capped, "10,000 cannot fund 504 shares at 100"
     assert trade.quantity == 100          # 10,000 / 100
     assert trade.entry * trade.quantity <= 10_000.0 * 1.0
+    assert trade.risk_with_costs <= 200.0
 
 
 def test_required_win_rate_solves_the_breakeven_equation() -> None:
@@ -460,6 +475,13 @@ def test_levels_refuse_to_build_without_volatility_or_time() -> None:
     assert _long_levels(bars_left=0) is None
     assert _long_levels(entry=0.0) is None
     assert _long_levels(capital=0.0) is None
+    # NaN fails every `<= 0.0` test, so these used to get through the
+    # guards and raise inside the sizer instead of returning None.
+    nan = float("nan")
+    assert _long_levels(atr_per_bar=nan) is None
+    assert _long_levels(entry=nan) is None
+    assert _long_levels(capital=nan) is None
+    assert _long_levels(risk_pct=nan) is None
 
 
 def test_levels_reject_an_unknown_direction() -> None:
@@ -775,19 +797,24 @@ def test_max_pain_is_the_least_writer_payout_strike() -> None:
 
 
 def test_pick_contract_buys_calls_for_long_and_puts_for_short() -> None:
+    # A lot of 50 at a 10.00 mid is 500 of premium plus about 53 of
+    # charges, inside the default 1,000 budget. The old lot of 500 was
+    # 5,000 of premium, which the budget now refuses - see
+    # test_risk_budget.py for that half.
     chain = [_contract(strike=100.0, side=options_chain.CALL),
              _contract(strike=100.0, side=options_chain.PUT)]
-    call, _ = options_chain.pick_contract(chain, 100.0, LONG, 500)
-    put, _ = options_chain.pick_contract(chain, 100.0, SHORT, 500)
+    call = options_chain.pick_contract(chain, 100.0, LONG, 50).contract
+    put = options_chain.pick_contract(chain, 100.0, SHORT, 50).contract
     assert call is not None and call.side == options_chain.CALL
     assert put is not None and put.side == options_chain.PUT
 
 
 def test_pick_contract_returns_nothing_when_every_strike_is_illiquid() -> None:
     chain = [_contract(strike=100.0, open_interest=1, volume=1)]
-    picked, reasons = options_chain.pick_contract(chain, 100.0, LONG, 500)
-    assert picked is None
-    assert "no contract cleared the quality gates" in reasons[0]
+    pick = options_chain.pick_contract(chain, 100.0, LONG, 50)
+    assert pick.contract is None and pick.lots == 0
+    assert not pick.refused_by_budget, "illiquid is not a budget refusal"
+    assert "no contract cleared the quality gates" in pick.reasons[0]
 
 
 def test_atm_strike_is_the_nearest_strike_to_spot() -> None:

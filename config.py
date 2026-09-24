@@ -470,7 +470,28 @@ OPT_STRIKES_EITHER_SIDE = 5       # ATM window to report
 # decides the size rather than the other way round: a wider stop buys fewer
 # shares for the same rupees at risk.
 SCAN_CAPITAL = 100_000.0          # intraday capital assumed by the sizer
-SCAN_RISK_PCT_PER_TRADE = 1.0     # percent of capital risked between entry and stop
+# Percent of capital lost if the stop fills, round-trip charges included.
+SCAN_RISK_PCT_PER_TRADE = 1.0
+
+# --- RISK CEILINGS --------------------------------------------------------
+# Two limits the sizer did not have. Both fail CLOSED: a value past either
+# refuses the trade rather than trimming it, so a misconfiguration shows up
+# as an empty scan instead of as quietly oversized positions.
+#
+# THE PER-TRADE CEILING is the upper end of the 0.25-2% range that fixed
+# fractional sizing is built around. Above it an ordinary losing streak
+# stops being survivable: ten straight losses cost 20% at 2% (25% needed
+# to recover) but 50% at 5% (100% needed). levels.build_levels returns
+# None above it and scan_intraday refuses the argument, so typing 25 for
+# 2.5 cannot size every trade at a quarter of the account.
+SCAN_MAX_RISK_PCT = 2.0
+# THE COMBINED CEILING, as a percent of capital, counted with charges
+# included. Five full-risk trades at 1%: a streak of five losses then costs
+# about 5%, recoverable with about 5.3%. Every setup is sized on its own
+# against its own stop, so before this the total was unbounded - on
+# 2026-09-22 the scan log marked 569 setups taken, each risking 1,000 of
+# 1,00,000. setups.apply_portfolio_caps enforces it per scan snapshot.
+SCAN_MAX_OPEN_RISK_PCT = 5.0
 
 # This was 57 because yfinance stopped serving 5-minute bars near day 60.
 # Kite serves them for years, so that cliff is gone and the cap now rests on

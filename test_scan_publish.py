@@ -200,10 +200,22 @@ def test_a_failing_scan_does_not_escape_the_loop(monkeypatch) -> None:
     # worth more than a table, so a scan that throws must be swallowed.
     import threading
 
+    scans = {"n": 0}
+
     def boom(*a, **k):
+        scans["n"] += 1
         raise RuntimeError("scan exploded")
 
     monkeypatch.setattr(scan_publish, "run_once", boom)
+    # The loop now idles outside the scan window and without bars stamped
+    # today, so without these two it never reached run_once at all and
+    # this test passed without exercising the failure it is named for.
+    # The window and the bar check have their own tests in
+    # test_scan_window.py.
+    monkeypatch.setattr(scan_publish, "scan_window",
+                        lambda now: (True, "open"))
+    monkeypatch.setattr(scan_publish, "session_symbols",
+                        lambda symbols, today, seed, now: list(symbols))
 
     class _Builder:
         def snapshot(self):
@@ -221,3 +233,4 @@ def test_a_failing_scan_does_not_escape_the_loop(monkeypatch) -> None:
     scan_publish.loop(_Builder(), ["X"], {}, {}, {}, stop, every=0)
     stop.wait = real_wait
     assert calls["n"] > 2, "the loop must have kept going after the failure"
+    assert scans["n"] == 2, "both iterations must have reached the scan"

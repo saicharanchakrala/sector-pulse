@@ -369,8 +369,14 @@ every setup.
   Accepting a wider structural stop scales the target past sigma, which the
   reachability check then rejects: every structural stop in `(base,
   1.4*base]` was a guaranteed rejection.
+- Quantity is the largest whole number for which `qty * risk_per_share +
+  round_trip_cost(qty)` fits the risk budget, so the loss at the stop,
+  charges included, never exceeds it. Sizing on price risk alone and adding
+  charges on top overran a Rs 1,000 budget by about 10% at the median.
 - Quantity is capped by `capital * leverage / entry`. Risk-based sizing
   alone printed a 6.94 lakh position on 1 lakh of capital.
+- `risk_pct` above `SCAN_MAX_RISK_PCT` (2%) is refused, and every numeric
+  input must be finite and positive: NaN passes a `<= 0.0` check.
 - `required_win_rate` solves `p*reward - (1-p)*risk = costs`. This is the
   number that makes a reward-to-risk ratio mean anything and must appear in
   every report.
@@ -385,6 +391,13 @@ does not move when another is added.
 
 Direction requires price-vs-VWAP and the opening-range break to **agree**.
 Disagreement is chop and yields nothing.
+
+`apply_portfolio_caps` runs after `rank` in every caller (feed, CLI, app).
+It keeps actionable setups in rank order until their combined loss at the
+stop would pass `SCAN_MAX_OPEN_RISK_PCT` of capital or their combined
+notional would pass capital times leverage, and blocks everything ranked
+below with a `portfolio risk cap` / `portfolio notional cap` reason. It
+bounds one snapshot; it cannot see positions already entered.
 
 Documented weakness: of 99 rejected directional candidates in one run,
 relative volume rejected 84 and reachability 8. The cost and win-rate gates
@@ -406,16 +419,23 @@ leaves nothing to fall back on.
 #### edge_lab.py
 Rules are measured, not argued about. Contract: `rule(ctx) -> "LONG" |
 "SHORT" | None`. Reports favourable and adverse excursion distributions plus
-a stop-and-target grid, and for each cell the hit rate a driftless random
-walk would give that same geometry. **That difference is the only evidence
-of predictive skill.** A high hit rate at a reward-to-risk below 1 proves
-nothing.
+a stop-and-target grid, and for each cell the hit rate and expectancy of a
+coin tossed for direction at the same bars (every signal is also scored in
+the opposite direction on the same path). **The difference in R is the only
+evidence of predictive skill.** A high hit rate at a reward-to-risk below 1
+proves nothing. Open trades are marked at the close in R, never scored as
+0 R. `python -m edge_lab` reproduces the measured result below.
 
-Measured result for the shipped rule, which must not be quietly dropped from
-this document: 3,537 signals, mean MFE 0.601 sigma against mean MAE 0.629,
-so adverse excursion exceeds favourable at every percentile. 16 of 20 grid
-cells lose at zero cost. The shipped geometry is 10.2 percentage points
-worse than a coin flip. No rule in this repo has a demonstrated edge.
+Measured result for the rule's structural core (VWAP side plus
+opening-range break), which must not be quietly dropped from this
+document: 54,397 signals over 229 sessions and 210 names. Edge over the
+coin lies between -0.003 R and +0.003 R in all 25 grid cells; at the
+shipped geometry it is -0.002 R (95% session-bootstrap interval -0.026 to
++0.024). All 25 cells lose after costs, the best at -0.053 R. The earlier
+figures here (10.2 points worse than a coin flip, 16 of 20 cells losing at
+zero cost) were artefacts of scoring open trades as 0 R and of a
+closed-form baseline that assumed unlimited time. No rule in this repo has
+a demonstrated edge.
 
 ### Zerodha modules
 
